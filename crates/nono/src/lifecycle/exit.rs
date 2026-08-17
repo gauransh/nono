@@ -34,6 +34,7 @@
 use super::events::{EventSink, LifecycleEvent, Observation};
 use super::identity::ProcessIdentity;
 use super::state::{LifecycleOp, LifecycleState};
+use super::sync_core::SharedLifecycle;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
@@ -354,7 +355,13 @@ pub struct ReapError {
 /// the handoff and does not follow the run any further.
 pub struct ActivatedSandbox {
     identity: ProcessIdentity,
-    state: LifecycleState,
+    /// This handle's own core, started at the state the handoff observed.
+    ///
+    /// Deliberately not shared with the [`super::PreparedSandbox`] it came
+    /// from: that handle reports the state it had at the handoff and does not
+    /// follow the run, which is a promise its docs make and its live tests
+    /// check. One core between them would silently break it.
+    shared: SharedLifecycle,
     activation: ActivationObservation,
     reaped: Option<SandboxExit>,
     event_sink: Option<Arc<dyn EventSink>>,
@@ -369,7 +376,7 @@ impl ActivatedSandbox {
     ) -> Self {
         Self {
             identity,
-            state,
+            shared: SharedLifecycle::new(state),
             activation,
             reaped: None,
             event_sink,
@@ -395,7 +402,7 @@ impl ActivatedSandbox {
     /// Where the run currently is.
     #[must_use]
     pub fn state(&self) -> LifecycleState {
-        self.state
+        self.shared.state()
     }
 
     /// Wait for the program to end and report what was observed.
@@ -439,15 +446,14 @@ impl ActivatedSandbox {
     /// A refused transition is a library bug rather than a caller error, and
     /// this path cannot return one, so the state simply does not move.
     fn transition(&mut self, op: LifecycleOp) {
-        let from = self.state;
-        let Ok(to) = from.apply(op) else {
+        let Ok(change) = self.shared.mark(op) else {
             return;
         };
-        self.state = to;
+        // Outside the shared core's lock: the sink is consumer code.
         if let Some(sink) = &self.event_sink {
             sink.emit(&LifecycleEvent::StateChanged {
-                from,
-                to,
+                from: change.from,
+                to: change.to,
                 observation: Observation::DirectlyObserved,
             });
         }
@@ -459,7 +465,7 @@ impl std::fmt::Debug for ActivatedSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActivatedSandbox")
             .field("identity", &self.identity)
-            .field("state", &self.state)
+            .field("state", &self.shared.state())
             .field("activation", &self.activation)
             .field("reaped", &self.reaped)
             .field("event_sink", &self.event_sink.is_some())

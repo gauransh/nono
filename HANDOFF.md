@@ -40,8 +40,14 @@ frozen-contract state of THIS repository only.
   `ProcessIdentity` (pid + start_time + boot_id). Security review pass
   applied (fd sweep in child, random release/abort nonces, honest
   three-valued activation observation).
+- Landed (iteration 4): the lifecycle state and its one-shot gate write moved
+  behind a single lock (`lifecycle::sync_core::SharedLifecycle`, crate-internal
+  — public only under `--cfg loom`), with `PreparedSandbox`/`ActivatedSandbox`
+  rewired onto it. No public API change: same types, same signatures, same
+  observable behavior; the 96 existing lifecycle unit tests and all 16 live
+  tests pass unmodified. Proven by 5 Loom models (ADR-0001 §2).
 - Still being added: durable supervisor/session store, attach/detach/resize,
-  `CleanupVerification`, `SupportReport`, Loom race harness (ADR-0001 §5-7).
+  `CleanupVerification`, `SupportReport` (ADR-0001 §5-7).
 
 ## Toolchain and platform requirements
 
@@ -58,7 +64,10 @@ frozen-contract state of THIS repository only.
 | `cargo test --workspace --no-fail-fast` (upstream baseline @149579a7, macOS) | 3409 passed / 3 failed / 1 ignored — all 3 macOS-host portability bugs (see WORKLOG) |
 | same, after F1+F1b fixes | 3412 passed / 0 failed / 1 ignored — green on 5 consecutive runs; full bin-test binary stressed 20x, 0 failures (baseline: 23/20 runs) |
 | `cargo test --workspace --no-fail-fast` (after F3+F4, iteration 3) | 3527 passed / 0 failed / 1 ignored, 32 suites |
+| `cargo test --workspace --no-fail-fast` (after F5, iteration 4) | 3540 passed / 0 failed / 1 ignored, 33 suites — reproduced on 2 runs |
 | `cargo test -p nono lifecycle` / `--test lifecycle_live` | 96 unit + 16 live; live suite clean on 10 consecutive runs |
+| same, after F5 (shared lifecycle core) | 109 unit (96 unchanged + 13 new `sync_core`) + 16 live, unmodified |
+| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` | 5 loom models pass (all interleavings); harness verified to fail when the activation CAS is weakened. Cfg name is `nono_loom`, not loom's own `loom`: RUSTFLAGS reaches every crate, and `--cfg loom` makes tokio compile out `tokio::net`, breaking hyper-util (transitive via sigstore-verify) |
 | `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1 |
 | `cargo clippy --workspace --all-targets` | clean |
 | `cargo fmt --all -- --check` | clean |

@@ -88,3 +88,21 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
   supervisor — supervisor slice); Linux path compiled-unverified (Docker blocker
   recorded in R07 note; cross-compile dead-ends at aws-lc-sys needing
   x86_64-linux-gnu-gcc).
+
+## 2026-08-17 — Iteration 4: R05 Loom race harness (delta F5)
+
+- lifecycle/sync_core.rs: SharedLifecycle — one Mutex owns LifecycleState +
+  three-valued GateEffect (Open/ClosedToActivation/Spent); try_begin_activate
+  runs the release effect inside the critical section; begin_stop reserves the
+  abort write (so expiry still emits GateAborted); claim_gate_close once-only.
+  PreparedSandbox/ActivatedSandbox rewired; zero public-API change; 96 existing
+  unit + 16 live tests pass unmodified.
+- 5 Loom models exhaust interleavings (activate x2, activate-vs-stop,
+  death-vs-stop, supervisor-lost-vs-activate, cleanup x2). Bug-detection
+  demonstrated: weakened CAS -> 3/5 models fail; restored -> green.
+- cfg is `nono_loom` (RUSTFLAGS --cfg loom breaks tokio/hyper-util transitively);
+  loom is a cfg-gated dependency, not an unconditional dev-dep.
+- Gates: 109 unit + 16 live x3; workspace 3540/0/1 x2; strict clippy clean (also
+  under nono_loom); fmt clean; lint scripts green; loom gate 5/5.
+- Disk pressure recurred (~950 MiB free): parallel streams' builds; cleanup pass
+  before next slice.

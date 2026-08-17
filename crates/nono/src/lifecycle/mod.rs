@@ -26,6 +26,9 @@
 //! - [`prepare`][self]: [`PreparedSandbox`], which forks a child, sandboxes it,
 //!   and holds it before `execve`.
 //! - [`gate`][self]: [`ActivationHandle`] and the single-use release check.
+//! - `sync_core`: the state and the one-shot gate write behind a single lock,
+//!   so the activation compare-and-swap has an answer under concurrency rather
+//!   than a race. Crate-internal; proven by `tests/loom_lifecycle.rs`.
 //! - [`exit`][self]: [`ActivatedSandbox`] and the typed [`SandboxExit`] facts.
 //! - [`identity`][self]: [`ProcessIdentity`], pid plus what makes it unique.
 //!
@@ -67,6 +70,15 @@ mod identity;
 mod plan;
 mod prepare;
 mod state;
+
+// The shared core is crate-internal in every ordinary build. Under `--cfg
+// nono_loom` it is exported so `tests/loom_lifecycle.rs`, which is an
+// out-of-crate consumer, can drive it from several threads; that cfg is never
+// set for a released build, so the public API is the same either way.
+#[cfg(nono_loom)]
+pub mod sync_core;
+#[cfg(not(nono_loom))]
+mod sync_core;
 
 pub use events::{EventSink, LifecycleEvent, Observation};
 pub use exit::{

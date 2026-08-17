@@ -10,6 +10,12 @@ use std::path::Path;
 fn main() {
     println!("cargo:rerun-if-changed=schema/capability-manifest.schema.json");
 
+    // `--cfg nono_loom` is set by hand for the deterministic concurrency
+    // harness (see crates/nono/src/lifecycle/sync_core.rs). Declaring it here
+    // keeps rustc's `unexpected_cfgs` lint quiet on ordinary builds without
+    // turning the lint off for cfg names that really are typos.
+    println!("cargo::rustc-check-cfg=cfg(nono_loom)");
+
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
 
     let schema_str = include_str!("schema/capability-manifest.schema.json");

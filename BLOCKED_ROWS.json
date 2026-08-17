@@ -1,6 +1,6 @@
 {
   "run_id": "EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C",
-  "updated": "2026-08-17 (iteration 3)",
+  "updated": "2026-08-17 (iteration 4)",
   "legend": {
     "PASS": "verified green on this stream's gate matrix",
     "FAIL": "verified failing right now",
@@ -40,8 +40,8 @@
     {
       "row": "R05",
       "title": "Stop/activate/wait races tested",
-      "status": "TODO",
-      "evidence": "No loom/miri/fuzz in repo; no wait API even in CLI; only concurrency artifact is a fixed-sleep socket roundtrip test (supervisor/socket.rs:851) and ENV_LOCK test serialization. Harness must be built from scratch.",
+      "status": "IN_PROGRESS",
+      "evidence": "Iteration 4 (delta F5): SharedLifecycle sync core (single lock owns LifecycleState + three-valued GateEffect; every mutation via LifecycleState::apply; CAS+release one critical section). 5 Loom models exhaust interleavings: two activations -> one winner/one release; activate-vs-stop never both-win-and-release; death-vs-stop one fact; no release after SupervisorLost; duplicate cleanup one winner. Harness detects deliberately weakened CAS (3/5 models fail). Gate: RUSTFLAGS=--cfg nono_loom cargo test -p nono --test loom_lifecycle --release. Pending: state-recovery-after-restart model (needs session store, R09).",
       "blocker": null
     },
     {

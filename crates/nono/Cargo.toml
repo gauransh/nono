@@ -81,5 +81,17 @@ prettyplease = "0.3"
 tempfile.workspace = true
 jsonschema = "0.48"
 
+# Deterministic concurrency harness for lifecycle/sync_core.rs. Wired as the
+# loom README prescribes — a cfg-gated normal dependency, not a dev-dependency,
+# because the shared core itself swaps its lock for loom's under that cfg — but
+# under our own cfg name rather than the README's bare `loom`. RUSTFLAGS reach
+# every crate in the build, and `--cfg loom` makes tokio compile out
+# `tokio::net`, which hyper-util (pulled in transitively by sigstore-verify)
+# then fails to find. `nono_loom` says the same thing to our code and nothing
+# to anyone else's. No ordinary build ever resolves this. Run with:
+#   RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release
+[target.'cfg(nono_loom)'.dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true

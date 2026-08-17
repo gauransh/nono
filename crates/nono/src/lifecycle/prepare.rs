@@ -91,6 +91,7 @@ use super::gate::{
 use super::identity::ProcessIdentity;
 use super::plan::{ResourceLimits, SessionMode, ValidatedPlan};
 use super::state::{LifecycleOp, LifecycleState, TransitionError};
+use super::sync_core::{SharedLifecycle, Transition};
 use std::ffi::{CString, c_char};
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -225,7 +226,11 @@ pub struct PreparedSandbox {
     session_id: Uuid,
     generation: u64,
     identity: ProcessIdentity,
-    state: LifecycleState,
+    /// The state and the one-shot gate write, behind one lock. Held by value
+    /// rather than shared today — nothing else has a reference to this run —
+    /// but every operation goes through `&self`, so the durable supervisor can
+    /// put it in an `Arc` without any of this file changing shape.
+    shared: SharedLifecycle,
     gate: Option<PipeWriter>,
     status: Option<PipeReader>,
     token_digest: [u8; TOKEN_DIGEST_BYTES],
@@ -319,7 +324,7 @@ impl PreparedSandbox {
                     session_id,
                     generation: FIRST_GENERATION,
                     identity: ProcessIdentity::capture(child.as_raw()),
-                    state,
+                    shared: SharedLifecycle::new(state),
                     gate: Some(gate_write),
                     status: Some(status_read),
                     // Replaced two lines down. A digest of all zeros matches no
@@ -374,7 +379,7 @@ impl PreparedSandbox {
     /// tracks the run from there.
     #[must_use]
     pub fn state(&self) -> LifecycleState {
-        self.state
+        self.shared.state()
     }
 
     /// The child's identity, captured at fork.
@@ -434,9 +439,12 @@ impl PreparedSandbox {
         // digest has already been zeroized, and the state machine already
         // knows why — so the checks below run only while their answers could
         // still matter. This is not a second source of truth: it reads the
-        // same machine the transition further down advances.
-        if self.state != LifecycleState::Prepared {
-            return Err(ActivationError::from_closed_gate(self.state));
+        // same machine the claim further down advances, and it is advisory —
+        // a caller that passes it can still lose the claim to another party,
+        // which is exactly what the claim is for.
+        let observed = self.shared.state();
+        if observed != LifecycleState::Prepared {
+            return Err(ActivationError::from_closed_gate(observed));
         }
         if self.has_expired() {
             // Expiry is terminal: a correct token presented late must not work
@@ -449,13 +457,30 @@ impl PreparedSandbox {
             return Err(ActivationError::InvalidActivationToken);
         }
 
-        // The compare-and-swap. The state machine, not a flag beside it,
-        // decides whether this activation is the one that wins.
-        if self.transition(LifecycleOp::BeginActivate).is_err() {
-            return Err(ActivationError::from_closed_gate(self.state));
-        }
+        // The compare-and-swap, and the release write it authorises, in one
+        // critical section. The state machine — not a flag beside it — decides
+        // whether this activation is the one that wins, and the winner writes
+        // the gate before any other party can observe that the gate moved.
+        // Destructured so the closure borrows only the two fields the write
+        // touches while `shared` is borrowed alongside them.
+        let Self {
+            shared,
+            gate,
+            secrets,
+            ..
+        } = self;
+        let claimed = shared.try_begin_activate(|| release(gate, secrets.as_ref()));
 
-        if let Err(errno) = self.release() {
+        let (change, released) = match claimed {
+            Ok(claimed) => claimed,
+            Err(err) => return Err(ActivationError::from_closed_gate(err.from)),
+        };
+        // Reported after the write, not before: a sink is consumer code and
+        // must never run inside the lock that the gate's single-use guarantee
+        // depends on.
+        self.report(change);
+
+        if let Err(errno) = released {
             return Err(self.fail_activation(SupervisorStage::Release, errno));
         }
 
@@ -479,7 +504,7 @@ impl PreparedSandbox {
                 self.zeroize_secrets();
                 Ok(ActivatedSandbox::new(
                     self.identity.clone(),
-                    self.state,
+                    self.shared.state(),
                     ActivationObservation::ExecOrKilledPreExec,
                     self.event_sink.clone(),
                 ))
@@ -504,7 +529,7 @@ impl PreparedSandbox {
     /// stopped, or failed; [`StopError::Reap`] if the death could not be
     /// observed, in which case nothing is claimed about the process.
     pub fn stop_before_activation(&mut self) -> Result<SandboxExit, StopError> {
-        self.transition(LifecycleOp::BeginStop)
+        self.begin_stop()
             .map_err(|err| StopError::NotStoppable { state: err.from })?;
         self.abort_gate();
 
@@ -532,21 +557,39 @@ impl PreparedSandbox {
 
     /// Apply an observed fact, recording it and telling the sink.
     ///
-    /// Every state change in this module goes through here, so there is exactly
-    /// one place where the machine can move and no way to keep a second,
-    /// disagreeing copy of "where we are".
+    /// Every state change in this module goes through here or through
+    /// [`Self::begin_stop`], and both go through the same shared core, so
+    /// there is exactly one place where the machine can move and no way to
+    /// keep a second, disagreeing copy of "where we are".
     fn transition(&mut self, op: LifecycleOp) -> Result<LifecycleState, TransitionError> {
-        let from = self.state;
-        let to = from.apply(op)?;
-        self.state = to;
+        let change = self.shared.mark(op)?;
+        self.report(change);
+        Ok(change.to)
+    }
+
+    /// Request a stop, shutting the gate to activation at the same instant.
+    ///
+    /// Separate from [`Self::transition`] because a stop is the one
+    /// observation that also settles who may write the gate: after this
+    /// returns `Ok`, no interleaving can still reach the release write.
+    fn begin_stop(&mut self) -> Result<LifecycleState, TransitionError> {
+        let change = self.shared.begin_stop()?;
+        self.report(change);
+        Ok(change.to)
+    }
+
+    /// Tell the sink about a change that already happened.
+    ///
+    /// Always outside the shared core's lock: the sink is consumer code and
+    /// may do anything, including calling back in.
+    fn report(&self, change: Transition) {
         if let Some(sink) = &self.event_sink {
             sink.emit(&LifecycleEvent::StateChanged {
-                from,
-                to,
+                from: change.from,
+                to: change.to,
                 observation: Observation::DirectlyObserved,
             });
         }
-        Ok(to)
     }
 
     /// Wait for the child's "sandbox applied, at the gate" record.
@@ -570,30 +613,23 @@ impl PreparedSandbox {
             .is_some_and(|limit| self.prepared_at.elapsed() >= limit)
     }
 
-    /// Write the release message and close the gate behind it.
-    fn release(&mut self) -> Result<(), i32> {
-        let message = *self.secrets.as_ref().ok_or(0)?.release();
-        let mut gate = self.gate.take().ok_or(0)?;
-        gate.write_all(&message)
-            .map_err(|err| err.raw_os_error().unwrap_or(0))?;
-        // Closed immediately: the gate opens once, and a descriptor that no
-        // longer exists cannot be written a second time.
-        drop(gate);
-        Ok(())
-    }
-
     /// Close the gate without a message. The child sees EOF and exits.
     fn close_gate(&mut self) {
         self.gate = None;
     }
 
     /// Tell a held child to give up, then close the gate.
+    ///
+    /// The claim, not the descriptor, is what makes this once-only against a
+    /// concurrent release: a caller that does not hold the gate write says
+    /// nothing and only lets the descriptor go, which the child reads as EOF.
     fn abort_gate(&mut self) {
+        let may_write = self.shared.claim_gate_close();
         let message = self.secrets.as_ref().map(|secrets| *secrets.abort());
         if let Some(mut gate) = self.gate.take() {
             // Best effort. The close below is the part that is guaranteed to
             // land: the child's `read` returns 0 and it exits either way.
-            if let Some(message) = message {
+            if may_write && let Some(message) = message {
                 let _ = gate.write_all(&message);
             }
         }
@@ -705,7 +741,7 @@ impl PreparedSandbox {
 
     /// Close an expired gate and stop the child behind it.
     fn expire(&mut self) -> ActivationError {
-        if self.transition(LifecycleOp::BeginStop).is_ok() {
+        if self.begin_stop().is_ok() {
             self.abort_gate();
             // Same reasoning as the stop path: the abort record, not the exit
             // code, is what says the child was stopped rather than run.
@@ -726,6 +762,24 @@ impl PreparedSandbox {
     }
 }
 
+/// Write the release message and close the gate behind it.
+///
+/// A free function rather than a method because it is the effect
+/// [`super::sync_core::SharedLifecycle::try_begin_activate`] runs on the
+/// winning path: it borrows the two fields the write touches and nothing else,
+/// so the shared core can be borrowed alongside them. Calling it from anywhere
+/// but inside that claim would be the bug the claim exists to prevent.
+fn release(gate: &mut Option<PipeWriter>, secrets: Option<&GateSecrets>) -> Result<(), i32> {
+    let message = *secrets.ok_or(0)?.release();
+    let mut gate = gate.take().ok_or(0)?;
+    gate.write_all(&message)
+        .map_err(|err| err.raw_os_error().unwrap_or(0))?;
+    // Closed immediately: the gate opens once, and a descriptor that no longer
+    // exists cannot be written a second time.
+    drop(gate);
+    Ok(())
+}
+
 /// Debug that names the session without naming the secret.
 ///
 /// The digest is not the token, but it is still the value the gate compares
@@ -735,7 +789,7 @@ impl std::fmt::Debug for PreparedSandbox {
         f.debug_struct("PreparedSandbox")
             .field("session_id", &self.session_id)
             .field("generation", &self.generation)
-            .field("state", &self.state)
+            .field("state", &self.shared.state())
             .field("identity", &self.identity)
             .field("token_digest", &"<redacted>")
             .field("expiry", &self.expiry)
