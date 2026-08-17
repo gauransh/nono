@@ -609,3 +609,135 @@ the fix is against a measured fact rather than a theory.
 - Still Linux-unverified behind R07: the whole PTY path — `open_pty`'s Linux
   `ptsname_r` arm, `setsid`/`TIOCSCTTY`, and the master's `EIO`-on-last-slave-close
   end of file (macOS returns 0; both are folded into `ReadOutcome::Ended`).
+
+## 2026-08-17 — Iteration 10: R06 mode-aware filesystem vocabulary (delta F11)
+
+- Goal: replace "read / write / read+write" with words for the operations a
+  caller actually means, and — the harder half — make the platform say out loud
+  what it cannot do with them.
+- New directory `crates/nono/src/capability_modes/`: `mod.rs` (the vocabulary,
+  the disclosure types, and the shared compile), `landlock_map.rs` (Linux),
+  `sbpl_map.rs` (macOS). New live suite
+  `crates/nono/tests/lifecycle_modes_live.rs`. Everything else is additive edits
+  to `capability.rs`, `error.rs`, `lib.rs`, `sandbox/{linux,macos,mod}.rs`,
+  `lifecycle/support.rs`, `bindings/c/src/lib.rs`, and three docs.
+
+### The five decisions worth recording
+
+1. **The new module is a new directory, and that is a rebase decision.**
+   `capability.rs` is 3810 lines and is exactly the file upstream would touch if
+   it ever evolved `AccessMode` — the conflict surface F2 predicted. So the
+   vocabulary lives somewhere a rebase cannot conflict, and what
+   `capability.rs` gains is four things: one `use`, one `fs_modes` field, the
+   four-method builder block, and a behaviour-preserving extraction of
+   `FsCapability::new_dir`/`new_file`'s canonicalise-then-check-type bodies into
+   `resolve_directory`/`resolve_file`. The extraction is the only edit that
+   rewrites existing lines, and it exists so the two grant types cannot drift
+   apart on TOCTOU handling — two paths that canonicalise differently would be
+   two security properties wearing one name.
+
+2. **`bundled` reports what the caller did *not* ask for.** The first shape I
+   tried listed every implication, which meant a caller who asked for both
+   `write` and `append` was told about a "bundle" that surprised nobody. The
+   rule that survived is sharper and is the anti-silent-widening guarantee in
+   one sentence: an entry appears exactly when the grant confers a mode the
+   caller did not name. A caller who named both halves is not being widened, so
+   there is nothing to disclose.
+
+3. **`create` is `MAKE_REG` and nothing else.** Landlock has seven make-rights
+   and coarse `Write` grants all seven. Folding them into one mode would mean a
+   caller who asked to create a file also got to create a device node and a
+   symlink — the exact widening this vocabulary exists to stop. So `create` is
+   regular files only, the other six have *no* mode, and the absence is written
+   down in `landlock.mdx`, in the baseline, and in a test whose deletion is what
+   a silent widening of `create` would look like. A caller who needs `mkdir`
+   inside a sandbox still uses `allow_path` and takes the coarse bundle
+   knowingly.
+
+4. **An ABI gate refuses; it does not drop.** On a kernel below V3 there is no
+   `TRUNCATE` right — which means truncation is not restrictable *at all*, so a
+   `truncate` grant that quietly compiled to no right would leave the caller
+   believing something was enforced. `RefusalReason::UnsupportedRight { right,
+   abi, needed_abi }` becomes `NonoError::ModeUnsupported` and fails
+   prepare/apply. Same for `rename`/`REFER` below V2, and therefore for
+   `atomic_write`, which is a name for a set containing `rename`.
+
+5. **The Linux mapping is testable on macOS by construction.**
+   `landlock_map::compile` takes a `LandlockRightsAvailable` — an ABI number —
+   instead of reading the kernel, so all ten leaf arms, both gates, the
+   always-allowed disclosure, the delegation and the bundle closure run in the
+   ordinary macOS suite months before a Linux runner exists. Only
+   `access_fs_for`, `abi_version_number` and the two rule loops in
+   `sandbox/linux.rs` need a kernel, and one of their `cfg(target_os = "linux")`
+   tests asserts the pure availability table agrees with `AccessFs::from_all`
+   for every right at every ABI — the one claim the pure tests cannot make for
+   themselves.
+
+### The macOS exec change, stated plainly
+
+`(allow process-exec*)` at `macos.rs:555` was unconditional, so on macOS "which
+binary may run" was never a capability. `FsMode::Execute` makes it one, and the
+switch is the *presence of a mode grant*, not a flag: a capability set built
+entirely from `allow_path` — which is every existing consumer, including all of
+`nono-cli` — gets that exact line, byte for byte, and the upstream suite is
+untouched. A set carrying one mode grant gets `(allow process-exec* (<filter>))`
+per `execute`-granted path and nothing else.
+
+### What did not work, and why the fixture changed
+
+The Execute pair was meant to run a copy of `/bin/echo`. On this host a
+byte-for-byte copy of a platform binary cannot be `execve`d **at all** — the
+kernel `SIGKILL`s it (exit 137) because its code signature is not the one the
+trust cache holds for that path, and `codesign --force --sign -` does not change
+that. Verified outside any sandbox before changing anything, so the sandbox was
+never suspected. The fixture is now a `#!` program, which is unsigned by nature;
+it also exercises the `*` in `process-exec*`, since the kernel's interpreter exec
+is a `process-exec-interpreter` check against `/bin/sh`.
+
+### Deviations from the row as scoped
+
+- `CompiledModes` has a **fifth** field, `delegated`, beyond the specified
+  `{enforced, bundled, always_allowed, refused}`. `unix_socket_connect` is
+  enforced — by `UnixSocketCapability`, which already models socket grants on
+  both platforms — and it is none of the other four. Folding it into `bundled`
+  would have needed a self-referential entry, into `refused` would have broken a
+  working grant, and into `always_allowed` would have been false. Adding a word
+  was cheaper than rounding one off. `ModeEnforceability` gains the matching
+  `delegated { target }` for the same reason.
+- The Linux availability flags are derived from the ABI *number* rather than
+  from `DetectedAbi::has_*`. `has_refer`/`has_truncate` are themselves
+  `AccessFs::from_all` lookups so they agree by construction; `has_execute` is
+  deliberately *not* used, because it answers a stricter question (whether the
+  second execute-only `restrict_execute` layer is usable, V3+) than "does the
+  ABI carry `EXECUTE`" (V1+). Using it would have refused a working `execute`
+  grant on V1 and V2. The agreement between the number-driven table and the
+  crate's own table is asserted by a Linux test.
+
+- Gates after: 1012 lib unit (24 new `capability_modes`, 3 new `support`);
+  `--test lifecycle_modes_live` 14 passed ×3; `--test lifecycle_live` 25 passed
+  ×3 unmodified; `--test lifecycle_detached` 27 passed / 1 ignored unmodified;
+  loom 7/7 unchanged; workspace 3744/0/2 across 35 suites; strict clippy clean;
+  fmt clean; both lint scripts exit 0; doctests 11.
+- Removal detection (each restored to green afterwards):
+  - ABI gate deleted (`landlock_map::compile`'s `refuse` closure made to return
+    `None`) → `truncate_is_refused_below_abi_v3_rather_than_dropped`,
+    `rename_is_refused_below_abi_v2_rather_than_dropped` and
+    `atomic_write_fails_closed_on_a_kernel_without_refer` FAILED; the first
+    printed `left: []` against `right: [ModeRefusal { mode: Truncate, why:
+    UnsupportedRight { right: Truncate, abi: 1, needed_abi: 3 } }]` — the empty
+    list *is* the silent widening.
+  - Landlock's always-allowed arm deleted from `compile_common` →
+    `read_metadata_is_a_disclosed_no_op_not_a_grant` FAILED at
+    `assertion failed: compiled.modes.enforced().is_empty()`: a `stat` grant
+    would have been reported as enforced on a platform that cannot enforce it.
+  - macOS exec scoping deleted (unconditional `(allow process-exec*)` restored
+    for mode-built profiles) → the live pair
+    `execute_granted_runs_an_unheard_of_program_and_ungranted_is_refused_at_exec`
+    FAILED with "activation was expected to fail; the run ended
+    `Ok(Exited { code: 0 })`".
+- Still Linux-unverified behind R07: `access_fs_for`, `abi_version_number`,
+  `mode_cap_access` and the two `fs_mode_capabilities()` rule loops in
+  `sandbox/linux.rs`, plus their six `cfg(target_os = "linux")` tests. The
+  mapping they call is fully host-tested. Cross-compilation is still not a
+  workaround — `aws-lc-sys` wants `x86_64-linux-gnu-gcc`, reconfirmed this
+  iteration.

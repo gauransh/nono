@@ -8,6 +8,10 @@
 use crate::capability::{
     AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
 };
+use crate::capability_modes::{
+    CompiledModes, FsModeCapability,
+    sbpl_map::{self, SbplOperation},
+};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
@@ -185,15 +189,29 @@ pub fn support_info() -> SupportInfo {
 fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String> {
     let mut parents = std::collections::HashSet::new();
 
-    for cap in caps.fs_capabilities() {
+    // Both grant lists: a mode-aware grant needs its ancestors walkable for
+    // exactly the same reason a coarse one does, and leaving it out would make
+    // the mode vocabulary fail on any path more than one level deep.
+    let granted: Vec<(&std::path::Path, &std::path::Path)> = caps
+        .fs_capabilities()
+        .iter()
+        .map(|cap| (cap.original.as_path(), cap.resolved.as_path()))
+        .chain(
+            caps.fs_mode_capabilities()
+                .iter()
+                .map(|cap| (cap.original.as_path(), cap.resolved.as_path())),
+        )
+        .collect();
+
+    for (original, resolved) in granted {
         // Collect parents for both resolved and original paths.
         // On macOS, /tmp is a symlink to /private/tmp. If the user passes
         // --allow /tmp, we need metadata access to / for the symlink itself.
         // The original path's parents handle this.
-        let paths_to_walk: Vec<&std::path::Path> = if cap.original != cap.resolved {
-            vec![cap.resolved.as_path(), cap.original.as_path()]
+        let paths_to_walk: Vec<&std::path::Path> = if original != resolved {
+            vec![resolved, original]
         } else {
-            vec![cap.resolved.as_path()]
+            vec![resolved]
         };
 
         for path in paths_to_walk {
@@ -247,6 +265,179 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
     }
 
     Ok(filters)
+}
+
+/// Seatbelt path filters for a mode-aware capability, mirroring
+/// [`path_filters_for_cap`] exactly: `literal` for a file, `subpath` for a
+/// directory, and the `original` spelling too when it differs from `resolved`
+/// (`/tmp` vs `/private/tmp`) so a symlinked path is still traversable.
+fn path_filters_for_mode_cap(cap: &FsModeCapability) -> Result<Vec<String>> {
+    let mut filters = Vec::with_capacity(2);
+
+    let resolved_str = cap.resolved.to_str().ok_or_else(|| {
+        NonoError::SandboxInit(format!(
+            "path contains non-UTF-8 bytes: {}",
+            cap.resolved.display()
+        ))
+    })?;
+    let escaped_resolved = escape_path(resolved_str)?;
+    let kind = if cap.is_file { "literal" } else { "subpath" };
+    filters.push(format!("{} \"{}\"", kind, escaped_resolved));
+
+    if cap.original != cap.resolved
+        && let Some(original_str) = cap.original.to_str()
+    {
+        let escaped_original = escape_path(original_str)?;
+        filters.push(format!("{} \"{}\"", kind, escaped_original));
+    }
+
+    Ok(filters)
+}
+
+/// Compile one mode-aware capability, refusing the whole profile if the
+/// platform will not express a granted mode.
+///
+/// Seatbelt has no version gates, so `refused` is structurally empty here — but
+/// the check is written anyway and is the same shape as the Linux one. A
+/// platform that quietly had nothing to refuse and a platform that was never
+/// asked look identical from the outside, and only one of them is honest.
+fn compile_mode_cap(cap: &FsModeCapability) -> Result<sbpl_map::CompiledSbpl> {
+    let compiled = sbpl_map::compile(cap.modes, cap.is_file);
+    if let Some(refusal) = compiled.modes.first_refusal() {
+        return Err(NonoError::ModeUnsupported {
+            mode: refusal.mode.to_string(),
+            path: cap.resolved.clone(),
+            detail: refusal.why.to_string(),
+        });
+    }
+    Ok(compiled)
+}
+
+/// What every mode-aware grant in `caps` compiles to, in grant order.
+///
+/// The disclosures a caller reads (`bundled`, `always_allowed`, `delegated`)
+/// come from here, so `--dry-run`-style consumers and the profile see the same
+/// compilation rather than two that could disagree.
+///
+/// # Errors
+///
+/// [`NonoError::ModeUnsupported`] if any grant names a mode this platform will
+/// not express.
+pub(crate) fn compile_fs_modes(caps: &CapabilitySet) -> Result<Vec<CompiledModes>> {
+    caps.fs_mode_capabilities()
+        .iter()
+        .map(|cap| compile_mode_cap(cap).map(|compiled| compiled.modes))
+        .collect()
+}
+
+/// Emit the `(allow …)` rules for every mode-aware grant.
+///
+/// One rule per operation per path filter, so the profile reads as the mode set
+/// does. Nothing is emitted for a mode that compiles to no operation:
+/// `unix_socket_connect` is carried by its own
+/// [`UnixSocketCapability`][crate::UnixSocketCapability] and `atomic_write` is a
+/// name for its members.
+fn emit_fs_mode_rules(profile: &mut String, caps: &CapabilitySet) -> Result<()> {
+    for cap in caps.fs_mode_capabilities() {
+        let compiled = compile_mode_cap(cap)?;
+        let filters = path_filters_for_mode_cap(cap)?;
+        for operation in &compiled.operations {
+            // `process-exec*` is emitted by `emit_process_exec_rules`, which
+            // owns the whole decision — scoped or unconditional — in one place.
+            if *operation == SbplOperation::ProcessExec {
+                continue;
+            }
+            for filter in &filters {
+                profile.push_str(&format!("(allow {} ({}))\n", operation.as_str(), filter));
+            }
+        }
+        emit_atomic_write_temp_rules(profile, cap, &compiled.temp_sibling_operations)?;
+    }
+    Ok(())
+}
+
+/// Emit the hex-suffixed temp-sibling rule an atomic write on a *file* needs.
+///
+/// The pattern — `<target>.tmp.<pid>.<hex>` — and the need for
+/// `file-read-metadata` on it are upstream's discovery: see
+/// `add_atomic_write_rule` in `crates/nono-cli/src/capability_ext.rs:434-460`
+/// (hex-suffix and read-metadata fix in 5f0b95a0). What is different here is the
+/// operation list: upstream emits `file-write*`, this emits only the four
+/// operations [`sbpl_map`] says a temp-file write performs.
+fn emit_atomic_write_temp_rules(
+    profile: &mut String,
+    cap: &FsModeCapability,
+    operations: &[SbplOperation],
+) -> Result<()> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let ops: Vec<&str> = operations.iter().map(|op| op.as_str()).collect();
+    let ops = ops.join(" ");
+
+    let mut paths: Vec<&Path> = vec![cap.resolved.as_path()];
+    if cap.original != cap.resolved {
+        paths.push(cap.original.as_path());
+    }
+    for path in paths {
+        let path_str = path.to_str().ok_or_else(|| {
+            NonoError::SandboxInit(format!(
+                "atomic-write path contains non-UTF-8 bytes: {}",
+                path.display()
+            ))
+        })?;
+        let escaped = regex_escape_path_for_seatbelt(path_str)?;
+        // `[.]` rather than `\.` for the same reason the escaper uses it: a
+        // character class is unambiguous across both Scheme string readers.
+        profile.push_str(&format!(
+            "(allow {} (regex \"^{}[.]tmp[.][0-9]+[.][0-9a-f]+$\"))\n",
+            ops, escaped
+        ));
+    }
+    Ok(())
+}
+
+/// Emit the process-exec grant, scoped when the caller used the mode vocabulary.
+///
+/// Upstream emits an unconditional `(allow process-exec*)`: on macOS, which
+/// binaries a confined process may run has never been a capability bit, only a
+/// property of the process model's timing. [`FsMode::Execute`][crate::FsMode::Execute]
+/// makes it a bit,
+/// and this is where it takes effect.
+///
+/// **The switch is the presence of a mode-aware grant, not a flag.** A
+/// capability set built entirely from [`allow_path`][CapabilitySet::allow_path]
+/// gets exactly the profile it has always got, byte for byte — every upstream
+/// consumer, including all of `nono-cli`, is in that case. A set with even one
+/// [`allow_path_modes`][CapabilitySet::allow_path_modes] grant is a set whose
+/// author is naming operations, and an unconditional exec grant sitting under
+/// their `execute` grants would make those grants meaningless.
+///
+/// Scoped means `(allow process-exec* (<filter>))` for each `execute`-granted
+/// path and nothing else, so a path that is merely readable cannot be `execve`d.
+/// `process-exec*` rather than `process-exec` covers
+/// `process-exec-interpreter`, so a `#!` script whose interpreter is granted
+/// still runs.
+fn emit_process_exec_rules(profile: &mut String, caps: &CapabilitySet) -> Result<()> {
+    if caps.fs_mode_capabilities().is_empty() {
+        profile.push_str("(allow process-exec*)\n");
+        return Ok(());
+    }
+
+    for cap in caps.fs_mode_capabilities() {
+        let compiled = compile_mode_cap(cap)?;
+        if !compiled.operations.contains(&SbplOperation::ProcessExec) {
+            continue;
+        }
+        for filter in path_filters_for_mode_cap(cap)? {
+            profile.push_str(&format!(
+                "(allow {} ({}))\n",
+                SbplOperation::ProcessExec.as_str(),
+                filter
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Returns true if the capability set explicitly grants access to a keychain DB.
@@ -551,8 +742,10 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
+    // Allow specific process operations needed for execution. Unconditional
+    // for a capability set built the coarse way (unchanged); scoped to the
+    // `execute`-granted paths when the caller used the mode vocabulary.
+    emit_process_exec_rules(&mut profile, caps)?;
     profile.push_str("(allow process-fork)\n");
 
     // Process info: allow self-inspection and same-sandbox inspection for both
@@ -733,6 +926,10 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             }
         }
     }
+
+    // Mode-aware grants. Emitted after the coarse read/write loops and before
+    // the platform rules, so a targeted deny still wins over both.
+    emit_fs_mode_rules(&mut profile, caps)?;
 
     // Emit platform rules last so targeted denies win under Seatbelt's
     // last-rule-wins semantics. See #970.

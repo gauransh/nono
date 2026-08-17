@@ -45,6 +45,7 @@
 
 use super::cleanup::{Probe, probe_group, probe_pid};
 use super::identity::ProcessIdentity;
+use crate::capability_modes::{DelegationTarget, FsMode, ModeEnforceability};
 use serde::{Deserialize, Serialize};
 
 /// Schema version of the report this build writes.
@@ -420,6 +421,63 @@ pub enum LandlockRight {
     Scoping,
 }
 
+/// How enforceable each filesystem mode is on this platform.
+///
+/// The per-mode counterpart of [`LandlockFacts`]'s per-right table, and it
+/// answers a question the ABI number cannot: not "which rights does the kernel
+/// have" but "if I grant `append`, what happens". The two platforms fall short
+/// in different places — Landlock cannot restrict `stat(2)` and Seatbelt can,
+/// Landlock separates truncation and Seatbelt does not — so a consumer that has
+/// to decide whether to run at all needs this table rather than a version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsModeFacts {
+    /// The platform mechanism the table is about, named so a reader does not
+    /// have to infer it from the host fields.
+    mechanism: String,
+    /// One entry per mode in [`FsMode::ALL`] order, including the ones that are
+    /// not enforceable. A table that listed only the enforceable modes would
+    /// leave the rest to inference, and the inference a reader makes is usually
+    /// the optimistic one.
+    modes: Vec<FsModeSupport>,
+}
+
+impl FsModeFacts {
+    /// The platform mechanism this table is about.
+    #[must_use]
+    pub fn mechanism(&self) -> &str {
+        &self.mechanism
+    }
+
+    /// Per-mode enforceability.
+    #[must_use]
+    pub fn modes(&self) -> &[FsModeSupport] {
+        &self.modes
+    }
+}
+
+/// One filesystem mode, and how enforceable it is here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsModeSupport {
+    /// The mode this entry is about.
+    mode: FsMode,
+    /// How enforceable it is.
+    enforceability: ModeEnforceability,
+}
+
+impl FsModeSupport {
+    /// The mode this entry is about.
+    #[must_use]
+    pub fn mode(&self) -> FsMode {
+        self.mode
+    }
+
+    /// How enforceable it is here.
+    #[must_use]
+    pub fn enforceability(&self) -> &ModeEnforceability {
+        &self.enforceability
+    }
+}
+
 /// Which network-filtering mechanisms this platform offers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkFilteringFacts {
@@ -702,6 +760,9 @@ pub struct SupportReport {
     host: Capability<HostFacts>,
     /// Landlock, with the per-right table (Linux).
     landlock: Capability<LandlockFacts>,
+    /// The filesystem mode vocabulary, with the per-mode enforceability table
+    /// for whichever mechanism this platform has.
+    fs_modes: Capability<FsModeFacts>,
     /// seccomp filter installation (Linux).
     seccomp: Capability,
     /// seccomp user-notification, the mechanism proxy-mode mediation needs
@@ -769,6 +830,7 @@ impl SupportReport {
             schema_version: SUPPORT_REPORT_SCHEMA_VERSION,
             host: gather_host(),
             landlock,
+            fs_modes: gather_fs_modes(),
             seccomp,
             seccomp_user_notification,
             seatbelt: gather_seatbelt(),
@@ -826,6 +888,12 @@ impl SupportReport {
     #[must_use]
     pub fn landlock(&self) -> &Capability<LandlockFacts> {
         &self.landlock
+    }
+
+    /// The filesystem mode vocabulary and its per-mode enforceability table.
+    #[must_use]
+    pub fn fs_modes(&self) -> &Capability<FsModeFacts> {
+        &self.fs_modes
     }
 
     /// seccomp filter installation.
@@ -1049,6 +1117,227 @@ fn gather_landlock() -> Capability<LandlockFacts> {
         SupportReason::OtherPlatform {
             mechanism: "Landlock LSM".to_string(),
             this_target_os: std::env::consts::OS.to_string(),
+        },
+    )
+}
+
+/// One per-mode table entry.
+fn mode_support(mode: FsMode, enforceability: ModeEnforceability) -> FsModeSupport {
+    FsModeSupport {
+        mode,
+        enforceability,
+    }
+}
+
+/// The per-mode table for Landlock, against the ABI actually detected here.
+///
+/// `NeedsAbi` is a *live* answer, not a constant: `truncate` reads
+/// `Enforceable` on a V3 kernel and `NeedsAbi { abi: 3 }` on a V2 one, because
+/// that is the difference between a grant that works and a grant that is
+/// refused.
+#[cfg(target_os = "linux")]
+fn gather_fs_modes() -> Capability<FsModeFacts> {
+    use crate::capability_modes::landlock_map::{LandlockRightName, LandlockRightsAvailable};
+
+    const PROBE: &str = "landlock ruleset creation probe, V6 down to V1 with \
+                         CompatLevel::HardRequirement (Sandbox::detect_abi), read against the \
+                         capability_modes::landlock_map table";
+
+    // Landlock did not answer: no right is carried, so no mode is enforceable
+    // and every entry says so. `Unsupported`, not `NeedsAbi` — a kernel with no
+    // Landlock is not a kernel with an old one.
+    let Ok(detected) = crate::sandbox::detect_abi() else {
+        let modes = FsMode::ALL
+            .into_iter()
+            .map(|mode| mode_support(mode, ModeEnforceability::Unsupported))
+            .collect();
+        return Capability::detailed(
+            SupportStatus::Unavailable,
+            Determination::ProbedLive,
+            SupportReason::Probed {
+                probe: PROBE.to_string(),
+            },
+            FsModeFacts {
+                mechanism: "Landlock LSM filesystem access rights".to_string(),
+                modes,
+            },
+        );
+    };
+
+    let available =
+        LandlockRightsAvailable::from_abi_version(crate::sandbox::abi_version_number(detected.abi));
+    // Enforceable when this kernel carries `right`, and the version gap when it
+    // does not — a live answer, not a constant: `truncate` reads `enforceable`
+    // on V3 and `needs_abi { abi: 3 }` on V2, which is exactly the difference
+    // between a grant that works and a grant that is refused.
+    let gated = |right: LandlockRightName| {
+        if available.has(right) {
+            ModeEnforceability::Enforceable
+        } else {
+            ModeEnforceability::NeedsAbi {
+                abi: right.first_abi(),
+            }
+        }
+    };
+
+    let modes = FsMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let enforceability = match mode {
+                // Landlock has distinct READ_FILE, READ_DIR, MAKE_REG,
+                // REMOVE_FILE, REMOVE_DIR and EXECUTE rights, so each of these
+                // really is separable from the others.
+                FsMode::ReadContents
+                | FsMode::ReadDir
+                | FsMode::Write
+                | FsMode::Create
+                | FsMode::RemoveFile
+                | FsMode::RemoveDir
+                | FsMode::Execute => ModeEnforceability::Enforceable,
+                // No right covers stat(2), at any ABI. This is why the
+                // capability below is permanently `partial` on Linux.
+                FsMode::ReadMetadata => ModeEnforceability::Unrestrictable,
+                // WRITE_FILE covers an O_APPEND write; append is the narrower
+                // request and is the one that names its partner.
+                FsMode::Append => ModeEnforceability::BundledWith {
+                    mode: FsMode::Write,
+                },
+                FsMode::Truncate => gated(LandlockRightName::Truncate),
+                FsMode::Rename => gated(LandlockRightName::Refer),
+                FsMode::UnixSocketConnect => ModeEnforceability::Delegated {
+                    target: DelegationTarget::UnixSocketCapability,
+                },
+                // A union of its members, so it is as enforceable as its
+                // weakest member — which is `rename`, and therefore REFER.
+                FsMode::AtomicWrite => gated(LandlockRightName::Refer),
+            };
+            mode_support(mode, enforceability)
+        })
+        .collect();
+
+    Capability::detailed(
+        // Never `Available`: `read_metadata` is not restrictable on this
+        // platform at any ABI, so the vocabulary is permanently partial here.
+        SupportStatus::Partial,
+        Determination::ProbedLive,
+        SupportReason::Probed {
+            probe: PROBE.to_string(),
+        },
+        FsModeFacts {
+            mechanism: "Landlock LSM filesystem access rights".to_string(),
+            modes,
+        },
+    )
+}
+
+/// The per-mode table for Seatbelt.
+///
+/// Static rather than probed, and `PlatformApi` rather than `ProbedLive` for
+/// the same reason [`gather_seatbelt`] is: SBPL has no version negotiation, so
+/// what a mode compiles to is a property of this build, and the only live probe
+/// available would be to sandbox the caller irreversibly.
+///
+/// The bundles are read out of
+/// [`sbpl_map`][crate::capability_modes::sbpl_map]'s own implication table
+/// rather than restated here, so the report and the compiler cannot disagree.
+#[cfg(target_os = "macos")]
+fn gather_fs_modes() -> Capability<FsModeFacts> {
+    seatbelt_fs_modes()
+}
+
+/// The Seatbelt per-mode capability, spelled once.
+///
+/// Compiled off-macOS under `test` so the golden example — which is a macOS
+/// report — is the *same* table `gather()` produces on macOS, rather than a
+/// hand-copy of it that could drift.
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_fs_modes() -> Capability<FsModeFacts> {
+    let modes = FsMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let enforceability = match mode {
+                // `file-read-data`, `file-read-metadata`, `file-write-data`,
+                // `file-write-create`, `file-write-unlink` and `process-exec*`
+                // are distinct operations, so one mode per operation is
+                // separable. Where two modes share an operation, the broader
+                // request keeps `enforceable` and the narrower one names it;
+                // where neither is narrower, the earlier in `FsMode::ALL` keeps
+                // it. Stated as a convention so the table is readable rather
+                // than arbitrary.
+                FsMode::ReadContents
+                | FsMode::ReadMetadata
+                | FsMode::Write
+                | FsMode::Create
+                | FsMode::RemoveFile
+                | FsMode::Execute => ModeEnforceability::Enforceable,
+                // Same `file-read-data` check for `read(2)` on a file and
+                // `readdir(3)` on a directory.
+                FsMode::ReadDir => ModeEnforceability::BundledWith {
+                    mode: FsMode::ReadContents,
+                },
+                // `file-write-data` covers writing, appending and truncating.
+                FsMode::Append | FsMode::Truncate => ModeEnforceability::BundledWith {
+                    mode: FsMode::Write,
+                },
+                // `file-write-unlink` covers unlink(2) and rmdir(2).
+                FsMode::RemoveDir => ModeEnforceability::BundledWith {
+                    mode: FsMode::RemoveFile,
+                },
+                // SBPL has no rename operation at all: a rename is a create on
+                // the destination and an unlink on the source, so it cannot be
+                // granted without granting both.
+                FsMode::Rename => ModeEnforceability::BundledWith {
+                    mode: FsMode::Create,
+                },
+                FsMode::UnixSocketConnect => ModeEnforceability::Delegated {
+                    target: DelegationTarget::UnixSocketCapability,
+                },
+                // A union of operations SBPL expresses exactly, plus the
+                // hex-suffixed temp-sibling rule a file grant needs.
+                FsMode::AtomicWrite => ModeEnforceability::Enforceable,
+            };
+            mode_support(mode, enforceability)
+        })
+        .collect();
+
+    Capability::detailed(
+        // Partial for the opposite reason to Linux's: Seatbelt restricts
+        // `stat(2)` but cannot separate write from append, truncate or the
+        // create/unlink halves of a rename.
+        SupportStatus::Partial,
+        Determination::PlatformApi,
+        SupportReason::PlatformApiLinked {
+            api: "sandbox_init(3) SBPL filesystem operations".to_string(),
+            why_not_probed: "SBPL has no version negotiation: which operation a mode compiles \
+                             to is a property of this build, not of the running kernel, and the \
+                             only live probe available is to install a profile — which applies \
+                             to the calling process and cannot be undone"
+                .to_string(),
+        },
+        FsModeFacts {
+            mechanism: "Seatbelt SBPL filesystem operations".to_string(),
+            modes,
+        },
+    )
+}
+
+/// The per-mode table on a platform with no sandbox mechanism at all.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn gather_fs_modes() -> Capability<FsModeFacts> {
+    let modes = FsMode::ALL
+        .into_iter()
+        .map(|mode| mode_support(mode, ModeEnforceability::Unsupported))
+        .collect();
+    Capability::detailed(
+        SupportStatus::Unavailable,
+        Determination::Declared,
+        SupportReason::OtherPlatform {
+            mechanism: "Landlock LSM or Seatbelt SBPL".to_string(),
+            this_target_os: std::env::consts::OS.to_string(),
+        },
+        FsModeFacts {
+            mechanism: format!("none on {}", std::env::consts::OS),
+            modes,
         },
     )
 }
@@ -1742,6 +2031,11 @@ mod tests {
                 },
             ),
             landlock: gather_landlock_for_other_platform(),
+            // The real macOS table, not a hand-written one: the golden example
+            // is meant to be the shape `gather()` produces here, and a
+            // hand-copied mode table would be a second place the contract is
+            // written down.
+            fs_modes: seatbelt_fs_modes(),
             seccomp: Capability::plain(
                 SupportStatus::Unavailable,
                 Determination::Declared,
@@ -1985,6 +2279,162 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn the_mode_table_names_every_mode_exactly_once_including_the_unenforceable_ones() {
+        let report = SupportReport::gather();
+        let Some(facts) = report.fs_modes().facts() else {
+            panic!("the mode capability always carries its table");
+        };
+        let listed: Vec<FsMode> = facts.modes().iter().map(FsModeSupport::mode).collect();
+        // A table that listed only the enforceable modes would leave the rest
+        // to inference, and the inference a reader makes is the optimistic one.
+        assert_eq!(listed, FsMode::ALL.to_vec());
+        assert!(!facts.mechanism().is_empty());
+    }
+
+    /// The table and the compiler must not be two opinions.
+    ///
+    /// Every entry is checked against what
+    /// [`crate::capability_modes`] actually does with a one-mode grant on this
+    /// platform: an `enforceable` entry has to compile to something, a
+    /// `bundled_with` entry has to really confer its partner, an
+    /// `unrestrictable` entry has to show up as a disclosed no-op, and a
+    /// `needs_abi` entry has to actually refuse.
+    #[test]
+    fn every_table_entry_matches_what_the_compiler_does_on_this_platform() {
+        use crate::capability_modes::FsModeSet;
+
+        let report = SupportReport::gather();
+        let Some(facts) = report.fs_modes().facts() else {
+            panic!("the mode capability always carries its table");
+        };
+
+        for entry in facts.modes() {
+            let mode = entry.mode();
+            let requested = FsModeSet::empty().with(mode);
+
+            #[cfg(target_os = "macos")]
+            let compiled = crate::capability_modes::sbpl_map::compile(requested, true);
+            #[cfg(target_os = "macos")]
+            let produced_something = !compiled.operations.is_empty();
+
+            #[cfg(target_os = "linux")]
+            let compiled = crate::capability_modes::landlock_map::compile(
+                requested,
+                crate::capability_modes::landlock_map::LandlockRightsAvailable::from_abi_version(
+                    match crate::sandbox::detect_abi() {
+                        Ok(abi) => crate::sandbox::abi_version_number(abi.abi),
+                        Err(_) => 0,
+                    },
+                ),
+            );
+            #[cfg(target_os = "linux")]
+            let produced_something = !compiled.rights.is_empty();
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = requested;
+                assert_eq!(entry.enforceability(), &ModeEnforceability::Unsupported);
+                continue;
+            }
+
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            match entry.enforceability() {
+                ModeEnforceability::Enforceable => {
+                    assert!(
+                        produced_something,
+                        "{mode} is reported enforceable but compiles to nothing"
+                    );
+                    assert!(
+                        compiled.modes.refused().is_empty(),
+                        "{mode} is reported enforceable but the compiler refuses it"
+                    );
+                }
+                ModeEnforceability::BundledWith { mode: partner } => {
+                    assert_ne!(*partner, mode, "a mode cannot be bundled with itself");
+                    assert!(
+                        compiled.modes.grants(*partner),
+                        "{mode} is reported bundled with {partner}, but granting {mode} alone \
+                         does not confer {partner}"
+                    );
+                }
+                ModeEnforceability::Unrestrictable => {
+                    assert!(
+                        !produced_something,
+                        "{mode} is reported unrestrictable but compiles to a rule"
+                    );
+                    assert!(
+                        compiled
+                            .modes
+                            .always_allowed()
+                            .iter()
+                            .any(|entry| entry.mode == mode),
+                        "{mode} is reported unrestrictable but the compiler does not disclose \
+                         it as always-allowed"
+                    );
+                }
+                ModeEnforceability::NeedsAbi { abi } => {
+                    assert!(
+                        !compiled.modes.refused().is_empty(),
+                        "{mode} is reported to need ABI V{abi} but the compiler accepts it here"
+                    );
+                }
+                ModeEnforceability::Unsupported => {
+                    assert!(
+                        !produced_something,
+                        "{mode} is reported unsupported but compiles to a rule"
+                    );
+                }
+                ModeEnforceability::Delegated { .. } => {
+                    assert!(
+                        compiled
+                            .modes
+                            .delegated()
+                            .iter()
+                            .any(|entry| entry.mode == mode),
+                        "{mode} is reported delegated but the compiler does not delegate it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The one place the two platforms disagree in the *strong* direction, and
+    /// the reason `read_metadata` is a mode at all.
+    #[test]
+    fn read_metadata_is_the_mode_the_two_platforms_disagree_about() {
+        let report = SupportReport::gather();
+        let Some(facts) = report.fs_modes().facts() else {
+            panic!("the mode capability always carries its table");
+        };
+        let Some(entry) = facts
+            .modes()
+            .iter()
+            .find(|entry| entry.mode() == FsMode::ReadMetadata)
+        else {
+            panic!("read_metadata is always in the table");
+        };
+
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            entry.enforceability(),
+            &ModeEnforceability::Unrestrictable,
+            "Landlock has no right covering stat(2); reporting anything else would claim an \
+             enforcement that does not exist"
+        );
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            entry.enforceability(),
+            &ModeEnforceability::Enforceable,
+            "Seatbelt's file-read-metadata really does restrict stat(2); reporting it as \
+             unrestrictable would understate the platform"
+        );
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(entry.enforceability(), &ModeEnforceability::Unsupported);
     }
 
     #[test]

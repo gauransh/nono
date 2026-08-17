@@ -85,6 +85,36 @@ Note: Landlock rules bind to the inode that was open when the ruleset was applie
 
 Both read and write access rights combined.
 
+### Per-mode grants (library API)
+
+The three flags above are bundles, and the library also offers a vocabulary with
+one word per operation: `CapabilitySet::allow_path_modes(path, FsModeSet)` over
+the thirteen `FsMode` values. `--read`/`--write`/`--allow` are unchanged and
+still compile to exactly the rights listed above; the mode grants are a separate
+list with their own mapping:
+
+| `FsMode` | Landlock right | Notes |
+|---|---|---|
+| `read_contents` | `READ_FILE` | |
+| `read_dir` | `READ_DIR` | |
+| `read_metadata` | *(none)* | **Landlock cannot restrict `stat(2)`.** The grant is a no-op and the compile result says so (`CompiledModes::always_allowed`); the support report calls the mode `unrestrictable` on Linux. macOS *can* restrict it. |
+| `write` | `WRITE_FILE` | |
+| `append` | `WRITE_FILE` | Bundled with `write` and disclosed (`AppendImpliesWrite`): there is no append-only right on either platform. |
+| `create` | `MAKE_REG` | **Regular files only.** The other six `MAKE_*` rights are *not* granted, so a mode-set grant cannot `mkdir`, create a symlink, a socket, a fifo or a device node. Coarse `--write` still grants all seven; a caller who needs them uses `--write`/`allow_path` knowingly. |
+| `truncate` | `TRUNCATE` (v3+) | On ABI &lt; v3 the grant is **refused** (`NonoError::ModeUnsupported`), not dropped: there, truncation is not restrictable at all, so a rule that compiled to nothing would read as enforcement. |
+| `remove_file` | `REMOVE_FILE` | |
+| `remove_dir` | `REMOVE_DIR` | |
+| `rename` | `REFER` (v2+) | Refused on ABI v1, same reasoning as `truncate`. |
+| `execute` | `EXECUTE` | |
+| `unix_socket_connect` | *(none)* | Landlock has no AF_UNIX connect right. Delegated to `UnixSocketCapability`, which is the type that already models socket grants; enforced only where the seccomp-notify AF_UNIX mediation is installed. |
+| `atomic_write` | union of `create`, `write`, `rename`, `remove_file` | A published named bundle (`FsMode::ATOMIC_WRITE_MEMBERS`), so it inherits `rename`'s v2 gate. |
+
+Nothing in a mode grant is silently widened or silently dropped:
+`Sandbox::compile_fs_modes(&caps)` returns, per grant, the modes that are
+enforced, the modes that ride along with them and why, the modes the platform
+cannot restrict, the modes it delegates, and the modes it refuses. A refusal
+fails `prepare`/`apply`.
+
 ## Network Filtering
 
 Landlock ABI v4 (kernel 6.7+) added TCP network filtering:

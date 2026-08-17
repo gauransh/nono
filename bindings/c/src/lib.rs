@@ -148,6 +148,11 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         | nono::NonoError::RegistryError(_)
         | nono::NonoError::ActionRequired(_) => NonoErrorCode::ErrConfigParse,
         nono::NonoError::NetworkFilterUnsupported { .. } => NonoErrorCode::ErrUnsupportedPlatform,
+        // A filesystem mode this platform will not express is the same class of
+        // refusal as a network filter it cannot express: the policy was refused
+        // rather than degraded. An empty mode set is a call-site mistake.
+        nono::NonoError::ModeUnsupported { .. } => NonoErrorCode::ErrUnsupportedPlatform,
+        nono::NonoError::EmptyModeSet(_) => NonoErrorCode::ErrInvalidArg,
         // CLI-only user-cancellation marker. Library callers shouldn't
         // see it through the FFI in normal use, but if they do, surface
         // as an invalid-arg style error code rather than a real fault.

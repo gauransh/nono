@@ -34,6 +34,12 @@ pub use linux::{
 #[cfg(target_os = "linux")]
 pub use linux::is_wsl2;
 
+// The one place a `landlock::ABI` becomes the plain version number the
+// mode mapping (and the support report's per-mode table) is driven by.
+// Crate-internal: `DetectedAbi` stays the public shape.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::abi_version_number;
+
 // Re-export Linux seccomp-notify primitives for supervisor use
 #[cfg(target_os = "linux")]
 pub use linux::{
@@ -195,6 +201,48 @@ impl Sandbox {
     #[cfg(target_os = "linux")]
     pub fn restrict_execute(paths: &[impl AsRef<std::path::Path>]) -> Result<()> {
         linux::restrict_execute(paths)
+    }
+
+    /// What this platform will do with the mode-aware grants in `caps`.
+    ///
+    /// One [`CompiledModes`] per
+    /// [`allow_path_modes`][CapabilitySet::allow_path_modes] grant, in grant
+    /// order. This is the same compilation the profile or ruleset is built
+    /// from, so a caller that reads the disclosures and a caller that applies
+    /// the policy cannot be looking at two different answers.
+    ///
+    /// Read it before applying: `bundled` names every mode the grant confers
+    /// beyond what was asked for, `always_allowed` names every mode this
+    /// platform cannot restrict at all, and `delegated` names the modes another
+    /// capability enforces.
+    ///
+    /// # Errors
+    ///
+    /// [`NonoError::ModeUnsupported`][crate::NonoError::ModeUnsupported] if a
+    /// granted mode is one this platform will not express — the same refusal
+    /// that fails the apply, surfaced before anything is applied. On Linux this
+    /// probes the Landlock ABI, so it can also fail if Landlock is unavailable.
+    pub fn compile_fs_modes(caps: &CapabilitySet) -> Result<Vec<crate::CompiledModes>> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::compile_fs_modes(caps)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            macos::compile_fs_modes(caps)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if caps.fs_mode_capabilities().is_empty() {
+                return Ok(Vec::new());
+            }
+            Err(crate::NonoError::UnsupportedPlatform(format!(
+                "no sandbox mechanism on {}, so no filesystem mode can be enforced",
+                std::env::consts::OS
+            )))
+        }
     }
 
     /// Check if sandboxing is supported on this platform

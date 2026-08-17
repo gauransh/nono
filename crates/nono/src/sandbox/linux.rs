@@ -3,6 +3,10 @@
 use crate::capability::{
     AccessMode, CapabilitySet, IpcMode, NetworkMode, SignalMode, merge_port_ranges,
 };
+use crate::capability_modes::{
+    CompiledModes, FsModeCapability,
+    landlock_map::{self, LandlockRightName, LandlockRightsAvailable},
+};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use landlock::{
@@ -592,6 +596,99 @@ fn access_to_landlock(access: AccessMode, abi: ABI) -> LandlockAccess {
     }
 }
 
+/// The ABI version number for a detected `landlock::ABI`.
+///
+/// The mode mapping is version-driven so it can be exercised without a kernel
+/// (see [`landlock_map`]); this is the one place the two representations meet.
+pub(crate) fn abi_version_number(abi: ABI) -> u8 {
+    match abi {
+        // Not "version 0": a kernel with no Landlock carries no right, so every
+        // mode grant against it is refused rather than compiled to nothing.
+        ABI::Unsupported => 0,
+        ABI::V1 => 1,
+        ABI::V2 => 2,
+        ABI::V3 => 3,
+        ABI::V4 => 4,
+        ABI::V5 => 5,
+        ABI::V6 => 6,
+        ABI::V7 => 7,
+        // `landlock::ABI` is `#[non_exhaustive]`. Landlock's own compatibility
+        // contract makes each ABI a superset of the last, so a version this
+        // build has not read still carries everything V7 does; reporting it as
+        // V7 credits it with exactly the rights whose semantics *have* been
+        // read, and with none that have not.
+        _ => 7,
+    }
+}
+
+/// Which Landlock rights `abi` really carries.
+fn rights_available(abi: ABI) -> LandlockRightsAvailable {
+    LandlockRightsAvailable::from_abi_version(abi_version_number(abi))
+}
+
+/// The `landlock::AccessFs` flag a [`LandlockRightName`] names.
+///
+/// The only part of the Linux mode mapping that cannot run on a non-Linux host,
+/// and deliberately the smallest part: everything else is in [`landlock_map`],
+/// which is compiled and tested everywhere.
+fn access_fs_for(right: LandlockRightName) -> AccessFs {
+    match right {
+        LandlockRightName::ReadFile => AccessFs::ReadFile,
+        LandlockRightName::ReadDir => AccessFs::ReadDir,
+        LandlockRightName::WriteFile => AccessFs::WriteFile,
+        LandlockRightName::Execute => AccessFs::Execute,
+        LandlockRightName::MakeReg => AccessFs::MakeReg,
+        LandlockRightName::RemoveFile => AccessFs::RemoveFile,
+        LandlockRightName::RemoveDir => AccessFs::RemoveDir,
+        LandlockRightName::Refer => AccessFs::Refer,
+        LandlockRightName::Truncate => AccessFs::Truncate,
+    }
+}
+
+/// Compile one mode-aware capability into the rights its rule carries.
+///
+/// A refusal from [`landlock_map`] becomes [`NonoError::ModeUnsupported`] here,
+/// which fails the whole apply. That is the fail-closed half of the mode
+/// vocabulary: on a kernel without `TRUNCATE`, truncation is not restrictable at
+/// all, so a grant that quietly compiled to no right would read as enforcement.
+fn mode_cap_access(
+    cap: &FsModeCapability,
+    abi: ABI,
+) -> Result<(BitFlags<AccessFs>, landlock_map::CompiledLandlock)> {
+    let compiled = landlock_map::compile(cap.modes, rights_available(abi));
+    if let Some(refusal) = compiled.modes.first_refusal() {
+        return Err(NonoError::ModeUnsupported {
+            mode: refusal.mode.to_string(),
+            path: cap.resolved.clone(),
+            detail: refusal.why.to_string(),
+        });
+    }
+    let mut access = BitFlags::<AccessFs>::empty();
+    for right in &compiled.rights {
+        access |= access_fs_for(*right);
+    }
+    Ok((access, compiled))
+}
+
+/// What Landlock will do with the mode-aware grants in `caps`, at the detected
+/// ABI.
+///
+/// # Errors
+///
+/// Returns an error if Landlock is unavailable, or
+/// [`NonoError::ModeUnsupported`] if the detected ABI will not carry a granted
+/// mode's right.
+pub(crate) fn compile_fs_modes(caps: &CapabilitySet) -> Result<Vec<CompiledModes>> {
+    if caps.fs_mode_capabilities().is_empty() {
+        return Ok(Vec::new());
+    }
+    let abi = detect_abi()?.abi;
+    caps.fs_mode_capabilities()
+        .iter()
+        .map(|cap| mode_cap_access(cap, abi).map(|(_, compiled)| compiled.modes))
+        .collect()
+}
+
 /// Legacy check: whether the simple block-all seccomp filter can be used.
 ///
 /// Only true for plain `NetworkMode::Blocked` with no port exceptions.
@@ -882,6 +979,41 @@ fn prepare_with_abi_inner(
             && (is_device_path(&cap.resolved) || is_device_directory(&cap.resolved))
         {
             access |= AccessFs::IoctlDev;
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(&cap.resolved)
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Cannot pre-open Landlock rule path {}: {}",
+                    cap.resolved.display(),
+                    e
+                ))
+            })?;
+        let path_fd = move_fd_above_stdio(file.into()).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Cannot reserve Landlock rule descriptor for {}: {}",
+                cap.resolved.display(),
+                e
+            ))
+        })?;
+        path_rules.push(PreparedPathRule {
+            path_fd,
+            allowed_access: access.bits(),
+        });
+    }
+
+    // Mode-aware grants. Same rule shape, different access derivation; a
+    // refusal here fails the prepare rather than producing a narrower rule.
+    for cap in caps.fs_mode_capabilities() {
+        let (access, _) = mode_cap_access(cap, target_abi)?;
+        if access.is_empty() {
+            // Every mode in this grant was always-allowed or delegated. A
+            // `PathBeneath` with no rights would be a rule that grants nothing
+            // and reads as a grant, so none is added.
+            continue;
         }
 
         let file = std::fs::OpenOptions::new()
@@ -1254,6 +1386,51 @@ fn apply_with_abi_inner(
         debug!(
             "Adding rule: {} with access {:?}",
             cap.resolved.display(),
+            access
+        );
+
+        let path_fd = PathFd::new(&cap.resolved)?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(path_fd, access))
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Cannot add Landlock rule for {}: {} (filesystem may not support Landlock)",
+                    cap.resolved.display(),
+                    e
+                ))
+            })?;
+    }
+
+    // Mode-aware grants. Same rule shape as above; the access set comes from
+    // the mode mapping instead of the three coarse bundles, and a mode this
+    // ABI cannot carry aborts the whole apply rather than narrowing the rule.
+    for cap in caps.fs_mode_capabilities() {
+        let (access, _) = mode_cap_access(cap, target_abi)?;
+        if access.is_empty() {
+            debug!(
+                "Mode grant for {} compiles to no Landlock right (every mode is \
+                 always-allowed or delegated); no rule added",
+                cap.resolved.display()
+            );
+            continue;
+        }
+
+        if let Some(dev) = unsupported_filesystem_dev(&cap.resolved)
+            && warned_unsupported_devs.insert(dev)
+        {
+            warn!(
+                "Path '{}' is on a 9P filesystem (e.g. WSL2 Windows host mount, QEMU virtfs). \
+                 Landlock enforcement on 9P paths is unreliable — grants may be silently ignored \
+                 or incompletely enforced, causing unexpected access denials. \
+                 Move your working directory to a native Linux filesystem to use nono safely.",
+                cap.resolved.display()
+            );
+        }
+
+        debug!(
+            "Adding mode rule: {} with modes {} -> access {:?}",
+            cap.resolved.display(),
+            cap.modes,
             access
         );
 
@@ -5798,5 +5975,165 @@ mod tests {
              (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
              3=restrict_execute failed, 4=mkdir failed)"
         );
+    }
+
+    use crate::capability_modes::{FsMode, FsModeSet};
+
+    // -----------------------------------------------------------------------
+    // Mode-aware capability vocabulary (R06). The mapping itself lives in
+    // `capability_modes::landlock_map` and is tested there on every host; what
+    // is tested here is the Linux-only glue, which is the only part that needs
+    // a kernel-shaped `landlock::ABI` and a real `AccessFs`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn abi_version_numbers_match_the_probe_order() {
+        let expected = [6u8, 5, 4, 3, 2, 1];
+        for (abi, number) in ABI_PROBE_ORDER.iter().zip(expected) {
+            assert_eq!(
+                abi_version_number(*abi),
+                number,
+                "{abi:?} must be reported as V{number}"
+            );
+        }
+        // A kernel without Landlock carries no right, so it must not be
+        // credited with V1's.
+        assert_eq!(abi_version_number(ABI::Unsupported), 0);
+        assert!(
+            !rights_available(ABI::Unsupported).has(LandlockRightName::ReadFile),
+            "an unsupported kernel must not be reported as carrying READ_FILE"
+        );
+    }
+
+    /// The one claim the pure mapping cannot check for itself: that
+    /// `LandlockRightsAvailable`'s version table says the same thing the
+    /// landlock crate's own `AccessFs::from_all` says, for every right and
+    /// every ABI. If they ever disagree, a mode grant would be compiled against
+    /// a right the kernel does not handle.
+    #[test]
+    fn the_rights_table_agrees_with_the_landlock_crates_own_abi_table() {
+        let rights = [
+            LandlockRightName::ReadFile,
+            LandlockRightName::ReadDir,
+            LandlockRightName::WriteFile,
+            LandlockRightName::Execute,
+            LandlockRightName::MakeReg,
+            LandlockRightName::RemoveFile,
+            LandlockRightName::RemoveDir,
+            LandlockRightName::Refer,
+            LandlockRightName::Truncate,
+        ];
+        for abi in ABI_PROBE_ORDER {
+            let available = rights_available(abi);
+            let from_all = AccessFs::from_all(abi);
+            for right in rights {
+                assert_eq!(
+                    available.has(right),
+                    from_all.contains(access_fs_for(right)),
+                    "{right} availability disagrees with AccessFs::from_all({abi:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_mode_compiles_to_the_access_right_the_contract_names() {
+        let table = [
+            (FsMode::ReadContents, AccessFs::ReadFile),
+            (FsMode::ReadDir, AccessFs::ReadDir),
+            (FsMode::Write, AccessFs::WriteFile),
+            (FsMode::Append, AccessFs::WriteFile),
+            (FsMode::Create, AccessFs::MakeReg),
+            (FsMode::Truncate, AccessFs::Truncate),
+            (FsMode::RemoveFile, AccessFs::RemoveFile),
+            (FsMode::RemoveDir, AccessFs::RemoveDir),
+            (FsMode::Rename, AccessFs::Refer),
+            (FsMode::Execute, AccessFs::Execute),
+        ];
+        for (mode, right) in table {
+            let cap = match FsModeCapability::new_dir("/", FsModeSet::empty().with(mode)) {
+                Ok(cap) => cap,
+                Err(err) => panic!("root must be grantable: {err}"),
+            };
+            let (access, _) = match mode_cap_access(&cap, ABI::V6) {
+                Ok(pair) => pair,
+                Err(err) => panic!("{mode} must compile on V6: {err}"),
+            };
+            assert!(access.contains(right), "{mode} must compile to {right:?}");
+        }
+    }
+
+    #[test]
+    fn create_compiles_to_make_reg_and_no_other_node_type() {
+        let cap = match FsModeCapability::new_dir("/", FsModeSet::empty().with(FsMode::Create)) {
+            Ok(cap) => cap,
+            Err(err) => panic!("root must be grantable: {err}"),
+        };
+        let (access, _) = match mode_cap_access(&cap, ABI::V6) {
+            Ok(pair) => pair,
+            Err(err) => panic!("create must compile on V6: {err}"),
+        };
+        assert_eq!(access, BitFlags::from(AccessFs::MakeReg));
+        for other in [
+            AccessFs::MakeDir,
+            AccessFs::MakeSym,
+            AccessFs::MakeSock,
+            AccessFs::MakeFifo,
+            AccessFs::MakeChar,
+            AccessFs::MakeBlock,
+        ] {
+            assert!(
+                !access.contains(other),
+                "a create grant must not confer {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_metadata_compiles_to_no_rule_because_landlock_cannot_restrict_stat() {
+        let cap =
+            match FsModeCapability::new_dir("/", FsModeSet::empty().with(FsMode::ReadMetadata)) {
+                Ok(cap) => cap,
+                Err(err) => panic!("root must be grantable: {err}"),
+            };
+        let (access, compiled) = match mode_cap_access(&cap, ABI::V6) {
+            Ok(pair) => pair,
+            Err(err) => panic!("read_metadata must compile on V6: {err}"),
+        };
+        assert!(access.is_empty());
+        assert_eq!(compiled.modes.always_allowed().len(), 1);
+    }
+
+    #[test]
+    fn an_abi_gated_mode_refuses_the_apply_instead_of_narrowing_it() {
+        let cap = match FsModeCapability::new_dir("/", FsModeSet::empty().with(FsMode::Truncate)) {
+            Ok(cap) => cap,
+            Err(err) => panic!("root must be grantable: {err}"),
+        };
+        match mode_cap_access(&cap, ABI::V2) {
+            Ok((access, _)) => panic!(
+                "V2 must refuse a truncate grant, not compile it to {access:?} \
+                 (silent widening: on V2 truncation is unrestricted everywhere)"
+            ),
+            Err(NonoError::ModeUnsupported { mode, detail, .. }) => {
+                assert_eq!(mode, "truncate");
+                assert!(detail.contains("V2"), "the refusal must name the ABI found");
+                assert!(
+                    detail.contains("V3"),
+                    "the refusal must name the ABI needed"
+                );
+            }
+            Err(err) => panic!("the refusal must be typed ModeUnsupported, got {err}"),
+        }
+
+        let rename = match FsModeCapability::new_dir("/", FsModeSet::empty().with(FsMode::Rename)) {
+            Ok(cap) => cap,
+            Err(err) => panic!("root must be grantable: {err}"),
+        };
+        assert!(
+            mode_cap_access(&rename, ABI::V1).is_err(),
+            "V1 must refuse a rename grant: REFER does not exist there"
+        );
+        assert!(mode_cap_access(&rename, ABI::V2).is_ok());
     }
 }

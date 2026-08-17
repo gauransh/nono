@@ -47,6 +47,7 @@
 
 pub mod audit;
 pub mod capability;
+pub mod capability_modes;
 pub mod diagnostic;
 pub mod error;
 pub mod keystore;
@@ -69,6 +70,11 @@ pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, CoveringCapabilities, FsCapability, IpcMode,
     NetworkMode, ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode,
     UnixSocketOp,
+};
+pub use capability_modes::{
+    AlwaysAllowedReason, BundleReason, CompiledModes, DelegationTarget, FsMode, FsModeCapability,
+    FsModeSet, ModeAlwaysAllowed, ModeBundle, ModeDelegation, ModeEnforceability, ModeRefusal,
+    ModeTarget, RefusalReason,
 };
 pub use diagnostic::{
     DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,

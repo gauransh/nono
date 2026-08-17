@@ -191,6 +191,29 @@ pub enum NonoError {
     #[error("Per-port network filtering not supported on {platform}: {reason}")]
     NetworkFilterUnsupported { platform: String, reason: String },
 
+    /// A mode-set grant named no operation. Refused rather than stored: a path
+    /// that appears in every diagnostic and grants nothing is worse than no
+    /// grant at all.
+    #[error("Filesystem mode grant for {0} names no modes")]
+    EmptyModeSet(PathBuf),
+
+    /// The platform cannot express a granted [`FsMode`][crate::FsMode] here, so
+    /// the whole policy is refused instead of being compiled into something
+    /// narrower or wider than what was asked for.
+    ///
+    /// This is the fail-closed half of the mode vocabulary. `detail` carries
+    /// the typed [`RefusalReason`][crate::capability_modes::RefusalReason]'s own
+    /// rendering, which names the right, the ABI found and the ABI needed.
+    #[error("Cannot enforce filesystem mode '{mode}' on {path}: {detail}")]
+    ModeUnsupported {
+        /// The mode that cannot be honoured.
+        mode: String,
+        /// The path it was granted on.
+        path: PathBuf,
+        /// Why the platform will not express it.
+        detail: String,
+    },
+
     // Lifecycle errors
     #[error("Lifecycle error: {0}")]
     Lifecycle(#[from] crate::lifecycle::LifecycleError),
@@ -218,6 +241,12 @@ impl NonoError {
         use crate::diagnostic::NonoDiagnosticCode;
         match self {
             Self::CwdPromptRequired => NonoDiagnosticCode::CwdAccessRequired,
+            // A mode the platform will not express is the same class of failure
+            // as any other unsupported platform feature: the policy was
+            // refused, not degraded.
+            Self::ModeUnsupported { .. } => NonoDiagnosticCode::UnsupportedPlatformFeature,
+            // An empty mode set is a call-site mistake, like an empty command.
+            Self::EmptyModeSet(_) => NonoDiagnosticCode::ConfigurationError,
             Self::SecretNotFound(_) => NonoDiagnosticCode::CredentialNotFound,
             Self::KeystoreAccess(_) => NonoDiagnosticCode::CredentialUnavailable,
             Self::UnsupportedPlatform(_) | Self::NetworkFilterUnsupported { .. } => {

@@ -4,6 +4,13 @@ Honest per-platform capability model as implemented at the pinned base.
 Host for live verification: aarch64-apple-darwin (Darwin 23.6.0). Linux live runs require a
 provisioned environment (Docker/CI) — see BLOCKED_ROWS.json notes.
 
+> **Fork delta (R06).** The three-value `AccessMode` described below is unchanged and still
+> means what it meant. A **mode vocabulary** now sits beside it: `FsModeSet` over thirteen
+> named operations, granted with `CapabilitySet::allow_path_modes`, compiled per platform into
+> a `CompiledModes` that names every bundling, every unrestrictable operation, every delegation
+> and every refusal. See "Mode-aware filesystem vocabulary" at the end of this file for the
+> full two-platform table and for what it changes about macOS `process-exec`.
+
 ## Linux (crates/nono/src/sandbox/linux.rs, 5802 lines)
 
 ### Landlock
@@ -22,7 +29,8 @@ provisioned environment (Docker/CI) — see BLOCKED_ROWS.json notes.
   Truncate}. Bundling is disclosed in `docs/cli/internals/landlock.mdx` ("Access Rights
   Mapping"; atomic-write is why Remove/Refer/Truncate ride along with Write). **No independent
   append/create/truncate/remove/rename/metadata/exec toggles** — coarseness, honestly
-  documented.
+  documented. *(Fork delta R06: `allow_path_modes` adds those toggles as a parallel grant
+  list; `access_to_landlock` and the three coarse modes are unchanged.)*
 - `IoctlDev` (V5+): granted only for detected device paths/dirs, not blanket.
 - Execute narrowing: `Sandbox::restrict_execute` (:1336-1421) and CLI
   `apply_outer_exec_gate` (`tool-sandbox/platform/linux.rs:3093-3175`) stack a second
@@ -88,10 +96,64 @@ provisioned environment (Docker/CI) — see BLOCKED_ROWS.json notes.
   are themselves wildcard bundles). Metadata-only rules exist solely as internal parent-dir/
   PATH traversal derivations (:660-668, :754-798), not a selectable mode.
 - **Exec is not per-path gated**: `(allow process-exec*)` unconditional (:555); executable
-  restriction relies on process-model timing, not a capability bit.
+  restriction relies on process-model timing, not a capability bit. *(Fork delta R06: still
+  unconditional for a coarse-only capability set — byte-identical to upstream — but scoped to
+  the `execute`-granted paths as soon as the set carries one mode grant.)*
 - `macos::support_info` (:162-174) hardcodes `is_supported: true` — no probe. The real probe
   (fork + `sandbox_init`) exists only in `nono setup --check-only`
   (`nono-cli/src/setup.rs:91-165`), println-only, no machine-readable output.
+
+## Mode-aware filesystem vocabulary (fork delta, R06)
+
+`crates/nono/src/capability_modes/` — `FsMode` (13 modes), `FsModeSet`, `FsModeCapability`,
+`CompiledModes`. Builder entry `CapabilitySet::allow_path_modes(path, modes)` /
+`allow_file_modes`. `allow_path`/`allow_file` and `AccessMode` are untouched;
+`FsModeSet::describes_access_mode` states each coarse bundle in the new vocabulary's words.
+
+The mapping tables are **pure functions over platform capability data**, not `cfg`-gated code:
+`landlock_map::compile` takes a `LandlockRightsAvailable` (an ABI number), so every Linux arm
+— both ABI gates included — is exercised by unit tests on this macOS host. Only
+`access_fs_for` / `abi_version_number` / the two rule loops in `sandbox/linux.rs` need a
+kernel.
+
+| `FsMode` | Linux (Landlock) | macOS (Seatbelt SBPL) |
+|---|---|---|
+| `read_contents` | `READ_FILE` — enforceable | `file-read-data` + `file-map-executable` — enforceable |
+| `read_dir` | `READ_DIR` — enforceable | `file-read-data` — **bundled with `read_contents`** (one op covers `read(2)` and `readdir(3)`) |
+| `read_metadata` | **none — unrestrictable**; grant is a disclosed no-op (`always_allowed`) | `file-read-metadata` — **enforceable**; the one place macOS is finer than Linux |
+| `write` | `WRITE_FILE` — enforceable | `file-write-data` — enforceable |
+| `append` | `WRITE_FILE` — **bundled with `write`** (`AppendImpliesWrite`) | `file-write-data` — **bundled with `write`** (same reason) |
+| `create` | `MAKE_REG` **only** — enforceable; the other six `MAKE_*` are deliberately not granted and have no mode | `file-write-create` — enforceable, but covers **all** node types (SBPL cannot narrow to regular files) |
+| `truncate` | `TRUNCATE`, **ABI ≥ 3** — else typed refusal `UnsupportedRight{right, abi, needed_abi}`, failing prepare/apply closed | `file-write-data` — **bundled with `write`** (`SeatbeltTruncateIsWriteData`) |
+| `remove_file` | `REMOVE_FILE` — enforceable | `file-write-unlink` — enforceable |
+| `remove_dir` | `REMOVE_DIR` — enforceable | `file-write-unlink` — **bundled with `remove_file`** |
+| `rename` | `REFER`, **ABI ≥ 2** — else typed refusal | `file-write-create` + `file-write-unlink` — **bundled with `create`** (and transitively `remove_file`); SBPL has no rename op |
+| `execute` | `EXECUTE` — enforceable | `process-exec*` **scoped to the path** + `file-map-executable` — enforceable |
+| `unix_socket_connect` | none — **delegated** to `UnixSocketCapability` (Landlock has no AF_UNIX right; enforced only under the opt-in seccomp-notify mediation) | none — **delegated** to `UnixSocketCapability`'s own `network-outbound` rules |
+| `atomic_write` | union of `create`+`write`+`rename`+`remove_file`; inherits `rename`'s ABI-2 gate | same union, plus the hex-suffixed temp-sibling rule for *file* grants (`^<path>[.]tmp[.][0-9]+[.][0-9a-f]+$`, ported from `nono-cli/src/capability_ext.rs:434-460`, narrowed from `file-write*` to the four operations a temp write performs) |
+
+`CompiledModes { enforced, bundled: [(requested, also_granted, why)], always_allowed, refused,
+delegated }` — readable before applying via `Sandbox::compile_fs_modes(&caps)`. A refusal is an
+error at prepare/apply; nothing is dropped and nothing is widened without an entry naming it.
+
+**What this changes about macOS exec.** The unconditional `(allow process-exec*)` at
+`macos.rs:555` is now emitted only when the capability set has **no** mode grants — which is
+every existing consumer including all of `nono-cli`, so upstream behaviour is byte-identical
+there. A set with at least one mode grant gets `(allow process-exec* (<filter>))` per
+`execute`-granted path and nothing else, which turns "which binary may run" from a property of
+the process model's timing into a capability bit. Proven live: a `#!` program in a
+`read_contents`-granted directory is refused at `execve` with a typed
+`ActivationError::PreExecFailed { stage: Exec, errno: EPERM }`, and the same program with
+`execute` added exits 0 (`crates/nono/tests/lifecycle_modes_live.rs`).
+
+**Support report.** `SupportReport.fs_modes` carries the per-mode enforceability table
+(`enforceable` / `bundled_with{mode}` / `unrestrictable` / `needs_abi{abi}` / `unsupported` /
+`delegated{target}`), `probed_live` on Linux against the real detected ABI and `platform_api`
+on macOS. `partial` on both platforms, for opposite reasons.
+
+**Verification status.** macOS: live-proven, 14 positive/negative lifecycle pairs. Linux:
+mapping logic host-tested against a faked ABI (every arm, both gates); the ruleset wiring is
+written-unverified behind the R07 Linux-runner blocker.
 
 ## Observation fidelity (both platforms)
 

@@ -47,6 +47,7 @@ typed `facts`:
 | `schema_version` | `u32` | no | The schema this report was written by. Bumped when a field's meaning changes, not when one is added. |
 | `host` | capability of `HostFacts` | no | The machine, as compiled for and as running. |
 | `landlock` | capability of `LandlockFacts` | no | Landlock and its per-right table (Linux). `other_platform` elsewhere. |
+| `fs_modes` | capability of `FsModeFacts` | no | The filesystem mode vocabulary (`FsModeSet`) and how enforceable each of its thirteen modes is here. `partial` on **both** platforms, for opposite reasons — see below. |
 | `seccomp` | capability | no | Whether a seccomp filter can be installed (Linux). |
 | `seccomp_user_notification` | capability | no | Whether `SECCOMP_RET_USER_NOTIF` mediation is available (Linux). |
 | `seatbelt` | capability | no | Seatbelt (macOS). |
@@ -76,6 +77,44 @@ typed `facts`:
 
 The capability is `available` only when every right is; anything less is
 `partial`, because the difference is exactly what a consumer has to plan around.
+
+### `FsModeFacts`
+
+| Field | Type | Nullable | Meaning |
+|---|---|---|---|
+| `mechanism` | string | no | The platform mechanism the table is about, named so a reader does not infer it from the host fields. |
+| `modes` | array of `{mode, enforceability}` | no | One entry per mode in `FsMode::ALL` order — **including the ones that are not enforceable**, so nothing is left to inference. |
+
+`enforceability` is a tagged object:
+
+| `enforceability` | Extra fields | Meaning |
+|---|---|---|
+| `enforceable` | — | The platform expresses this mode as a grant distinct from the others. |
+| `bundled_with` | `mode` | It cannot be separated from `mode`: granting either grants both. The **narrower** request is the one that names its partner; where neither is narrower, the earlier in `FsMode::ALL` keeps `enforceable`. |
+| `unrestrictable` | — | The platform cannot restrict the operation at all. A grant is a no-op, and the *absence* of a grant is not a denial. |
+| `needs_abi` | `abi` | The platform could express it, but not at the version detected here. A grant is **refused** (`NonoError::ModeUnsupported`), not silently dropped. |
+| `unsupported` | — | The platform has no mechanism for it. |
+| `delegated` | `target` | Enforced, but by a sibling capability — `unix_socket_capability` — rather than by the filesystem rules. |
+
+The rolled-up status is `partial` on both platforms and for **opposite** reasons,
+which is the fact this table exists to make readable:
+
+- **Linux**: `read_metadata` is `unrestrictable`. Landlock has no access right
+  covering `stat(2)`, so a metadata grant changes nothing and a metadata
+  *denial* is not expressible. `truncate` and `rename` are `needs_abi` below V3
+  and V2 respectively, read from the ABI detected in this process — so the entry
+  is `probed_live`.
+- **macOS**: `read_metadata` is `enforceable` (`file-read-metadata` is a real
+  SBPL operation), but `append`, `truncate`, `read_dir`, `remove_dir` and
+  `rename` are all `bundled_with` something, because SBPL has one operation
+  where the contract has two. The entry is `platform_api`, not `probed_live`:
+  SBPL has no version negotiation, so what a mode compiles to is a property of
+  this build, and the only live probe available is to install a profile, which
+  cannot be undone.
+
+`atomic_write` is a *named bundle* over `create`, `write`, `rename` and
+`remove_file`, so it is as enforceable as its weakest member — on Linux that is
+`rename`, and therefore `REFER`.
 
 ### `NetworkFilteringFacts`
 
@@ -175,6 +214,104 @@ the kind of claim this report exists to prevent.
       "reason": "other_platform",
       "mechanism": "Landlock LSM",
       "this_target_os": "macos"
+    }
+  },
+  "fs_modes": {
+    "status": "partial",
+    "determination": "platform_api",
+    "reason": {
+      "reason": "platform_api_linked",
+      "api": "sandbox_init(3) SBPL filesystem operations",
+      "why_not_probed": "SBPL has no version negotiation: which operation a mode compiles to is a property of this build, not of the running kernel, and the only live probe available is to install a profile — which applies to the calling process and cannot be undone"
+    },
+    "facts": {
+      "mechanism": "Seatbelt SBPL filesystem operations",
+      "modes": [
+        {
+          "mode": "read_contents",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        },
+        {
+          "mode": "read_dir",
+          "enforceability": {
+            "enforceability": "bundled_with",
+            "mode": "read_contents"
+          }
+        },
+        {
+          "mode": "read_metadata",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        },
+        {
+          "mode": "write",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        },
+        {
+          "mode": "append",
+          "enforceability": {
+            "enforceability": "bundled_with",
+            "mode": "write"
+          }
+        },
+        {
+          "mode": "create",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        },
+        {
+          "mode": "truncate",
+          "enforceability": {
+            "enforceability": "bundled_with",
+            "mode": "write"
+          }
+        },
+        {
+          "mode": "remove_file",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        },
+        {
+          "mode": "remove_dir",
+          "enforceability": {
+            "enforceability": "bundled_with",
+            "mode": "remove_file"
+          }
+        },
+        {
+          "mode": "rename",
+          "enforceability": {
+            "enforceability": "bundled_with",
+            "mode": "create"
+          }
+        },
+        {
+          "mode": "execute",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        },
+        {
+          "mode": "unix_socket_connect",
+          "enforceability": {
+            "enforceability": "delegated",
+            "target": "unix_socket_capability"
+          }
+        },
+        {
+          "mode": "atomic_write",
+          "enforceability": {
+            "enforceability": "enforceable"
+          }
+        }
+      ]
     }
   },
   "seccomp": {

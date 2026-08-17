@@ -288,6 +288,48 @@ frozen-contract state of THIS repository only.
   ceilings — each reported by `SupportReport` rather than left to inference
   (ADR-0001 §6). `interactive_session` and `attach` are now `available`.
 
+- Landed (iteration 10, macOS live-verified; Linux mapping host-verified
+  against a faked ABI, Linux live behind the R07 blocker):
+  `nono::{FsMode, FsModeSet, FsModeCapability, CompiledModes, ModeBundle,
+  ModeRefusal, ModeAlwaysAllowed, ModeDelegation, ModeEnforceability,
+  BundleReason, RefusalReason, AlwaysAllowedReason, DelegationTarget,
+  ModeTarget}`, `CapabilitySet::{allow_path_modes, allow_file_modes,
+  fs_mode_capabilities, add_fs_modes}`, `Sandbox::compile_fs_modes(&caps) ->
+  Result<Vec<CompiledModes>>`, and `SupportReport::fs_modes()`. A per-path
+  grant over thirteen named operations instead of the three coarse
+  `AccessMode` bundles.
+
+  **`AccessMode`, `allow_path` and `allow_file` are unchanged** — same
+  signatures, same rules, same profile bytes. A capability set that uses none
+  of the new API compiles to exactly what it compiled to before, including
+  macOS's unconditional `(allow process-exec*)`.
+
+  **Read the compilation before you apply it.** `Sandbox::compile_fs_modes`
+  returns, per grant, `enforced` / `bundled` (a mode the caller did *not* ask
+  for that the grant confers anyway, with the mode that dragged it in and the
+  reason) / `always_allowed` (the platform cannot restrict this at all — an
+  *absence* of enforcement, not a denial) / `refused` / `delegated`. It is the
+  same compilation the profile or ruleset is built from. A refusal fails
+  `PreparedSandbox::prepare` with `NonoError::ModeUnsupported`.
+
+  **Two things a consumer must plan around.** (1) `read_metadata` is
+  `unrestrictable` on Linux: Landlock has no right covering `stat(2)`, so a
+  metadata-only grant is a no-op there and a metadata *denial* cannot be
+  expressed at all — check `SupportReport::fs_modes()` rather than assuming
+  parity. (2) `truncate` needs Landlock ABI ≥ 3 and `rename` (and therefore
+  `atomic_write`) needs ABI ≥ 2; below those the grant is **refused**, not
+  degraded.
+
+  **One behaviour change, scoped to opt-in callers.** On macOS, a capability
+  set carrying at least one mode grant gets `(allow process-exec* (<filter>))`
+  per `execute`-granted path instead of the blanket grant. A program in a
+  directory granted only `read_contents` is refused at `execve` with
+  `ActivationError::PreExecFailed { stage: Exec, errno: EPERM }` — so a
+  consumer that adopts the vocabulary must grant `execute` on the paths its
+  program and interpreters live in (`/bin`, `/usr`, `/System`,
+  `/private/var/db` is what the live tests use).
+
+
 ## Toolchain and platform requirements
 
 - MSRV: 1.95 (workspace `rust-version`); edition 2024.
@@ -332,6 +374,13 @@ frozen-contract state of THIS repository only.
 | `cargo test -p nono --test lifecycle_live` (after F10) | 25 passed, unmodified; clean on 3 consecutive runs |
 | removal detection for the F10 guards | unknown-tag guard deleted from `FrameDecoder::next_frame` (decode as `Input` instead) → `a_tag_this_protocol_does_not_have_is_named_not_skipped` fails *and* the live `a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run` fails with "an unknown terminal frame tag must end the channel"; scrollback bound deleted from `Scrollback::push` → the two ring unit tests fail (`left: 524288, right: 262144`) and the live flood test fails with "the ring must stay bounded: 406282 bytes buffered, bound is 262144"; the `EPERM` arm deleted from `kill_own_group` → `a_group_of_zombies_is_nothing_left_to_signal_not_a_refusal` fails on macOS, and with it every detached stop that races the run's own exit |
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F10) | 7 loom models pass, unchanged — F10 adds no shared-state machinery inside a process (the supervisor loop is single-threaded by construction) |
+| `cargo test --workspace --no-fail-fast` (after F11, iteration 10) | 3744 passed / 0 failed / 2 ignored, 35 suites |
+| `cargo test -p nono` (after F11) | 1012 lib unit (235 lifecycle unchanged + 24 new `capability_modes` + 3 new `support` mode-table tests) + 25 `lifecycle_live` + 27 `lifecycle_detached` + 14 new `lifecycle_modes_live` + the rest of the integration suites; all green |
+| `cargo test -p nono --test lifecycle_modes_live` (new, macOS-only) | 14 passed / 0 failed; clean on 3 consecutive runs. One positive/negative pair per mode macOS can express, each pair differing in exactly one mode, all driven through real `prepare`/`activate`/`wait` |
+| `cargo test -p nono --test lifecycle_live` (after F11) | 25 passed, unmodified; clean on 3 consecutive runs |
+| `cargo test -p nono --test lifecycle_detached` (after F11) | 27 passed / 0 failed / 1 ignored, unmodified |
+| removal detection for the F11 guards | ABI gate deleted (the `refuse` closure made to return `None`) → 3 tests fail, `truncate_is_refused_below_abi_v3_rather_than_dropped` printing `left: []` against `right: [ModeRefusal { mode: Truncate, why: UnsupportedRight { right: Truncate, abi: 1, needed_abi: 3 } }]` — i.e. the silent-widening path is exactly what the assertion catches; Landlock's always-allowed arm deleted → `read_metadata_is_a_disclosed_no_op_not_a_grant` fails (a `stat` grant would be reported as enforced on a platform that cannot enforce it); macOS exec scoping deleted (unconditional `(allow process-exec*)` restored for mode-built profiles) → the live pair `execute_granted_runs_an_unheard_of_program_and_ungranted_is_refused_at_exec` fails with "activation was expected to fail; the run ended `Ok(Exited { code: 0 })`" |
+| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F11) | 7 loom models pass, unchanged — F11 adds no shared-state machinery; the mode compilers are pure functions |
 | `cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
 | `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
 | `cargo fmt --all -- --check` | clean |
@@ -349,11 +398,15 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
 - F2 (fork-only docs): SOURCE_LOCK.json, baseline docs, ADR-0001, this file.
 - F3-F10 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
   slice in NONO_UPSTREAM_DELTA.md with its disposition and deletion condition.
+- F11 (fork substrate, upstream-suitable candidate): the
+  `crates/nono/src/capability_modes/` mode vocabulary and its two platform
+  mappings. Row F11 in NONO_UPSTREAM_DELTA.md, including the
+  `capability.rs` rebase-conflict surface and how the placement mitigates it.
 
 ## Remaining external blockers
 
-- Linux verification environment (blocks Linux halves of R03/R04/R07/R10 and
-  the F4 Linux code path): Docker daemon down on this macOS host — Docker
+- Linux verification environment (blocks Linux halves of R03/R04/R06/R07/R10
+  and the F4/F11 Linux code paths): Docker daemon down on this macOS host — Docker
   Desktop launched headlessly but needs its GUI first-run acceptance.
   Reproduce: `docker ps` → "Cannot connect to the Docker daemon". Operator
   action: open Docker Desktop once and accept the prompt.

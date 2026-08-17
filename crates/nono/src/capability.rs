@@ -3,6 +3,7 @@
 //! This module defines the capability types used to specify what resources
 //! a sandboxed process can access.
 
+use crate::capability_modes::{FsMode, FsModeCapability, FsModeSet};
 use crate::error::{NonoError, Result};
 use crate::resource::ResourceLimits;
 use serde::{Deserialize, Serialize};
@@ -149,6 +150,54 @@ pub struct CoveringCapabilities<'a> {
     pub best_write: Option<&'a FsCapability>,
 }
 
+/// Canonicalize `path` and verify it is a directory.
+///
+/// Canonicalizes first — this atomically resolves symlinks and verifies
+/// existence, so no separate `exists()` check is needed and there is no TOCTOU
+/// window — then checks the type on the already-resolved path (same inode).
+///
+/// Crate-internal so that [`FsCapability::new_dir`] and
+/// [`FsModeCapability::new_dir`][crate::capability_modes::FsModeCapability::new_dir]
+/// cannot drift apart: two grant types that canonicalize differently would be
+/// two different security properties wearing the same name.
+pub(crate) fn resolve_directory(path: &Path) -> Result<PathBuf> {
+    let resolved = path.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NonoError::PathNotFound(path.to_path_buf())
+        } else {
+            NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source: e,
+            }
+        }
+    })?;
+
+    if !resolved.is_dir() {
+        return Err(NonoError::ExpectedDirectory(path.to_path_buf()));
+    }
+    Ok(resolved)
+}
+
+/// Canonicalize `path` and verify it is not a directory. See
+/// [`resolve_directory`] for the ordering rationale.
+pub(crate) fn resolve_file(path: &Path) -> Result<PathBuf> {
+    let resolved = path.canonicalize().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            NonoError::PathNotFound(path.to_path_buf())
+        } else {
+            NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source: e,
+            }
+        }
+    })?;
+
+    if resolved.is_dir() {
+        return Err(NonoError::ExpectedFile(path.to_path_buf()));
+    }
+    Ok(resolved)
+}
+
 impl FsCapability {
     /// Create a new directory capability, canonicalizing the path
     ///
@@ -156,24 +205,7 @@ impl FsCapability {
     /// to avoid TOCTOU races between exists() and canonicalize().
     pub fn new_dir(path: impl AsRef<Path>, access: AccessMode) -> Result<Self> {
         let path = path.as_ref();
-
-        // Canonicalize first - this atomically resolves symlinks and verifies existence.
-        // No separate exists() check needed, eliminating TOCTOU window.
-        let resolved = path.canonicalize().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                NonoError::PathNotFound(path.to_path_buf())
-            } else {
-                NonoError::PathCanonicalization {
-                    path: path.to_path_buf(),
-                    source: e,
-                }
-            }
-        })?;
-
-        // Verify type on the already-resolved path (no TOCTOU: same inode)
-        if !resolved.is_dir() {
-            return Err(NonoError::ExpectedDirectory(path.to_path_buf()));
-        }
+        let resolved = resolve_directory(path)?;
 
         Ok(Self {
             original: path.to_path_buf(),
@@ -190,24 +222,7 @@ impl FsCapability {
     /// to avoid TOCTOU races between exists() and canonicalize().
     pub fn new_file(path: impl AsRef<Path>, access: AccessMode) -> Result<Self> {
         let path = path.as_ref();
-
-        // Canonicalize first - this atomically resolves symlinks and verifies existence.
-        // No separate exists() check needed, eliminating TOCTOU window.
-        let resolved = path.canonicalize().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                NonoError::PathNotFound(path.to_path_buf())
-            } else {
-                NonoError::PathCanonicalization {
-                    path: path.to_path_buf(),
-                    source: e,
-                }
-            }
-        })?;
-
-        // Verify type on the already-resolved path (no TOCTOU: same inode)
-        if resolved.is_dir() {
-            return Err(NonoError::ExpectedFile(path.to_path_buf()));
-        }
+        let resolved = resolve_file(path)?;
 
         Ok(Self {
             original: path.to_path_buf(),
@@ -927,6 +942,13 @@ impl std::fmt::Display for NetworkMode {
 pub struct CapabilitySet {
     /// Filesystem capabilities
     fs: Vec<FsCapability>,
+    /// Mode-aware filesystem capabilities (see
+    /// [`allow_path_modes`](Self::allow_path_modes)). Kept in a separate list
+    /// rather than folded into `fs`: an [`FsCapability`] answers "read, write,
+    /// or both" and an [`FsModeCapability`] answers thirteen questions, and a
+    /// union type would force every existing consumer of `fs_capabilities()`
+    /// to decide what a mode set means to it.
+    fs_modes: Vec<FsModeCapability>,
     /// AF_UNIX socket capabilities (pathname grants only; see
     /// [`UnixSocketCapability`] and issue #685).
     unix_sockets: Vec<UnixSocketCapability>,
@@ -1000,10 +1022,100 @@ impl CapabilitySet {
     ///
     /// The path is canonicalized and validated. Returns an error if the path
     /// does not exist or is not a directory.
+    ///
+    /// # What the three access modes actually grant
+    ///
+    /// Each is a bundle, and always has been. `Read` is
+    /// `READ_FILE | READ_DIR | EXECUTE` on Linux and `file-read*` on macOS;
+    /// `Write` is eleven Landlock rights — every `MAKE_*`, both `REMOVE_*`,
+    /// `REFER` and `TRUNCATE` — because atomic writes need them, and
+    /// `file-write*` on macOS. [`FsModeSet::describes_access_mode`] states each
+    /// bundle in the mode vocabulary's own words, including the one residual
+    /// that vocabulary cannot express (coarse `Write` also creates directories,
+    /// symlinks and device nodes, and no [`FsMode`] does).
+    ///
+    /// Behaviour here is unchanged. A caller who wants to name operations
+    /// individually, and to be told what the platform could not separate, uses
+    /// [`allow_path_modes`](Self::allow_path_modes) instead.
     pub fn allow_path(mut self, path: impl AsRef<Path>, mode: AccessMode) -> Result<Self> {
         let cap = FsCapability::new_dir(path, mode)?;
         self.fs.push(cap);
         Ok(self)
+    }
+
+    /// Add a directory grant expressed in [`FsMode`]s (builder pattern).
+    ///
+    /// The mode-aware counterpart of [`allow_path`](Self::allow_path). Where
+    /// `allow_path` takes one of three coarse bundles — see
+    /// [`FsModeSet::describes_access_mode`] for what each of them is in this
+    /// vocabulary's own words — this takes exactly the operations the caller
+    /// means, and the platform layer reports back what it could and could not
+    /// enforce (`CompiledModes`).
+    ///
+    /// The path is canonicalized and must be an existing directory; the grant
+    /// is recursive, like `allow_path`.
+    ///
+    /// # Two things this does beyond storing the set
+    ///
+    /// An empty mode set is refused. A grant of nothing is always a mistake at
+    /// the call site rather than an intention, and silently storing one would
+    /// produce a path that looks granted in every diagnostic and grants nothing.
+    ///
+    /// [`FsMode::UnixSocketConnect`] registers a real
+    /// [`UnixSocketCapability`] through the same constructor
+    /// [`allow_unix_socket_dir`](Self::allow_unix_socket_dir) uses, because
+    /// that type already models socket grants on both platforms and a second
+    /// implementation would be a second thing to keep correct. The compile
+    /// result reports the mode as *delegated* rather than claiming a filesystem
+    /// rule enforced it.
+    ///
+    /// # Errors
+    ///
+    /// [`NonoError::EmptyModeSet`] for an empty set, plus the canonicalization
+    /// errors of [`allow_path`](Self::allow_path).
+    pub fn allow_path_modes(mut self, path: impl AsRef<Path>, modes: FsModeSet) -> Result<Self> {
+        let path = path.as_ref();
+        let cap = FsModeCapability::new_dir(path, modes)?;
+        Self::reject_empty_modes(&cap)?;
+        if modes.contains(FsMode::UnixSocketConnect) {
+            self = self.allow_unix_socket_dir(path, UnixSocketMode::Connect)?;
+        }
+        self.fs_modes.push(cap);
+        Ok(self)
+    }
+
+    /// Add a single-file grant expressed in [`FsMode`]s (builder pattern).
+    ///
+    /// The file counterpart of [`allow_path_modes`](Self::allow_path_modes),
+    /// mirroring the [`allow_path`](Self::allow_path) /
+    /// [`allow_file`](Self::allow_file) pair. The path must exist and must not
+    /// be a directory.
+    ///
+    /// [`FsMode::AtomicWrite`] means something extra here: a file grant is a
+    /// `literal` on macOS, so the temp file a tool writes beside the target is
+    /// a *different* path and needs its own rule. See
+    /// [`sbpl_map`][crate::capability_modes::sbpl_map].
+    ///
+    /// # Errors
+    ///
+    /// As [`allow_path_modes`](Self::allow_path_modes).
+    pub fn allow_file_modes(mut self, path: impl AsRef<Path>, modes: FsModeSet) -> Result<Self> {
+        let path = path.as_ref();
+        let cap = FsModeCapability::new_file(path, modes)?;
+        Self::reject_empty_modes(&cap)?;
+        if modes.contains(FsMode::UnixSocketConnect) {
+            self = self.allow_unix_socket(path, UnixSocketMode::Connect)?;
+        }
+        self.fs_modes.push(cap);
+        Ok(self)
+    }
+
+    /// Refuse a grant that names no operation.
+    fn reject_empty_modes(cap: &FsModeCapability) -> Result<()> {
+        if cap.modes.is_empty() {
+            return Err(NonoError::EmptyModeSet(cap.original.clone()));
+        }
+        Ok(())
     }
 
     /// Add file access permission (builder pattern)
@@ -1425,6 +1537,27 @@ impl CapabilitySet {
     #[must_use]
     pub fn fs_capabilities(&self) -> &[FsCapability] {
         &self.fs
+    }
+
+    /// Get mode-aware filesystem capabilities.
+    ///
+    /// Disjoint from [`fs_capabilities`](Self::fs_capabilities): a path granted
+    /// through [`allow_path_modes`](Self::allow_path_modes) appears here and
+    /// only here. A platform layer that enforces one list and not the other
+    /// would be dropping grants, so both are walked wherever rules are built.
+    #[must_use]
+    pub fn fs_mode_capabilities(&self) -> &[FsModeCapability] {
+        &self.fs_modes
+    }
+
+    /// Add a mode-aware filesystem capability directly.
+    ///
+    /// Mirrors [`add_fs`](Self::add_fs). Unlike the builder, this does **not**
+    /// register the delegated [`UnixSocketCapability`] for
+    /// [`FsMode::UnixSocketConnect`]: a caller holding a constructed
+    /// [`FsModeCapability`] is assembling a set by hand and owns that decision.
+    pub fn add_fs_modes(&mut self, cap: FsModeCapability) {
+        self.fs_modes.push(cap);
     }
 
     /// Scan filesystem capabilities for the ones covering a queried path,
