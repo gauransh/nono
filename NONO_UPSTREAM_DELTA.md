@@ -218,3 +218,92 @@ the order the deltas should be proposed in — are in `docs/UPSTREAMING.md`, whi
 operational companion to this table. Every row's **Disposition** column is the input to that
 document's PR ordering, and every row's **Deletion condition** is what makes the row's
 absence checkable later rather than a matter of memory.
+
+---
+
+## 7. Final-integration addendum — upstream drift review (2026-08-17)
+
+Added by the cross-repository final integration (`integration/leash-rs-final`). At review time
+`origin/main` was **8 commits** ahead of the frozen pin `149579a7`
+(`origin/main` = `e416f9c95e68d450e096cd66bddf10255893987b`).
+
+### 7.1 Decision
+
+**The integration base stays at the frozen pin. `origin/main` is not merged.**
+
+| SHA | Subject | Class | Rationale |
+|---|---|---|---|
+| `e416f9c9` | bump webpki-roots 1.0.8→1.0.9 | unrelated | TLS roots for the `nono-cli` HTTP client; not reachable from `crates/nono` |
+| `33ced81f` | bump libc 0.2.186→0.2.189 | additive | patch bump of a crate the core does use; no consumed API change |
+| `07a906e4` | bump http-body-util 0.1.4→0.1.5 | unrelated | `nono-cli` HTTP stack |
+| `b73c8026` | bump clap_complete 4.6.7→4.6.9 | unrelated | shell completion |
+| `f6347a56` | bump jsonc-parser 0.32.4→0.33.1 | unrelated | `nono-cli` config parsing |
+| `9078ffcf` | feat(remote): session connect and ps | unrelated | `nono-cli` product feature (+1473 lines in `connect_client.rs`); touches no core-library file |
+| `36243aa5` | feat(policy): allow unlink for atomic write temp files | unrelated | `nono-cli`-owned policy; out of the substrate boundary. The atomic-write behaviour it describes is retained as a conformance-matrix input. |
+| `5be192ad` | refactor(seccomp): ensure all filters include arch guard | **security fix** | see §7.2 |
+
+The library consumer (leash-rs) depends on `crates/nono` and never on `crates/nono-cli`, so seven of
+the eight commits are outside the surface this fork exposes.
+
+### 7.2 `5be192ad` — reclassified from "refactor" to "security fix"
+
+This commit was **first classified wrongly** by the integration, as a type-safety refactor closing a
+future-omission risk. The reasoning was that the pinned base already contains `seccomp_arch_guard` /
+`prepend_seccomp_arch_guard` / `prepend_seccomp_arch_guard_vec` (base `linux.rs:1649,1690,1715`) and
+already applies them at the sites found at `linux.rs:1926,2102,3121`.
+
+That is three call sites. **The file builds five seccomp programs.** A complete audit found two with
+no arch prologue at all:
+
+| Builder | Line | Guarded at the pin? |
+|---|---|---|
+| `build_seccomp_block_network_filter` | 2049 | yes |
+| `build_seccomp_tcp_only_network_filter` | 2124 | yes |
+| `build_seccomp_proxy_filter` | 3035 | yes |
+| `build_seccomp_af_unix_filter` | 3338 | **no** |
+| inline filter in `install_seccomp_notify` | 1938 | **no** |
+
+Confirmed against both trees rather than inferred: at the pin,
+`git show 149579a7:crates/nono/src/sandbox/linux.rs | awk '/^fn build_seccomp_af_unix_filter/,/^}/' | tail -6`
+ends with `]` then `}`; the same function at `origin/main` ends with
+`prepend_seccomp_arch_guard_vec(filter, errno_ret)`.
+
+**Impact.** `build_seccomp_af_unix_filter` is enforcement — it routes AF_UNIX
+`connect`/`bind`/`sendto`/`sendmsg`/`sendmmsg` to `USER_NOTIF` so the supervisor can check
+`sockaddr_un.sun_path` against the `unix_sockets` allowlist. A filter that loads `seccomp_data.nr`
+without first validating `seccomp_data.arch` matches native syscall numbers only, so on a kernel
+with the i386/x32 compat ABI enabled the compat-ABI equivalent escapes mediation and the allowlist
+is bypassed.
+
+### 7.3 What the fork did instead of rebasing
+
+Fixed in place (`f4e1da49`), reproducing upstream's deliberate asymmetry:
+
+- `build_seccomp_af_unix_filter` → **deny** non-native ABIs with `EACCES` (it is enforcement).
+- openat-notify filter → **allow** non-native ABIs. It only widens access on top of Landlock, so
+  evading it merely yields Landlock's denial, and denying would break legitimate 32-bit processes.
+  Extracted into a pure `build_seccomp_notify_filter()` so it is testable without a syscall.
+- Guard helpers' `errno_ret` parameter renamed `mismatch_action`, since it can now carry
+  `SECCOMP_RET_ALLOW`.
+
+**Upstream's `ArchGuarded<T>` newtype refactor is deliberately NOT imported.** It conflicts with the
+436 lines this fork independently added to `linux.rs`. The invariant is instead held by
+`test_every_seccomp_program_starts_with_arch_guard`, which asserts all five programs open with the
+6-instruction prologue and pins each one's mismatch action.
+
+**Deletion condition for this delta:** if the fork ever rebases onto an upstream containing
+`5be192ad`, drop the local guard additions in favour of upstream's `ArchGuarded<T>` and keep the
+assertion test — the test is complementary to the newtype, not redundant with it.
+
+**Known limitation:** the assertion test must be extended by hand if a sixth filter builder is ever
+added. That is the cost of not taking the newtype, and it is recorded here so the trade is
+reviewable rather than implicit.
+
+### 7.4 Verification status
+
+`BLOCKED_EXTERNAL` for execution. `crates/nono/src/sandbox/linux.rs` is behind
+`#[cfg(target_os = "linux")]` and this host is aarch64-apple-darwin with no Docker daemon and no C
+cross-compiler (`aws-lc-sys`, transitive via `sigstore-verify`, needs `x86_64-linux-gnu-gcc`).
+`cargo fmt`, `cargo test --workspace` (3761/0/2) and `cargo clippy` all pass but compile none of the
+changed lines. Real verification is `.github/workflows/stream-gates.yml` on ubuntu-latest.
+See `leash-rs/docs/final-integration/FINAL_BLOCKERS.md` rows BLK-F01, BLK-F02, BLK-F04.
