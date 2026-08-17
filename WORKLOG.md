@@ -64,3 +64,27 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
 - Environment: disk hit 100% during builds (ld errno=28); target/debug/incremental
   purged twice + CARGO_INCREMENTAL=0 for final gate. Host cleanup pass required
   before next build-heavy iteration.
+
+## 2026-08-17 — Iteration 3: R03/R04/R10 gate + prepare + typed exit (delta F4)
+
+- Host cleanup: deleted agent-resource-observatory/target (39 GiB regenerable cargo
+  cache, CACHEDIR.TAG verified); disk 1.5 GiB -> 39 GiB free.
+- Landed prepare.rs/gate.rs/exit.rs/identity.rs + lifecycle_live.rs: fork ->
+  sandbox-in-child -> fd sweep -> gate hold -> nonce release -> execve; 5-byte
+  status records; positive-exec observation; typed SandboxExit; ProcessIdentity
+  (pid+start_time+boot_id); Drop = abort+SIGKILL+reap.
+- Independent adversarial review (architect): ship-with-fixes. 2 HIGH (child fd
+  inheritance until exec; forgeable constant release byte), 4 MEDIUM (EOF=exec
+  overclaim; finish_failed reap-without-kill + fact fabrication; stop/expiry
+  sentinel-as-outcome; event sink unwired), 5 LOW. ALL applied same iteration:
+  close_inherited_descriptors sweep (removal-detection-verified live test),
+  random 16-byte release/abort nonces (ct classify), three-valued
+  ActivationObservation (bool accessor removed), kill_and_reap_observed,
+  GateAborted outcomes, sink threaded through wait(), token post-fork
+  parent-only, DuplicateEnvKey hoisted to validate().
+- Gates: lifecycle 96 unit + 16 live (10x consecutive clean); workspace
+  3527/0/1; strict clippy clean; fmt clean; lint scripts green.
+- Known residuals: no deadline on blocking reads (SIGSTOPped child blocks
+  supervisor — supervisor slice); Linux path compiled-unverified (Docker blocker
+  recorded in R07 note; cross-compile dead-ends at aws-lc-sys needing
+  x86_64-linux-gnu-gcc).

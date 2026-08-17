@@ -26,6 +26,7 @@ tracing.workspace = true
 zeroize.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
+uuid.workspace = true
 walkdir.workspace = true
 ignore.workspace = true
 globset.workspace = true
@@ -57,7 +58,8 @@ der = { version = "0.8", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
-nix = { workspace = true, features = ["fs", "user"] }
+# "process" and "signal" carry the lifecycle module's fork/waitpid/kill path.
+nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
 # Pure-Rust Secret Service backend (zbus over the D-Bus socket) so the binary
 # does not link libdbus and starts on hosts without it. crypto-rust keeps
 # session encryption pure-Rust; async-io is the runtime (avoids a tokio
@@ -65,7 +67,8 @@ nix = { workspace = true, features = ["fs", "user"] }
 keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nix = { workspace = true, features = ["fs", "user"] }
+# "process" and "signal" carry the lifecycle module's fork/waitpid/kill path.
+nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 
 [build-dependencies]

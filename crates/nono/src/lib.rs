@@ -88,8 +88,11 @@ pub use keystore::{
 // collide with `resource::ResourceLimits`, which is a different type with a
 // different purpose (cgroup ceilings on the CLI's enforcement path).
 pub use lifecycle::{
-    EventSink, GateConfig, LifecycleError, LifecycleEvent, LifecycleOp, LifecycleState,
-    MAX_PLAN_METADATA_BYTES, Observation, PlanError, SandboxPlan, SessionMode, TransitionError,
+    ACTIVATION_TOKEN_BYTES, ActivatedSandbox, ActivationError, ActivationHandle,
+    ActivationObservation, EventSink, ExitOutcome, GateConfig, LifecycleError, LifecycleEvent,
+    LifecycleOp, LifecycleState, MAX_PLAN_METADATA_BYTES, Observation, PRE_EXEC_EXIT_CODE,
+    PlanError, PreExecStage, PrepareError, PreparedSandbox, ProcessIdentity, ReapError,
+    SandboxExit, SandboxPlan, SessionMode, StopError, SupervisorStage, TransitionError,
     ValidatedPlan,
 };
 pub use net_filter::{FilterResult, HostFilter};

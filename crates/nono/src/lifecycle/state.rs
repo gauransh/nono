@@ -36,7 +36,8 @@ pub enum LifecycleState {
     /// The child is sandboxed and blocked at the activation gate. This is the
     /// only state from which activation is reachable.
     Prepared,
-    /// The gate has been claimed by exactly one activation; the release byte
+    /// The gate has been claimed by exactly one activation; the release
+    /// message
     /// is in flight and the exec outcome is not yet observed.
     Activating,
     /// Exec was positively observed; the customer program is running.

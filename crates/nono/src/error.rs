@@ -239,9 +239,32 @@ impl NonoError {
             Self::Lifecycle(crate::lifecycle::LifecycleError::Plan(_)) => {
                 NonoDiagnosticCode::ConfigurationError
             }
-            Self::Lifecycle(crate::lifecycle::LifecycleError::Transition(_)) => {
-                NonoDiagnosticCode::Other
+            // A refused sandbox policy is the same class of failure as
+            // `SandboxInit`: the confinement could not be established. A child
+            // that could not apply the policy to itself is the same failure
+            // seen one step later, so it gets the same code.
+            Self::Lifecycle(crate::lifecycle::LifecycleError::Prepare(
+                crate::lifecycle::PrepareError::SandboxSpec { .. },
+            )) => NonoDiagnosticCode::SandboxDeniedPath,
+            Self::Lifecycle(crate::lifecycle::LifecycleError::Prepare(
+                crate::lifecycle::PrepareError::ChildFailed { exit },
+            )) if matches!(
+                exit.outcome(),
+                crate::lifecycle::ExitOutcome::SandboxApplicationFailure { .. }
+            ) =>
+            {
+                NonoDiagnosticCode::SandboxDeniedPath
             }
+            // Everything else prepare refuses is a malformed run description.
+            Self::Lifecycle(crate::lifecycle::LifecycleError::Prepare(_)) => {
+                NonoDiagnosticCode::ConfigurationError
+            }
+            Self::Lifecycle(
+                crate::lifecycle::LifecycleError::Transition(_)
+                | crate::lifecycle::LifecycleError::Activation(_)
+                | crate::lifecycle::LifecycleError::Stop(_)
+                | crate::lifecycle::LifecycleError::Reap(_),
+            ) => NonoDiagnosticCode::Other,
             Self::Io(_) | Self::CommandExecution(_) => NonoDiagnosticCode::IoError,
             Self::ConfigParse(_)
             | Self::ConfigWrite { .. }

@@ -18,6 +18,12 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};
 
+// Seatbelt pieces the lifecycle module needs to split "build the profile" from
+// "install it": the build happens in the parent, the install in the forked
+// child. Crate-internal — the public API stays `Sandbox::apply_auto`.
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{generate_seatbelt_profile, sandbox_init_raw};
+
 // Re-export Linux Landlock ABI detection and scope policy reporting
 #[cfg(target_os = "linux")]
 pub use linux::{

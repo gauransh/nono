@@ -15,7 +15,7 @@
 //!
 //! # What this slice contains
 //!
-//! This is the pure, no-OS-interaction layer only:
+//! The pure layer, plus a working prepare/activate/wait path:
 //!
 //! - [`state`][self]: the typed state machine ([`LifecycleState`],
 //!   [`LifecycleOp`], [`TransitionError`]) as a total pure function.
@@ -23,16 +23,22 @@
 //!   with pre-launch validation that touches no filesystem.
 //! - [`events`][self]: [`EventSink`] and the fidelity-labelled
 //!   [`LifecycleEvent`].
+//! - [`prepare`][self]: [`PreparedSandbox`], which forks a child, sandboxes it,
+//!   and holds it before `execve`.
+//! - [`gate`][self]: [`ActivationHandle`] and the single-use release check.
+//! - [`exit`][self]: [`ActivatedSandbox`] and the typed [`SandboxExit`] facts.
+//! - [`identity`][self]: [`ProcessIdentity`], pid plus what makes it unique.
 //!
 //! # What it does not contain yet
 //!
-//! No process is created, no descriptor is opened, and no sandbox is applied by
-//! anything in this module. The activation gate (`gate.rs`), the forking
-//! prepare step (`prepare.rs`), the durable supervisor and session store, exit
-//! facts, process identity, and cleanup verification all arrive in later
-//! slices. Until then the state machine is driven by callers in tests only, and
-//! [`SandboxPlan::validate`] deliberately performs no existence or
-//! canonicalization checks — those belong to `prepare()`, at the point where
+//! The durable session store, the recoverable supervisor, attach, and cleanup
+//! verification all arrive in later slices. Until the durable store lands,
+//! every prepared session is generation 1 and nothing survives its supervisor:
+//! dropping a [`PreparedSandbox`] or an [`ActivatedSandbox`] kills and reaps
+//! the child rather than leaving it running.
+//!
+//! [`SandboxPlan::validate`] still performs no existence or canonicalization
+//! checks — those belong to [`PreparedSandbox::prepare`], at the point where
 //! the result can be acted on without a time-of-check/time-of-use gap.
 //!
 //! # Example
@@ -55,14 +61,25 @@
 //! ```
 
 mod events;
+mod exit;
+mod gate;
+mod identity;
 mod plan;
+mod prepare;
 mod state;
 
 pub use events::{EventSink, LifecycleEvent, Observation};
+pub use exit::{
+    ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
+    ReapError, SandboxExit, SupervisorStage,
+};
+pub use gate::{ACTIVATION_TOKEN_BYTES, ActivationError, ActivationHandle, StopError};
+pub use identity::ProcessIdentity;
 pub use plan::{
     GateConfig, MAX_PLAN_METADATA_BYTES, PlanError, ResourceLimits, SandboxPlan, SessionMode,
     ValidatedPlan,
 };
+pub use prepare::{PrepareError, PreparedSandbox};
 pub use state::{LifecycleOp, LifecycleState, TransitionError};
 
 use crate::error::NonoError;
@@ -83,6 +100,22 @@ pub enum LifecycleError {
     /// An op was applied in a state where it is not legal.
     #[error(transparent)]
     Transition(#[from] TransitionError),
+
+    /// A child could not be prepared, or died before reaching the gate.
+    #[error(transparent)]
+    Prepare(#[from] PrepareError),
+
+    /// An activation was refused.
+    #[error(transparent)]
+    Activation(#[from] ActivationError),
+
+    /// A pre-activation stop was refused.
+    #[error(transparent)]
+    Stop(#[from] StopError),
+
+    /// A child's death was never observed.
+    #[error(transparent)]
+    Reap(#[from] ReapError),
 }
 
 impl From<PlanError> for NonoError {
@@ -94,6 +127,30 @@ impl From<PlanError> for NonoError {
 impl From<TransitionError> for NonoError {
     fn from(err: TransitionError) -> Self {
         Self::Lifecycle(LifecycleError::Transition(err))
+    }
+}
+
+impl From<PrepareError> for NonoError {
+    fn from(err: PrepareError) -> Self {
+        Self::Lifecycle(LifecycleError::Prepare(err))
+    }
+}
+
+impl From<ActivationError> for NonoError {
+    fn from(err: ActivationError) -> Self {
+        Self::Lifecycle(LifecycleError::Activation(err))
+    }
+}
+
+impl From<StopError> for NonoError {
+    fn from(err: StopError) -> Self {
+        Self::Lifecycle(LifecycleError::Stop(err))
+    }
+}
+
+impl From<ReapError> for NonoError {
+    fn from(err: ReapError) -> Self {
+        Self::Lifecycle(LifecycleError::Reap(err))
     }
 }
 
@@ -127,6 +184,50 @@ mod tests {
             NonoError::Lifecycle(LifecycleError::Transition(_))
         ));
         assert_eq!(err.diagnostic_code(), NonoDiagnosticCode::Other);
+    }
+
+    #[test]
+    fn a_child_that_could_not_sandbox_itself_reports_a_sandbox_failure_code() {
+        // Same failure class as a policy that could not be built at all — the
+        // confinement was not established — so it must not be filed under
+        // "your configuration is malformed".
+        let exit = SandboxExit::new(
+            ExitOutcome::SandboxApplicationFailure {
+                stage: PreExecStage::SandboxApply,
+                errno: 1,
+            },
+            ActivationObservation::NotActivated,
+            ProcessIdentity::capture(0),
+        );
+        let err: NonoError = PrepareError::ChildFailed { exit }.into();
+        assert_eq!(err.diagnostic_code(), NonoDiagnosticCode::SandboxDeniedPath);
+
+        let spec: NonoError = PrepareError::SandboxSpec {
+            reason: "unsupported".to_string(),
+        }
+        .into();
+        assert_eq!(
+            spec.diagnostic_code(),
+            NonoDiagnosticCode::SandboxDeniedPath,
+            "the two must agree; they are the same failure at different moments"
+        );
+    }
+
+    #[test]
+    fn a_child_that_died_after_the_sandbox_applied_is_not_a_sandbox_failure() {
+        let exit = SandboxExit::new(
+            ExitOutcome::PreExecFailure {
+                stage: PreExecStage::Exec,
+                errno: 2,
+            },
+            ActivationObservation::NotActivated,
+            ProcessIdentity::capture(0),
+        );
+        let err: NonoError = PrepareError::ChildFailed { exit }.into();
+        assert_eq!(
+            err.diagnostic_code(),
+            NonoDiagnosticCode::ConfigurationError
+        );
     }
 
     #[test]

@@ -50,6 +50,16 @@ pub enum SessionMode {
 }
 
 /// Activation gate settings.
+///
+/// # How the deadline is measured
+///
+/// The expiry is measured with [`std::time::Instant`], which does not advance
+/// while the machine is suspended: a gate given five minutes still has time
+/// left after an hour of sleep. It is also evaluated *lazily* — there is no
+/// timer thread. A gate that has run out is discovered at the next
+/// `activate`, `stop`, or drop, and the child stays parked at the gate until
+/// then. Neither is a leak: the child cannot run without a release, and both
+/// choices favour refusing over racing a clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GateConfig {
     /// How long a prepared child may sit at the gate before activation is
@@ -139,6 +149,20 @@ pub enum PlanError {
     EnvValueNul {
         /// The key whose value was rejected. Safe to render: it has already
         /// passed the key rules.
+        key: String,
+    },
+
+    /// Two environment entries share a key.
+    ///
+    /// Refused rather than silently deduplicated. The vector reaches `execve`
+    /// verbatim, which entry wins is platform-dependent, and a caller who is
+    /// surprised by the answer has a dynamic-linker variable set to a value it
+    /// did not intend. Picking a winner here would be the library choosing
+    /// policy.
+    #[error("plan environment sets '{key}' more than once")]
+    DuplicateEnvKey {
+        /// The repeated key. Safe to render: the *value* is what carries
+        /// secrets.
         key: String,
     },
 
@@ -242,8 +266,10 @@ impl SandboxPlan {
     /// Permit one environment variable.
     ///
     /// Nothing is inherited, so this is the only way a variable reaches the
-    /// program. Entries are kept in insertion order and are not deduplicated:
-    /// the plan records exactly what the caller asked for.
+    /// program. Entries are kept in insertion order; a key set twice is
+    /// rejected by [`Self::validate`] rather than deduplicated, because the
+    /// vector reaches `execve` verbatim and which entry wins there is
+    /// platform-dependent.
     #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
@@ -319,8 +345,8 @@ impl SandboxPlan {
     ///
     /// Rules, in order: the program is non-empty and NUL-free; no argument
     /// contains a NUL; the working directory, if set, is absolute; every
-    /// environment key is non-empty, NUL-free, and `=`-free and every value is
-    /// NUL-free; the metadata fits [`MAX_PLAN_METADATA_BYTES`]; and an
+    /// environment key is non-empty, NUL-free, `=`-free, and unique, and every
+    /// value is NUL-free; the metadata fits [`MAX_PLAN_METADATA_BYTES`]; and an
     /// activation expiry, if set, is non-zero.
     ///
     /// No filesystem access happens here, by design — see the module docs.
@@ -355,6 +381,9 @@ impl SandboxPlan {
             }
             if key.contains('=') {
                 return Err(PlanError::EnvKeyEquals { index });
+            }
+            if self.env[..index].iter().any(|(seen, _)| seen == key) {
+                return Err(PlanError::DuplicateEnvKey { key: key.clone() });
             }
             if contains_nul(value) {
                 return Err(PlanError::EnvValueNul { key: key.clone() });
@@ -710,6 +739,36 @@ mod tests {
             minimal().env("A=B", "x").validate().err(),
             Some(PlanError::EnvKeyEquals { index: 0 })
         );
+    }
+
+    #[test]
+    fn a_repeated_env_key_is_rejected_not_silently_resolved() {
+        // `execve` takes the vector verbatim and the winner is
+        // platform-dependent, so the only safe answer is to refuse.
+        assert_eq!(
+            minimal()
+                .env("PATH", "/usr/bin")
+                .env("LANG", "C")
+                .env("PATH", "/attacker/bin")
+                .validate()
+                .err(),
+            Some(PlanError::DuplicateEnvKey {
+                key: "PATH".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn distinct_env_keys_are_kept_in_insertion_order() -> Result<(), PlanError> {
+        let validated = minimal().env("B", "2").env("A", "1").validate()?;
+        assert_eq!(
+            validated.env(),
+            [
+                ("B".to_string(), "2".to_string()),
+                ("A".to_string(), "1".to_string()),
+            ]
+        );
+        Ok(())
     }
 
     #[test]

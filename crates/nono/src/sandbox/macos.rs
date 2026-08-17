@@ -892,6 +892,40 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     Ok(profile)
 }
 
+/// Build the Seatbelt profile for `caps` without applying it.
+///
+/// The lifecycle module needs the profile text in the *parent*, before it
+/// forks, so the child's only remaining job is one `sandbox_init` call. Same
+/// generator as [`apply`]; nothing is applied here.
+pub(crate) fn generate_seatbelt_profile(caps: &CapabilitySet) -> Result<String> {
+    generate_profile(caps)
+}
+
+/// Install a Seatbelt profile in the calling process, for post-fork children.
+///
+/// Unlike [`apply`], this takes an already-built C string and returns
+/// `sandbox_init`'s raw result instead of formatting an error: it is called in
+/// a freshly forked child that must not run arbitrary Rust on failure, only
+/// write a fixed-size record and `_exit`.
+///
+/// The error buffer is deliberately never freed. `sandbox_free_error` is only
+/// reachable on the failure path, and on that path the child exits
+/// immediately — leaking a string in a process that is about to disappear is
+/// preferable to calling one more allocator function in a forked child.
+///
+/// # Safety
+///
+/// `profile` must point to a NUL-terminated C string that stays valid for the
+/// duration of the call. The caller must be a process that intends to be
+/// sandboxed: the effect is irreversible.
+pub(crate) unsafe fn sandbox_init_raw(profile: *const c_char) -> i32 {
+    let mut error_buf: *mut c_char = ptr::null_mut();
+    // SAFETY: delegated to this function's own safety contract — `profile` is
+    // a valid NUL-terminated C string. Flag 0 selects raw-profile mode, and
+    // `error_buf` is a live local the callee may overwrite.
+    unsafe { sandbox_init(profile, 0, &raw mut error_buf) }
+}
+
 /// Apply Seatbelt sandbox with the given capabilities
 ///
 /// This is a pure primitive - it applies ONLY the capabilities provided.

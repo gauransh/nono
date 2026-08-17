@@ -31,10 +31,17 @@ frozen-contract state of THIS repository only.
 - Landed (iteration 2): `nono::lifecycle::{LifecycleState, LifecycleOp,
   TransitionError, SandboxPlan, ValidatedPlan, PlanError, GateConfig,
   SessionMode, EventSink, LifecycleEvent, Observation, LifecycleError}`
-  (pure layer: state machine + validation + event trait; no OS interaction yet).
-- Still being added (R02+): `PreparedSandbox, ActivationHandle,
-  ActivatedSandbox, SandboxExit, CleanupVerification, SupportReport` (OS-backed;
-  ADR-0001 §3-6).
+  (pure layer: state machine + validation + event trait).
+- Landed (iteration 3, macOS live-verified; Linux written-unverified):
+  `PreparedSandbox::prepare(ValidatedPlan) -> (PreparedSandbox,
+  ActivationHandle)`, `activate(&handle) -> ActivatedSandbox`,
+  `stop_before_activation()`, `ActivatedSandbox::wait() -> SandboxExit`,
+  `SandboxExit` (typed exit facts + `ActivationObservation`),
+  `ProcessIdentity` (pid + start_time + boot_id). Security review pass
+  applied (fd sweep in child, random release/abort nonces, honest
+  three-valued activation observation).
+- Still being added: durable supervisor/session store, attach/detach/resize,
+  `CleanupVerification`, `SupportReport`, Loom race harness (ADR-0001 §5-7).
 
 ## Toolchain and platform requirements
 
@@ -50,6 +57,8 @@ frozen-contract state of THIS repository only.
 |---|---|
 | `cargo test --workspace --no-fail-fast` (upstream baseline @149579a7, macOS) | 3409 passed / 3 failed / 1 ignored — all 3 macOS-host portability bugs (see WORKLOG) |
 | same, after F1+F1b fixes | 3412 passed / 0 failed / 1 ignored — green on 5 consecutive runs; full bin-test binary stressed 20x, 0 failures (baseline: 23/20 runs) |
+| `cargo test --workspace --no-fail-fast` (after F3+F4, iteration 3) | 3527 passed / 0 failed / 1 ignored, 32 suites |
+| `cargo test -p nono lifecycle` / `--test lifecycle_live` | 96 unit + 16 live; live suite clean on 10 consecutive runs |
 | `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1 |
 | `cargo clippy --workspace --all-targets` | clean |
 | `cargo fmt --all -- --check` | clean |
@@ -67,10 +76,15 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
 
 ## Remaining external blockers
 
-- None declared yet. Candidates being resolved: Linux execution environment
-  (Docker daemon not yet up on this macOS host — `docker ps` fails; Docker
-  Desktop launched, may require GUI first-run acceptance. Reproduce:
-  `docker ps` → "Cannot connect to the Docker daemon").
+- Linux verification environment (blocks Linux halves of R03/R04/R07/R10 and
+  the F4 Linux code path): Docker daemon down on this macOS host — Docker
+  Desktop launched headlessly but needs its GUI first-run acceptance.
+  Reproduce: `docker ps` → "Cannot connect to the Docker daemon". Operator
+  action: open Docker Desktop once and accept the prompt.
+  Cross-compile is NOT a workaround: the `nono` lib depends on
+  `sigstore-verify` → `aws-lc-sys`, which requires `x86_64-linux-gnu-gcc`.
+  Reproduce: `RUSTC=~/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/rustc
+  cargo check --target x86_64-unknown-linux-gnu -p nono`.
 
 ## Integration instructions for leash-rs (current)
 
