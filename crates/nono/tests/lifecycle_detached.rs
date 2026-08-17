@@ -1285,77 +1285,130 @@ fn a_second_client_is_told_it_is_busy_while_a_wait_is_in_flight() {
     session.detach();
 }
 
+/// How many full input frames this test will send looking for backpressure.
+///
+/// The threshold is a platform's, not this library's: macOS stops accepting
+/// input into a terminal at `TTYHOG` (1 KiB), Linux at the tty port's memory
+/// limit plus the line discipline's buffer (~68 KiB). Sixteen 32 KiB frames is
+/// half a megabyte, comfortably past both, and the loop stops at the first frame
+/// that produces the state — so on macOS it sends one.
+const FILL_ATTEMPTS: usize = 16;
+
+/// Whether the supervisor has stopped reading this client.
+///
+/// A ping is answered by a supervisor that is reading its client, and answered
+/// *at once* — the descriptor is in its poll set and the reply is queued in the
+/// same pass. Silence for [`BRIEF`] therefore means the descriptor is not being
+/// read at all, which is the state the caller is trying to reach. Output is
+/// skipped rather than counted as an answer, so this stays true for a run that
+/// says something.
+fn supervisor_stopped_reading(terminal: &mut AttachedTerminal) -> bool {
+    if let Err(err) = terminal.ping() {
+        panic!("a ping must be writable: {err}");
+    }
+    let deadline = Instant::now() + BRIEF;
+    loop {
+        match terminal.read_event(deadline) {
+            Ok(TerminalEvent::Pong) => return false,
+            Ok(TerminalEvent::Idle) => return true,
+            Ok(TerminalEvent::Output(_)) => {}
+            Ok(TerminalEvent::Ended(end)) => panic!(
+                "the run must outlast this setup; it ended in {} first",
+                end.state()
+            ),
+            Err(err) => panic!("the terminal must answer: {err}"),
+        }
+    }
+}
+
 /// R20 FIX 8: the same rule, in the state where nothing else would notice.
 ///
 /// The ordering half of FIX 3 — that the slot is re-read *before* the accept
-/// decides — cannot be forced on macOS by racing a close against a connect: the
-/// hang-up wakes the supervisor first and the client branch drops the stale
-/// client of its own accord. There is exactly one state in which it cannot:
-/// while bytes are owed to the terminal, `client_interest` is zero, the client's
-/// descriptor is watched for nothing, and macOS synthesises no `POLLHUP` for an
-/// entry that asked for nothing. In that state a dead client is invisible to
-/// every path except an explicit liveness check.
+/// decides — cannot be forced by racing a close against a connect: the hang-up
+/// wakes the supervisor first and the client branch drops the stale client of
+/// its own accord. There is exactly one state in which it cannot: while bytes
+/// are owed to the terminal, an **attached** client's descriptor is watched for
+/// nothing, and macOS synthesises no `POLLHUP` for an entry that asked for
+/// nothing. In that state a dead client is invisible to every path except an
+/// explicit liveness check.
 ///
-/// The state is *verified rather than assumed* (an unanswered ping proves the
-/// supervisor has stopped reading this client), which is what stops this test
-/// from passing for the wrong reason if the backpressure never happens.
+/// The state is *verified rather than assumed* — an unanswered ping proves the
+/// supervisor has stopped reading this client — because a test that merely
+/// assumed it would silently become the racy version it replaces.
+///
+/// It pins the second half of R20 FIX A as well, and that is not incidental: the
+/// adopting client below connects while the terminal is *still* backpressured,
+/// which is precisely the state in which a supervisor that let terminal
+/// backpressure gate control traffic could accept a connection and then never
+/// answer it. The run outlasts the whole test, so nothing here can be rescued by
+/// the terminal draining on its own.
 fn a_dead_client_frees_the_slot_even_when_nothing_else_would_notice() {
     let store_dir = TempStore::new();
     let store = store_dir.open();
     // Raw mode with echo off, so the bulk input below is not echoed back as
     // output — an echo would keep the client's descriptor watched for
-    // writability and defeat the whole construction. The run then reads
-    // nothing, ever, which is what makes the terminal's input queue stay full.
+    // writability and defeat the whole construction. The run then reads nothing,
+    // ever, which is what makes the terminal's input queue stay full, and it
+    // outlasts the test, so the state cannot expire underneath an assertion.
     let mut terminal = interactive_attached(
         &store,
         store_dir.path(),
         "/bin/sh",
-        &["-c", "stty raw -echo; printf ready; exec sleep 2"],
+        &["-c", "stty raw -echo; printf ready; exec sleep 30"],
         WindowSize::new(24, 80),
     );
     read_until(&mut terminal, "ready", PATIENCE);
     let session_id = terminal.session_id();
 
+    // Fill the terminal's input queue. How much that takes is a property of the
+    // host's tty buffering, so it is *probed* rather than assumed: each frame is
+    // followed by a ping, and the first ping that goes unanswered is the state.
     let bulk = vec![b'x'; MAX_ATTACH_PAYLOAD_BYTES];
-    if let Err(err) = terminal.write_input(&bulk) {
-        panic!("a full frame of input must be writable: {err}");
-    }
-    // The ping goes *after* the supervisor has had time to take the bulk frame
-    // and discover it cannot hand it on. Sent in the same breath it would ride
-    // into the same 8 KiB read as the tail of that frame and be answered from
-    // the same batch, which would say nothing about whether this client is
-    // still being read.
-    std::thread::sleep(BRIEF);
-    if let Err(err) = terminal.ping() {
-        panic!("a ping must be writable: {err}");
-    }
-    // The premise. A ping is answered immediately by a supervisor that is
-    // reading this client; silence here is the backpressure this test needs,
-    // and a `Pong` means the state was never reached.
-    match terminal.read_event(Instant::now() + BRIEF) {
-        Ok(TerminalEvent::Idle) => {}
-        Ok(TerminalEvent::Pong) => {
-            panic!("the terminal never filled: the supervisor is still reading this client")
+    let mut backpressured = false;
+    for _ in 0..FILL_ATTEMPTS {
+        // A write that cannot complete is the same fact arriving the other way
+        // round: this socket is no longer being drained.
+        if terminal.write_input(&bulk).is_err() {
+            backpressured = true;
+            break;
         }
-        Ok(TerminalEvent::Output(_)) => panic!("this run must produce no output"),
-        Ok(TerminalEvent::Ended(_)) => panic!("this run must outlast the setup"),
-        Err(err) => panic!("the terminal must answer: {err}"),
+        // Probed *after* the write, never in the same breath as it: sent
+        // together, the ping rides into the same 8 KiB read as the tail of the
+        // frame and is answered from that same batch, which says nothing about
+        // whether this client is still being read.
+        if supervisor_stopped_reading(&mut terminal) {
+            backpressured = true;
+            break;
+        }
     }
+    assert!(
+        backpressured,
+        "this host's terminal accepted {} KiB of input without ever holding any back, so the \
+         state this test is about was never reached and nothing below would be proven",
+        (FILL_ATTEMPTS * MAX_ATTACH_PAYLOAD_BYTES) / 1024
+    );
 
     // Gone, with no goodbye and nothing on the wire to notice it by.
     drop(terminal);
 
-    // The run ends a moment later, which is what lets this connection be
-    // *answered* rather than merely accepted: the reply proves the supervisor
-    // is alive and serving, so "no Busy" cannot be confused with "no
-    // supervisor". A refusal, by contrast, would arrive at once.
-    let reconnected = match store.attach_control(session_id) {
+    // Adopted while the terminal is still full: the reply proves both halves at
+    // once — that the slot was freed for a client that died invisibly, and that
+    // a client which has not attached is answered whatever the run is doing with
+    // its stdin.
+    let mut reconnected = match store.attach_control(session_id) {
         Ok(session) => session,
         Err(err) => panic!(
             "a session whose only client died must be adoptable, even while its terminal is \
              backpressured; got {err}"
         ),
     };
+    match reconnected.status() {
+        Ok(status) => assert_eq!(status.state(), LifecycleState::Running),
+        Err(err) => panic!("and it must go on being answered: {err}"),
+    }
+    if let Err(err) = reconnected.stop() {
+        panic!("the adopting client must be able to end the run: {err}");
+    }
     reconnected.detach();
 }
 
@@ -2276,13 +2329,29 @@ fn the_scrollback_ring_stays_bounded_and_says_what_it_dropped() {
     // attached. The removal-detection target: without the bound in
     // `Scrollback::push` the ack would report every byte buffered and nothing
     // dropped, and both assertions below fail.
+    //
+    // **The pause is what makes "with nobody attached" true**, and without it
+    // this test was decided by a race it never mentioned. `interactive_attached`
+    // attaches before activating — it has to, so the window size reaches the
+    // program — so the run and the detach below start together. Output produced
+    // before the detach completes goes to the *attached channel*, which is
+    // allowed to hold `MAX_ATTACH_OUTBOUND_BYTES` = 256 KiB of it, and those
+    // bytes are neither delivered (the client has stopped reading terminal
+    // frames) nor in the ring (they never reached it) — they are dropped with
+    // the channel. Lose enough of the flood that way and the ring never
+    // overflows, `dropped()` is 0, and the assertion below fails while nothing
+    // is wrong with the ring at all. How much is lost depends on socket buffer
+    // sizes and scheduling, which is why this passed on macOS and failed on
+    // Linux, where `AF_UNIX` buffers are an order of magnitude larger. Four
+    // tenths of a second is the same pause, for the same reason, as in
+    // `a_run_that_ended_while_detached_yields_its_tail_and_then_its_end`.
     let terminal = interactive_attached(
         &store,
         store_dir.path(),
         "/bin/sh",
         &[
             "-c",
-            "i=0; while [ $i -lt 400 ]; do printf '%01023d\\n' $i; i=$((i+1)); done",
+            "sleep 0.4; i=0; while [ $i -lt 400 ]; do printf '%01023d\\n' $i; i=$((i+1)); done",
         ],
         WindowSize::new(24, 80),
     );

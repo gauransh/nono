@@ -1645,7 +1645,7 @@ impl Supervisor {
             watch.add(
                 Watched::Client,
                 client.stream.as_raw_fd(),
-                self.client_interest(client),
+                client_interest(client.attached.as_ref(), self.terminal_owes_input()),
             );
         }
         if let Some(terminal) = &self.terminal
@@ -1696,26 +1696,11 @@ impl Supervisor {
         }
     }
 
-    /// What the connected client's descriptor is watched for.
-    ///
-    /// Two pieces of backpressure live here. Output owed to the client makes
-    /// this watch for writability; bytes owed to the *terminal* stop it
-    /// watching for readability, so a client that types faster than the run
-    /// reads fills its own socket buffer instead of this process's memory.
-    fn client_interest(&self, client: &Client) -> libc::c_short {
-        let terminal_busy = self
-            .terminal
+    /// Whether the terminal is still holding bytes a client typed at it.
+    fn terminal_owes_input(&self) -> bool {
+        self.terminal
             .as_ref()
-            .is_some_and(|terminal| !terminal.to_master.is_empty());
-        let mut events = if terminal_busy { 0 } else { libc::POLLIN };
-        if client
-            .attached
-            .as_ref()
-            .is_some_and(|channel| !channel.outbound.is_empty())
-        {
-            events |= libc::POLLOUT;
-        }
-        events
+            .is_some_and(|terminal| !terminal.to_master.is_empty())
     }
 
     /// Whether there is anywhere for more terminal output to go.
@@ -2639,6 +2624,36 @@ impl AttachChannel {
     }
 }
 
+/// What the connected client's descriptor is watched for.
+///
+/// Two pieces of backpressure live here and they are **not** the same piece.
+///
+/// Output owed to the client makes this watch for writability. Bytes owed to the
+/// *terminal* stop it watching for readability — so a client that types faster
+/// than the run reads fills its own socket buffer instead of this process's
+/// memory — but only for a client that is **attached**, because only an attached
+/// client can send terminal input at all.
+///
+/// Applying that second piece to a client in control framing was a real defect
+/// and not a conservative choice. A control client's frames are `Hello`,
+/// `Status`, `Activate`, `Wait`, `Stop`, `VerifyCleanup`, `Attach` — none of
+/// which have anything to do with what the run is reading — and a supervisor
+/// that stopped reading them because a program was not reading its stdin could
+/// not answer *hello* for as long as the run chose not to read. Worse, it made
+/// the crash-recovery guarantee conditional on the run's behaviour: the process
+/// that comes to adopt a session whose holder died connects, is accepted, and is
+/// then never spoken to. Linux surfaced it first because its `AF_UNIX` and pty
+/// buffers are large enough for the state to persist past a control timeout;
+/// the defect was equally present on macOS.
+fn client_interest(attached: Option<&AttachChannel>, terminal_owes_input: bool) -> libc::c_short {
+    let holding_input_back = attached.is_some() && terminal_owes_input;
+    let mut events = if holding_input_back { 0 } else { libc::POLLIN };
+    if attached.is_some_and(|channel| !channel.outbound.is_empty()) {
+        events |= libc::POLLOUT;
+    }
+    events
+}
+
 /// Whether the connection on `fd` has lost its other end.
 ///
 /// Two facts, and a connection that shows either is over: `poll` reports
@@ -3222,6 +3237,60 @@ mod tests {
         assert!(IDLE_AFTER_TERMINAL_GRACE >= Duration::from_secs(60));
         assert!(IDLE_AFTER_TERMINAL_GRACE <= Duration::from_secs(3600));
         assert!(READINESS_DEADLINE < IDLE_AFTER_TERMINAL_GRACE);
+    }
+
+    #[test]
+    fn a_client_in_control_framing_is_read_whatever_the_terminal_is_doing() {
+        // The regression this pins cost a Linux CI run. Terminal-input
+        // backpressure belongs to the *attached* channel: it exists so that a
+        // client typing faster than the run reads fills its own socket buffer
+        // rather than this process's memory. A client that has not attached
+        // cannot type at the terminal at all, and its frames — hello, status,
+        // activate, wait, stop — have nothing to do with what the run is
+        // reading. Masking its readability made "can this session be adopted?"
+        // depend on whether some program was reading its stdin.
+        assert_eq!(
+            client_interest(None, true) & libc::POLLIN,
+            libc::POLLIN,
+            "a control client must stay readable while the terminal owes input"
+        );
+        assert_eq!(client_interest(None, false) & libc::POLLIN, libc::POLLIN);
+        // And it is never watched for writability: it is owed nothing until it
+        // attaches.
+        assert_eq!(client_interest(None, true) & libc::POLLOUT, 0);
+    }
+
+    #[test]
+    fn an_attached_client_stops_being_read_while_the_terminal_owes_input() {
+        // The other half, unchanged and load-bearing: this is the backpressure
+        // that reaches all the way to a client's own socket buffer. A fix that
+        // simply deleted the mask would let one attached client queue unbounded
+        // input in this process.
+        let mut channel = AttachChannel::new();
+        assert_eq!(
+            client_interest(Some(&channel), true),
+            0,
+            "an attached client with input still owed to the terminal is not read"
+        );
+        assert_eq!(
+            client_interest(Some(&channel), false) & libc::POLLIN,
+            libc::POLLIN,
+            "and is read again the moment the terminal has taken it"
+        );
+
+        // Output owed to the client is a separate question and is answered the
+        // same way whatever the input side is doing.
+        channel.queue_control(AttachTag::Pong, &[]);
+        assert!(!channel.outbound.is_empty());
+        assert_eq!(
+            client_interest(Some(&channel), true),
+            libc::POLLOUT,
+            "output owed must still be delivered while input is held back"
+        );
+        assert_eq!(
+            client_interest(Some(&channel), false),
+            libc::POLLIN | libc::POLLOUT
+        );
     }
 
     #[test]
