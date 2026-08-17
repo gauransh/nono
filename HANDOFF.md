@@ -322,9 +322,8 @@ Authoritative source: `BLOCKED_ROWS.json`. Summary:
 
 | | Rows |
 |---|---|
-| **PASS** (12) | R01 upstream tests green · R02 lifecycle exists as library APIs · R05 races tested (loom is host-independent) · R08 macOS Seatbelt fail-closed · R12 support report · R13 event delivery · R14 no CLI invocation · R15 no product types · R16 deltas documented · R17 locally-achievable rows green · R18 blockers reproducible · R19 this file |
+| **PASS** (13) | R01 upstream tests green · R02 lifecycle exists as library APIs · R05 races tested (loom is host-independent) · R08 macOS Seatbelt fail-closed · R12 support report · R13 event delivery · R14 no CLI invocation · R15 no product types · R16 deltas documented · R17 locally-achievable rows green · R18 blockers reproducible · R19 this file · R20 all work committed (tip `d56e0f8b`, `git status` clean) |
 | **BLOCKED** (7) | R03 prepare cannot exec early · R04 activation single-use · R06 mode semantics honest · **R07 Linux Landlock fail-closed (root blocker)** · R09 detached/attach · R10 exit facts · R11 cleanup verification — **all seven complete on macOS, all seven waiting on the same Linux runner** |
-| **IN_PROGRESS** (1) | R20 all work committed — iterations 1–10 are committed (11 commits, tip `be442758`); iteration 11 was instructed to be left uncommitted for review, so this row is not PASS while `git status` is non-empty. It flips at the commit that lands the eight documentation and gate-tooling files listed in its evidence. |
 
 ---
 
