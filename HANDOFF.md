@@ -28,9 +28,13 @@ frozen-contract state of THIS repository only.
 - Today (upstream baseline): `nono::CapabilitySet` → `nono::Sandbox::apply_auto/
   apply_landlock/apply_seccomp/apply_external`; `QueryContext`; `SandboxState`;
   `supervisor::{SupervisorSocket, ApprovalBackend, …}`.
-- Being added by this stream (R02+): `nono::lifecycle::{SandboxPlan,
-  PreparedSandbox, ActivationHandle, ActivatedSandbox, SandboxExit,
-  CleanupVerification, SupportReport, EventSink}`.
+- Landed (iteration 2): `nono::lifecycle::{LifecycleState, LifecycleOp,
+  TransitionError, SandboxPlan, ValidatedPlan, PlanError, GateConfig,
+  SessionMode, EventSink, LifecycleEvent, Observation, LifecycleError}`
+  (pure layer: state machine + validation + event trait; no OS interaction yet).
+- Still being added (R02+): `PreparedSandbox, ActivationHandle,
+  ActivatedSandbox, SandboxExit, CleanupVerification, SupportReport` (OS-backed;
+  ADR-0001 §3-6).
 
 ## Toolchain and platform requirements
 

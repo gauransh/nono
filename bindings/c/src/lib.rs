@@ -152,6 +152,11 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         // see it through the FFI in normal use, but if they do, surface
         // as an invalid-arg style error code rather than a real fault.
         nono::NonoError::Cancelled(_) => NonoErrorCode::ErrInvalidArg,
+        // Lifecycle failures are caller mistakes: a plan that failed
+        // validation, or an op applied in a state where it isn't legal.
+        // No lifecycle API is exposed through the FFI yet, so this arm
+        // exists to keep the exhaustive match honest.
+        nono::NonoError::Lifecycle(_) => NonoErrorCode::ErrInvalidArg,
     }
 }
 

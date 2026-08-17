@@ -47,3 +47,20 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
 - HANDOFF.md v1 created. Committing: (1) fix(tests) F1/F1b, (2) docs(stream) artifacts.
 - Residual (recorded, not acted on): ENV_LOCK discipline is unenforced by lint; upstream
   issue #567 is the proper fix. Docker daemon still down (Linux gate env pending).
+
+## 2026-08-17 — Iteration 2: R02 lifecycle skeleton (delta F3)
+
+- crates/nono/src/lifecycle/ landed: state.rs (10x11 pure transition machine,
+  exhaustive matrix test, single-use/stop-blocks-activation/one-death-one-fact
+  refusals test-locked), plan.rs (SandboxPlan -> ValidatedPlan typestate, full
+  validation, secrets-redacting Debug), events.rs (EventSink + Observation
+  fidelity), LifecycleError -> NonoError::Lifecycle (+forced FFI map_error arm).
+- Design decisions accepted on review: network_mode writes through to
+  CapabilitySet (single authority); lifecycle::ResourceLimits not re-exported at
+  root (name collision with cgroup type — revisit before ossification);
+  working_dir optional (None = inherit); duplicate env keys allowed for now.
+- Gates: 45+2 new tests; workspace 3459/0/1; strict clippy clean; fmt clean;
+  lint scripts green.
+- Environment: disk hit 100% during builds (ld errno=28); target/debug/incremental
+  purged twice + CARGO_INCREMENTAL=0 for final gate. Host cleanup pass required
+  before next build-heavy iteration.

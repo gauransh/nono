@@ -50,6 +50,7 @@ pub mod capability;
 pub mod diagnostic;
 pub mod error;
 pub mod keystore;
+pub mod lifecycle;
 pub mod manifest;
 pub mod manifest_convert;
 pub mod net_filter;
@@ -82,6 +83,14 @@ pub use keystore::{
     redact_bw_uri, redact_file_uri, redact_keyring_uri, redact_op_uri, store_secret_file,
     validate_apple_password_uri, validate_bw_uri, validate_destination_env_var, validate_env_uri,
     validate_file_uri, validate_keyring_uri, validate_op_uri,
+};
+// `lifecycle::ResourceLimits` is deliberately NOT re-exported here: it would
+// collide with `resource::ResourceLimits`, which is a different type with a
+// different purpose (cgroup ceilings on the CLI's enforcement path).
+pub use lifecycle::{
+    EventSink, GateConfig, LifecycleError, LifecycleEvent, LifecycleOp, LifecycleState,
+    MAX_PLAN_METADATA_BYTES, Observation, PlanError, SandboxPlan, SessionMode, TransitionError,
+    ValidatedPlan,
 };
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;

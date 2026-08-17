@@ -191,6 +191,10 @@ pub enum NonoError {
     #[error("Per-port network filtering not supported on {platform}: {reason}")]
     NetworkFilterUnsupported { platform: String, reason: String },
 
+    // Lifecycle errors
+    #[error("Lifecycle error: {0}")]
+    Lifecycle(#[from] crate::lifecycle::LifecycleError),
+
     // I/O errors
     #[error("I/O error: {0}")]
     Io(std::io::Error),
@@ -232,6 +236,12 @@ impl NonoError {
                 NonoDiagnosticCode::RollbackBudgetExceeded
             }
             Self::Cancelled(_) => NonoDiagnosticCode::Cancelled,
+            Self::Lifecycle(crate::lifecycle::LifecycleError::Plan(_)) => {
+                NonoDiagnosticCode::ConfigurationError
+            }
+            Self::Lifecycle(crate::lifecycle::LifecycleError::Transition(_)) => {
+                NonoDiagnosticCode::Other
+            }
             Self::Io(_) | Self::CommandExecution(_) => NonoDiagnosticCode::IoError,
             Self::ConfigParse(_)
             | Self::ConfigWrite { .. }
