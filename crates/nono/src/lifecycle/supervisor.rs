@@ -1338,6 +1338,7 @@ fn serve(
         prepared,
         activated: None,
         client: None,
+        serving_client: false,
         listener,
         signals,
         terminal,
@@ -1539,7 +1540,23 @@ struct Supervisor {
     /// The run, once released.
     activated: Option<super::exit::ActivatedSandbox>,
     /// The one client, if there is one.
+    ///
+    /// `None` does **not** mean the slot is free — see [`Self::serving_client`].
+    /// Ask [`Self::slot_is_taken`], never this field, before deciding about a
+    /// connection.
     client: Option<Client>,
+    /// Whether an exchange with the client is in flight.
+    ///
+    /// [`Self::serve_client`] takes the client *out* of its slot for the
+    /// duration of one exchange, so that every path which ends a conversation
+    /// ends it by simply not returning the stream. That leaves `client` reading
+    /// as `None` while a request is being answered — and one request,
+    /// [`ControlRequest::Wait`], runs a poll loop of its own that accepts
+    /// connections. Without this marker that accept reads a free slot, hands the
+    /// session to a second client, and then loses it the moment the first is put
+    /// back: the second connection is closed with **nothing written on it**,
+    /// which is strictly worse than the refusal the protocol promises.
+    serving_client: bool,
     listener: UnixListener,
     signals: SignalPipe,
     /// The run's terminal, when it has one. This process is its only holder.
@@ -1732,7 +1749,7 @@ impl Supervisor {
     /// this process refusing the whole point of a detached session.
     fn accept_one(&mut self) {
         self.reap_lost_client();
-        if let Some(stream) = accept_or_refuse(&self.listener, self.client.is_some()) {
+        if let Some(stream) = accept_or_refuse(&self.listener, self.slot_is_taken()) {
             self.client = Some(Client {
                 stream,
                 greeted: false,
@@ -1760,13 +1777,36 @@ impl Supervisor {
         }
     }
 
+    /// Whether the one client slot is spoken for.
+    ///
+    /// Two ways it can be, and only one of them is visible in `client`: a
+    /// connection sitting in the slot, and a connection that has been taken
+    /// *out* of the slot for the length of one exchange. The second is not a
+    /// detail — a `Wait` can hold it for [`MAX_CONTROL_WAIT`][wait], and the
+    /// loop that runs inside that wait accepts connections.
+    ///
+    /// This is the only thing the accept path may ask. Reading `client` there
+    /// directly is the bug it exists to prevent.
+    ///
+    /// [wait]: super::detached::MAX_CONTROL_WAIT
+    fn slot_is_taken(&self) -> bool {
+        self.client.is_some() || self.serving_client
+    }
+
     /// Read from the client, in whichever mode the connection is in.
+    ///
+    /// The slot is marked as taken for the whole of this, not merely while the
+    /// stream happens to be sitting in it: both arms below take the client out
+    /// and put it back, and an accept that ran in between — which a `Wait`
+    /// makes routine — would otherwise see a session with no client at all.
     fn serve_client(&mut self) {
+        self.serving_client = true;
         if self.attached().is_some() {
             self.serve_attached();
         } else {
             self.serve_one_request();
         }
+        self.serving_client = false;
     }
 
     /// Read one request from the client and answer it.
@@ -2042,8 +2082,13 @@ impl Supervisor {
             self.signals.drain();
         }
         if watch.ready(Watched::Listener, libc::POLLIN) {
-            // The client slot is occupied by the connection this wait belongs
-            // to, so this can only ever refuse.
+            // This can only ever refuse — and the reason is not that `client`
+            // holds the waiting connection, because it does not: the exchange
+            // this wait belongs to took it out of the slot. It is
+            // [`Supervisor::serving_client`] that keeps the slot taken across
+            // the whole exchange, which is what makes the refusal here a
+            // *written* `Busy` rather than a second client being accepted and
+            // then silently dropped when the waiter is put back.
             self.accept_one();
         }
         // The terminal is serviced by the caller's loop on the next pass; the

@@ -123,8 +123,16 @@ fn main() {
             a_second_concurrent_client_is_told_it_is_busy,
         ),
         (
+            "a_second_client_is_told_it_is_busy_while_a_wait_is_in_flight",
+            a_second_client_is_told_it_is_busy_while_a_wait_is_in_flight,
+        ),
+        (
             "a_client_that_died_without_a_goodbye_does_not_hold_the_slot",
             a_client_that_died_without_a_goodbye_does_not_hold_the_slot,
+        ),
+        (
+            "a_dead_client_frees_the_slot_even_when_nothing_else_would_notice",
+            a_dead_client_frees_the_slot_even_when_nothing_else_would_notice,
         ),
         (
             "a_killed_supervisor_leaves_a_stale_socket_that_recovery_removes",
@@ -1193,6 +1201,162 @@ fn a_second_concurrent_client_is_told_it_is_busy() {
         Err(err) => panic!("the first client must still be served: {err}"),
     }
     session.detach();
+}
+
+/// How long the wait under test is held open by the supervisor.
+///
+/// Long enough that the second connection below lands squarely inside it, short
+/// enough that the test costs a second and a half.
+const WAIT_IN_FLIGHT: Duration = Duration::from_millis(1500);
+
+/// R20 FIX 7: the single-client rule holds while a request is in flight.
+///
+/// `serve_one_request` takes the client *out* of the slot for the length of one
+/// exchange, and `Wait` is an exchange that runs its own poll loop — one that
+/// accepts connections. Read literally, `self.client.is_some()` said the session
+/// had no client at all, so a second connection arriving during a wait was
+/// **accepted**, and then silently destroyed when the waiting client was put
+/// back: no `Busy`, no bytes, just a close the second client had to interpret.
+/// That is worse than the refusal the protocol promises, and the comment on that
+/// accept claimed the opposite was happening.
+///
+/// Both halves are asserted here, because a fix that refused the second client
+/// by breaking the first would satisfy either one alone.
+fn a_second_client_is_told_it_is_busy_while_a_wait_is_in_flight() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    // A run that outlasts the wait, so the wait is genuinely still open when the
+    // second connection arrives. `/bin/sleep` rather than a shell: nothing here
+    // needs one, and a program that cannot exit early cannot end the wait early.
+    let (mut session, handle) =
+        match store.prepare_detached(detached_plan(store_dir.path(), "/bin/sleep", &["30"])) {
+            Ok(pair) => pair,
+            Err(err) => panic!("detached prepare must succeed: {err}"),
+        };
+    let session_id = session.session_id();
+    match session.activate(&handle) {
+        Ok(state) => assert_eq!(state, LifecycleState::Running),
+        Err(err) => panic!("activation must succeed: {err}"),
+    }
+    let socket = store.control_socket_path(session_id);
+
+    // The wait blocks its caller by design, so it runs on a thread of its own.
+    // What is under test is the supervisor's behaviour *while* it is in flight.
+    let waiter = std::thread::spawn(move || {
+        let outcome = session.wait(WAIT_IN_FLIGHT);
+        (session, outcome)
+    });
+    // Enough for the request to have reached the supervisor and put it inside
+    // `Supervisor::wait`; a fifth of the window it will sit there for.
+    std::thread::sleep(BRIEF);
+
+    let mut second = RawClient::connect(&socket);
+    assert_eq!(
+        refusal(second.read_reply()),
+        ControlRefusal::Busy,
+        "a second client arriving during a wait must be told, in words, that the \
+         session is busy — not accepted and then dropped without one"
+    );
+    assert!(
+        second.is_closed(),
+        "and then closed, as a refusal always is"
+    );
+
+    let (session, outcome) = match waiter.join() {
+        Ok(pair) => pair,
+        Err(_) => panic!("the waiting client's thread must not panic"),
+    };
+    match outcome {
+        Ok(WaitOutcome::StillRunning) => {}
+        // Loud rather than green: if the run ended inside the wait, the refusal
+        // above may not have arrived while anything was in flight, and this test
+        // would have proven nothing.
+        Ok(WaitOutcome::Exit(exit)) => panic!(
+            "the run must outlast the wait or this test proves nothing; it ended {:?}",
+            exit.outcome()
+        ),
+        Err(err) => panic!("the waiting client's own reply must still arrive: {err}"),
+    }
+
+    let mut session = session;
+    if let Err(err) = session.stop() {
+        panic!("the sleeping run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+/// R20 FIX 8: the same rule, in the state where nothing else would notice.
+///
+/// The ordering half of FIX 3 — that the slot is re-read *before* the accept
+/// decides — cannot be forced on macOS by racing a close against a connect: the
+/// hang-up wakes the supervisor first and the client branch drops the stale
+/// client of its own accord. There is exactly one state in which it cannot:
+/// while bytes are owed to the terminal, `client_interest` is zero, the client's
+/// descriptor is watched for nothing, and macOS synthesises no `POLLHUP` for an
+/// entry that asked for nothing. In that state a dead client is invisible to
+/// every path except an explicit liveness check.
+///
+/// The state is *verified rather than assumed* (an unanswered ping proves the
+/// supervisor has stopped reading this client), which is what stops this test
+/// from passing for the wrong reason if the backpressure never happens.
+fn a_dead_client_frees_the_slot_even_when_nothing_else_would_notice() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    // Raw mode with echo off, so the bulk input below is not echoed back as
+    // output — an echo would keep the client's descriptor watched for
+    // writability and defeat the whole construction. The run then reads
+    // nothing, ever, which is what makes the terminal's input queue stay full.
+    let mut terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &["-c", "stty raw -echo; printf ready; exec sleep 2"],
+        WindowSize::new(24, 80),
+    );
+    read_until(&mut terminal, "ready", PATIENCE);
+    let session_id = terminal.session_id();
+
+    let bulk = vec![b'x'; MAX_ATTACH_PAYLOAD_BYTES];
+    if let Err(err) = terminal.write_input(&bulk) {
+        panic!("a full frame of input must be writable: {err}");
+    }
+    // The ping goes *after* the supervisor has had time to take the bulk frame
+    // and discover it cannot hand it on. Sent in the same breath it would ride
+    // into the same 8 KiB read as the tail of that frame and be answered from
+    // the same batch, which would say nothing about whether this client is
+    // still being read.
+    std::thread::sleep(BRIEF);
+    if let Err(err) = terminal.ping() {
+        panic!("a ping must be writable: {err}");
+    }
+    // The premise. A ping is answered immediately by a supervisor that is
+    // reading this client; silence here is the backpressure this test needs,
+    // and a `Pong` means the state was never reached.
+    match terminal.read_event(Instant::now() + BRIEF) {
+        Ok(TerminalEvent::Idle) => {}
+        Ok(TerminalEvent::Pong) => {
+            panic!("the terminal never filled: the supervisor is still reading this client")
+        }
+        Ok(TerminalEvent::Output(_)) => panic!("this run must produce no output"),
+        Ok(TerminalEvent::Ended(_)) => panic!("this run must outlast the setup"),
+        Err(err) => panic!("the terminal must answer: {err}"),
+    }
+
+    // Gone, with no goodbye and nothing on the wire to notice it by.
+    drop(terminal);
+
+    // The run ends a moment later, which is what lets this connection be
+    // *answered* rather than merely accepted: the reply proves the supervisor
+    // is alive and serving, so "no Busy" cannot be confused with "no
+    // supervisor". A refusal, by contrast, would arrive at once.
+    let reconnected = match store.attach_control(session_id) {
+        Ok(session) => session,
+        Err(err) => panic!(
+            "a session whose only client died must be adoptable, even while its terminal is \
+             backpressured; got {err}"
+        ),
+    };
+    reconnected.detach();
 }
 
 /// R20 defect 3: the slot is held by a client, not by its ghost.

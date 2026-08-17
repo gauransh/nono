@@ -1197,3 +1197,111 @@ host can reach; the ubuntu job is what turns that into evidence.
 `crates/nono/src/sandbox/linux.rs`, `crates/nono/tests/lifecycle_detached.rs`,
 `crates/nono/tests/lifecycle_modes_live.rs`, `scripts/stream-gates.sh`,
 `NONO_UPSTREAM_DELTA.md`, `PLATFORM_CAPABILITY_BASELINE.md`, `WORKLOG.md`.
+
+## 2026-08-17 — Iteration 12 (cont.): FIX 7 and FIX 8 (delta F12 extended)
+
+Two follow-ups raised while the ubuntu job verified the first six. One is the
+defect the last entry reported and did not fix; the other is the removal
+transcript the last entry said it could not produce.
+
+### FIX 7 — the slot that read as empty while a request was in flight
+
+Reported as deviation 3 last iteration, now fixed. `serve_one_request` takes the
+client **out** of its slot for the length of one exchange — deliberately, so that
+every path which ends a conversation ends it by simply not returning the stream —
+and one request, `Wait`, runs a poll loop of its own that accepts connections. So
+`self.client.is_some()` read `false` in the middle of a wait, and a second client
+arriving there was *accepted*: given the session, and then destroyed without a
+byte written the moment the waiter was put back. Worse than the refusal the
+protocol promises, and the exact opposite of what the comment on that accept
+said was happening.
+
+The fix is a `serving_client` marker set across the whole of `serve_client`, and
+one `slot_is_taken()` that the accept path must ask instead of reading `client`
+itself. The marker covers `serve_attached` as well as `serve_one_request` — no
+accept is reachable inside the attached arm today, but the invariant is
+"occupied for the whole exchange" and a marker that held for only one of the two
+arms would be an invariant with a hole in it waiting for a caller.
+
+The comment at the accept was corrected rather than deleted: it now says *why*
+this can only refuse, which is the marker and not the field.
+
+### FIX 8 — the transcript the last iteration could not produce
+
+Last iteration reported, honestly, that deleting FIX 3's guard left the live test
+green on macOS 5/5, because here the hang-up wakes the supervisor first and the
+client branch drops the stale client of its own accord. That is true — and it is
+only true while the client's descriptor is being watched for something.
+
+There is exactly one state where it is not: while bytes are owed to the terminal,
+`client_interest` is zero, so the descriptor is in the poll set asking for
+nothing, and macOS synthesises no `POLLHUP` for an entry that asked for nothing —
+the same platform fact behind defect (a), used deliberately this time. In that
+state a dead client is invisible to every path except an explicit liveness check.
+
+`a_dead_client_frees_the_slot_even_when_nothing_else_would_notice` builds it: a
+raw-mode run that reads nothing ever (`stty raw -echo; printf ready; exec sleep
+2`), one full 32 KiB input frame to fill the terminal's input queue, and then the
+client dies. **The state is verified, not assumed** — a ping goes unanswered,
+which is the direct observation that the supervisor has stopped reading this
+client. Without that check the test would silently degenerate into the
+non-deterministic case and pass for the wrong reason.
+
+Two things had to be got right and the first attempt got neither:
+
+- The ping must be sent *after* the supervisor has taken the bulk frame. Sent in
+  the same breath it rides into the same 8 KiB read as the tail of that frame and
+  is answered from the same batch, which says nothing at all. The first run of
+  this test failed on exactly that, which is why the sleep between them is
+  commented rather than tidy.
+- The assertion has to be *positive*. "No `Busy` arrived" would also hold for a
+  dead supervisor. The run is `sleep 2`, so the terminal drains shortly after the
+  new client connects, and the connection is **answered** — the reply is what
+  distinguishes "not refused" from "nobody home".
+
+It also settled an open question about `client_is_gone`: the dead client's socket
+still held the unread ping, so the peek could not have returned end-of-file. It
+was detected anyway, which means macOS does report `POLLHUP` for a closed peer
+when a filter is actually registered for the descriptor. The peek remains the
+fallback and the half-close case still reads as alive.
+
+### Removal detection
+
+```
+# the accept-time reap deleted, top-of-loop reap left in place
+a_dead_client_frees_the_slot_even_when_nothing_else_would_notice ... FAILED  (5/5)
+  a session whose only client died must be adoptable, even while its terminal is
+  backpressured; got another client is connected to this session
+
+# both reaps deleted
+a_dead_client_frees_the_slot_even_when_nothing_else_would_notice ... FAILED  (3/3)
+  (same refusal)
+
+# slot_is_taken() reverted to self.client.is_some() in accept_one
+a_second_client_is_told_it_is_busy_while_a_wait_is_in_flight ... FAILED  (3/3)
+  the supervisor must answer
+```
+
+The first block is the one the last entry could not produce, and it is the
+*ordering* half specifically: with the top-of-loop reap still present and only the
+accept-time call removed, the slot is freed one pass too late and the connection
+is refused. The failure message is the same sentence the ubuntu job printed for
+`a_session_outlives_the_process_that_prepared_it`.
+
+The third block's failure is "the supervisor must answer" rather than a wrong
+refusal, which is the defect stated precisely: the second client was not refused,
+it was accepted and then dropped in silence.
+
+### Gates
+
+`cargo test -p nono lifecycle` 244/0. `cargo test -p nono` 1023 + 40 + 31(+1
+ignored) + 25 + 14 + 16 + 11, 0 failed. `--test lifecycle_live` 25/0 ×3.
+`--test lifecycle_modes_live` 14/0 ×3. `--test lifecycle_detached` 31/0 ×3.
+loom 7/0. `cargo test --workspace --no-fail-fast` exit 0. Strict clippy and its
+`nono_loom` variant clean. `cargo fmt --all -- --check` clean. Both lint scripts
+ok. Doc tests 11/0. Miri still NOT_RUN here (no miri component on this host).
+
+### Left uncommitted, by instruction
+
+Same list as the entry above, plus nothing new: `supervisor.rs`,
+`lifecycle_detached.rs`, `NONO_UPSTREAM_DELTA.md`, `WORKLOG.md`.
