@@ -612,6 +612,41 @@ for compiled in Sandbox::compile_fs_modes(&caps)? {
 It is the **same** compilation the profile or ruleset is built from, so the
 disclosure and the enforcement cannot disagree.
 
+### 9.6b macOS 26 evaluates inherited descriptors — plan your child's stdio
+
+Found live on the `macos-latest` runner (macOS 26.5.2 / Darwin 25.5.0), and it
+reaches real callers, not just tests.
+
+**macOS 26 evaluates `file-read-metadata` when a confined process `fstat`s a
+descriptor it merely *inherited*. macOS 14 does not evaluate it at all.**
+
+So a sandboxed child whose stdout you redirect to a file the profile does not
+name will see `Operation not permitted` from `fstat(1)` — even though nothing
+about the file it is actually reading or writing is denied. This is not
+hypothetical: it is how `cat(1)` fails, because `raw_cat` sizes its copy buffer
+from `fstat(fileno(stdout))` and dies with `cat: stdout: Operation not
+permitted` while holding a perfectly good read. Any tool that stats its own
+standard streams behaves the same way — and the failure names *stdout*, not the
+file you were debugging, which is what makes it expensive to diagnose.
+
+What this means for you:
+
+- If you hand a sandboxed run a stdout/stderr that is a **file**, grant
+  `read_metadata` on that path (`allow_path_modes`) or accept that
+  metadata-stating tools will fail there on macOS 26.
+- Pipes and PTYs are unaffected in what we observed; the detached supervisor's
+  interactive path gives the child a PTY, and the headless detached path gives
+  it `/dev/null`.
+- **Nono does not do this for you.** The library emits no grant for the child's
+  inherited standard streams, by either the mode-aware or the coarse
+  `AccessMode` emitter. Emitting one would be a real widening of every profile,
+  so it is a policy decision that belongs on your side of the boundary (§9.4) —
+  and if you decide the substrate should do it, it must arrive as a disclosed
+  bundle in `CompiledModes`, never silently.
+
+The coarse-emitter half of that last point is inferred from reading the emitter,
+not observed live; the mode-aware half was observed on the runner.
+
 ### 9.7 `LifecycleEvent` is a struct, not an enum
 
 **API shape note for anyone porting from an early iteration.** `LifecycleEvent`
