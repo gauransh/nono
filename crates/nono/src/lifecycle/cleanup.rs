@@ -335,6 +335,17 @@ pub(crate) fn verify_and_record(
     Ok((verification, Some(change)))
 }
 
+/// Probe an identity and report the verdict, moving no state machine.
+///
+/// The read-only half of [`verify_and_record`], for the one caller that needs
+/// the verdict *before* it has a state machine to move: a session recovered
+/// from a durable record, which must reconcile what the record claims against
+/// what the kernel says before it trusts either. Recording the answer is still
+/// [`verify_and_record`]'s job.
+pub(crate) fn probe_identity(identity: &ProcessIdentity) -> CleanupVerification {
+    verify_identity(identity)
+}
+
 /// Verify a run whose direct child was reaped, by probing its process group.
 ///
 /// `waitpid` already settled the child itself: a reaped pid names no process.

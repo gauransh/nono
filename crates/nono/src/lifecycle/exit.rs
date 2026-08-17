@@ -35,6 +35,7 @@ use super::cleanup::{CleanupError, CleanupVerification, DeathObservation, verify
 use super::events::{EventSink, LifecycleEvent, Observation};
 use super::gate::StopError;
 use super::identity::ProcessIdentity;
+use super::session_store::SessionHandle;
 use super::state::{LifecycleOp, LifecycleState};
 use super::sync_core::{SharedLifecycle, Transition};
 use serde::{Deserialize, Serialize};
@@ -384,6 +385,13 @@ pub struct ActivatedSandbox {
     activation: ActivationObservation,
     reaped: Option<SandboxExit>,
     event_sink: Option<Arc<dyn EventSink>>,
+    /// The durable record this run writes to, when it has one.
+    ///
+    /// The same record the [`super::PreparedSandbox`] was writing, shared by
+    /// `Arc` rather than copied: one session has one record, and two writers
+    /// with two copies of it would eventually disagree about which state was
+    /// last.
+    session: Option<Arc<SessionHandle>>,
 }
 
 impl ActivatedSandbox {
@@ -393,7 +401,15 @@ impl ActivatedSandbox {
         state: LifecycleState,
         activation: ActivationObservation,
         event_sink: Option<Arc<dyn EventSink>>,
+        session: Option<Arc<SessionHandle>>,
     ) -> Self {
+        // The handoff itself is worth a write: the prepared handle recorded the
+        // state but could not know the activation fact until this moment, and
+        // between here and the next transition the record would otherwise say
+        // "running" with nothing said about whether the program started.
+        if let Some(session) = &session {
+            session.persist(state, Some(activation));
+        }
         Self {
             identity,
             process_group,
@@ -401,6 +417,7 @@ impl ActivatedSandbox {
             activation,
             reaped: None,
             event_sink,
+            session,
         }
     }
 
@@ -555,9 +572,13 @@ impl ActivatedSandbox {
         self.report(change);
     }
 
-    /// Tell the sink about a change that already happened.
+    /// Tell the sink, and the durable record, about a change that already
+    /// happened.
     ///
-    /// Always outside the shared core's lock: the sink is consumer code.
+    /// Always outside the shared core's lock: the sink is consumer code and
+    /// the record write is filesystem I/O. Both run after the transition, so
+    /// the record can lag the live run by one step — see
+    /// [`super::SessionStore::recover`], which is what makes that safe.
     fn report(&self, change: Transition) {
         if let Some(sink) = &self.event_sink {
             sink.emit(&LifecycleEvent::StateChanged {
@@ -565,6 +586,9 @@ impl ActivatedSandbox {
                 to: change.to,
                 observation: Observation::DirectlyObserved,
             });
+        }
+        if let Some(session) = &self.session {
+            session.persist(change.to, Some(self.activation));
         }
     }
 }
@@ -588,11 +612,24 @@ impl std::fmt::Debug for ActivatedSandbox {
 /// The non-detached default: a dropped handle must not leave a running child
 /// or a zombie behind. Detached runs that outlive their supervisor arrive with
 /// the durable-supervisor slice; until then, dropping the handle ends the run.
+///
+/// The signal goes to the whole process group first, exactly as
+/// [`ActivatedSandbox::stop`] does and for the same reason: the customer's
+/// program may have forked, and killing only the pid this handle happens to
+/// hold would leave those children running while the run reported itself over.
+/// A drop that ended less than a stop would make "let it go out of scope" a
+/// quietly weaker guarantee than calling `stop`. The group id is refused if it
+/// would name the caller's own group — the same `targets <= 1` guard, made in
+/// [`kill_group`] itself.
 impl Drop for ActivatedSandbox {
     fn drop(&mut self) {
         if self.reaped.is_some() {
             return;
         }
+        // Best effort, in the order a stop uses: the group, then the direct
+        // child by pid (which covers a descendant that left the group), then
+        // the wait that turns the request into an observation.
+        let _ = kill_group(self.process_group);
         kill_and_reap(self.identity.pid());
     }
 }

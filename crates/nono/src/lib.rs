@@ -89,12 +89,13 @@ pub use keystore::{
 // different purpose (cgroup ceilings on the CLI's enforcement path).
 pub use lifecycle::{
     ACTIVATION_TOKEN_BYTES, AbsenceBasis, ActivatedSandbox, ActivationError, ActivationHandle,
-    ActivationObservation, CleanupError, CleanupVerification, EventSink, ExitOutcome, GateConfig,
-    IndeterminateReason, LifecycleError, LifecycleEvent, LifecycleOp, LifecycleState,
-    MAX_PLAN_METADATA_BYTES, Observation, PRE_EXEC_EXIT_CODE, PlanError, PreExecStage,
-    PrepareError, PreparedSandbox, ProcessIdentity, ReapError, SandboxExit, SandboxPlan,
-    SessionMode, StopError, SupervisorStage, SurvivorEvidence, TransitionError, UnsupportedReason,
-    ValidatedPlan,
+    ActivationObservation, CURRENT_SCHEMA_VERSION, CleanupError, CleanupVerification, EventSink,
+    ExitOutcome, GateConfig, IndeterminateReason, LifecycleError, LifecycleEvent, LifecycleOp,
+    LifecycleState, MAX_PLAN_METADATA_BYTES, MAX_RECORD_BYTES, Observation, PRE_EXEC_EXIT_CODE,
+    PlanError, PreExecStage, PrepareError, PreparedSandbox, ProcessIdentity, ReapError,
+    RecoveredSession, RecoveryDecision, SandboxExit, SandboxPlan, SessionMode, SessionRecord,
+    SessionStore, SessionStoreError, SessionSummary, StopError, SupervisorStage, SurvivorEvidence,
+    TransitionError, UnsupportedReason, ValidatedPlan,
 };
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;

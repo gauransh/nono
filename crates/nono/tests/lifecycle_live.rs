@@ -22,7 +22,8 @@
 use nono::lifecycle::{
     AbsenceBasis, ActivationError, ActivationObservation, CleanupError, CleanupVerification,
     EventSink, ExitOutcome, GateConfig, LifecycleEvent, LifecycleState, PreExecStage, PrepareError,
-    PreparedSandbox, SandboxPlan, StopError, SurvivorEvidence, ValidatedPlan,
+    PreparedSandbox, RecoveryDecision, SandboxPlan, SessionRecord, SessionStore, StopError,
+    SurvivorEvidence, ValidatedPlan,
 };
 use nono::{AccessMode, CapabilitySet};
 use std::path::Path;
@@ -962,6 +963,144 @@ fn a_child_stopped_before_activation_verifies_absent() {
     );
     assert_eq!(held.state(), LifecycleState::CleanupVerified);
     assert!(!marker.exists(), "a stopped child must never have run");
+}
+
+// ---------------------------------------------------------------------------
+// 20. F7: dropping a running handle ends the whole group, not just the pid.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dropping_an_activated_sandbox_kills_the_whole_process_group() {
+    // The shell exits immediately and leaves a `sleep` behind in the run's
+    // process group. A drop that signalled only the pid `waitpid` knows about
+    // would reap the shell, report the run over, and leave the sleep running —
+    // which is exactly what `stop()` refuses to do, and a drop must not be a
+    // quietly weaker guarantee than a stop.
+    let dir = temp_dir();
+    let pgid = {
+        let (mut held, handle) = prepared(plan(
+            dir.path(),
+            "/bin/sh",
+            &["-c", "/bin/sleep 30 & exec /bin/sleep 30"],
+        ));
+        let pgid = held.identity().pid();
+        let running = match held.activate(&handle) {
+            Ok(running) => running,
+            Err(err) => panic!("activation must succeed: {err}"),
+        };
+        // Give the shell time to fork its child and exec, so the group really
+        // has two members when the drop below happens.
+        std::thread::sleep(HOLD_OBSERVATION);
+        // SAFETY: signal 0 checks existence and permission without delivering
+        // anything; `pgid` is the group this run was prepared into.
+        assert_eq!(
+            unsafe { libc::killpg(pgid, 0) },
+            0,
+            "the run's group must be alive before the drop"
+        );
+        drop(running);
+        pgid
+    };
+
+    assert!(
+        wait_until_group_gone(pgid, GONE_TIMEOUT),
+        "a dropped activated sandbox left a descendant running"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 21. R09: a durable session follows the whole run, on disk.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_durable_session_records_every_state_the_run_passes_through() {
+    let dir = temp_dir();
+    let store = match SessionStore::open(&dir.path().join("sessions")) {
+        Ok(store) => store,
+        Err(err) => panic!("store must open: {err}"),
+    };
+
+    let (mut held, handle) = match store.prepare(plan(dir.path(), "/bin/echo", &["durable"])) {
+        Ok(pair) => pair,
+        Err(err) => panic!("durable prepare must succeed: {err}"),
+    };
+    let session_id = held.session_id();
+    let pid = held.identity().pid();
+
+    // Reading through a *separate* store handle throughout: what a recovering
+    // process would see, not what this one remembers.
+    let reader = match SessionStore::open(&dir.path().join("sessions")) {
+        Ok(store) => store,
+        Err(err) => panic!("store must reopen: {err}"),
+    };
+    let read = |what: &str| -> SessionRecord {
+        let mut found = None;
+        let sessions = match reader.sessions() {
+            Ok(sessions) => sessions,
+            Err(err) => panic!("enumeration must start ({what}): {err}"),
+        };
+        for summary in sessions {
+            match summary {
+                Ok(summary) if summary.session_id() == session_id => {
+                    found = Some(summary.record().clone());
+                }
+                Ok(_) => {}
+                Err(err) => panic!("record must load ({what}): {err}"),
+            }
+        }
+        match found {
+            Some(record) => record,
+            None => panic!("the session must be enumerable ({what})"),
+        }
+    };
+
+    let at_prepare = read("prepared");
+    assert_eq!(at_prepare.state(), LifecycleState::Prepared);
+    assert_eq!(at_prepare.identity().pid(), pid);
+    assert_eq!(at_prepare.process_group(), pid);
+    assert_eq!(at_prepare.generation(), 1);
+    assert_eq!(at_prepare.activation(), None, "nothing has run yet");
+
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => panic!("activation must succeed: {err}"),
+    };
+    let at_activate = read("running");
+    assert_eq!(at_activate.state(), LifecycleState::Running);
+    assert_eq!(
+        at_activate.activation(),
+        Some(ActivationObservation::ExecOrKilledPreExec),
+        "the honest answer until the exit status sharpens it"
+    );
+
+    match running.wait() {
+        Ok(exit) => assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 }),
+        Err(err) => panic!("wait must observe the exit: {err}"),
+    }
+    let at_exit = read("exited");
+    assert_eq!(at_exit.state(), LifecycleState::Exited);
+    assert_eq!(
+        at_exit.activation(),
+        Some(ActivationObservation::Observed),
+        "a normal exit is what settles the activation question"
+    );
+
+    match running.verify_cleanup() {
+        Ok(verdict) => assert!(verdict.is_confirmed_absent(), "{verdict:?}"),
+        Err(err) => panic!("cleanup verification must be legal after an exit: {err}"),
+    }
+    let at_cleanup = read("cleanup-verified");
+    assert_eq!(at_cleanup.state(), LifecycleState::CleanupVerified);
+    assert!(
+        at_cleanup.updated_unix_millis() >= at_prepare.created_unix_millis(),
+        "the record's own timeline must not run backwards"
+    );
+
+    // The run is over and proven over, so a recovery adopts nothing.
+    match reader.recover(session_id) {
+        Ok(recovered) => assert_eq!(recovered.decision(), RecoveryDecision::AlreadyVerified),
+        Err(err) => panic!("recovery must succeed: {err}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

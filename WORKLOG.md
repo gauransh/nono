@@ -141,3 +141,89 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
 - Residual: `ActivatedSandbox`'s drop path still kills only the child pid, not the
   group (unchanged from F4); a consumer that drops a running handle can leave
   descendants behind. Candidate for the supervisor slice.
+
+## 2026-08-17 — Iteration 6: R09 slice A durable session store (delta F7)
+
+- lifecycle/session_store.rs: `SessionRecord` v1 — `schema_version` (const
+  `CURRENT_SCHEMA_VERSION = 1`), session UUIDv7, generation, `ProcessIdentity`,
+  process group, `LifecycleState`, optional `ActivationObservation`,
+  created/updated wall timestamps (`Option<u64>` ms — `None` when the clock will
+  not say; advisory, nothing decides on them), and a bounded copy of the plan's
+  opaque caller metadata. Nothing product-shaped, and deliberately no command
+  line or environment: a record that carried the run's argv would be a durable
+  copy of whatever secrets it held.
+- Storage: directory created-or-opened at 0700 and *checked* rather than
+  repaired (real directory / owned by the effective uid / no group-or-world
+  bits, each a typed refusal — quietly `chmod`ing someone else's directory would
+  hide that it had been readable). Opened once `O_DIRECTORY | O_NOFOLLOW`; every
+  record reached by `openat` against that descriptor, so nothing after the first
+  open re-walks the path. Records `<uuid>.json` at 0600 (explicit `fchmod`,
+  because `O_CREAT`'s mode is filtered through the umask), first write `O_EXCL`,
+  updates write-to-temp + `renameat` in the same directory, `fsync` file then
+  directory. Record names derive from the UUID and are round-trip checked, so a
+  name can never carry a separator or a second spelling.
+- Corruption is an answer: `SessionCorrupt{path, why}`, never `Default` and
+  never a skipped entry. `sessions()` yields one `Result` per record so a
+  corrupt one is reported *beside* its healthy siblings — the opposite of the
+  CLI store's `debug!`-and-skip. A foreign schema is found by a version probe
+  that reads that one field before the rest, so a newer writer is
+  `UnsupportedSchemaVersion` rather than a field-by-field guess.
+- Durable prepare: `SessionStore::prepare(plan)` = `PreparedSandbox::prepare`
+  plus a record written *after* the gate-ready observation, when the identity and
+  pgid are facts. The record travels by `Arc` into the `ActivatedSandbox` and is
+  updated at every transition — always outside the `SharedLifecycle` lock and
+  always after the change. **Honesty consequence, documented not hidden: the
+  record can lag the live state by one step.** Reconciliation-on-load is what
+  makes that safe. Ephemeral `PreparedSandbox::prepare` is untouched: no store,
+  no file, no behaviour change.
+- Recovery: `recover(id)` loads, probes the recorded identity, and reduces
+  `(recorded state, verdict)` through the pure `reconcile()` to a
+  `RecoveryDecision`. Decision table: a record already `cleanup_verified` is
+  `AlreadyVerified` **whatever the probe says** (a proven-absent pid can be
+  reissued; adopting the reissue is the failure this rule exists to prevent);
+  otherwise `ConfirmedAbsent → ProcessGone`, `StillPresent → StillRunning`,
+  `Indeterminate → Unsettled`, `Unsupported → Unsupported`. A record found in a
+  watched state is moved to `Failed` with `SupervisorLost` and persisted — the
+  supervisor that would have observed the rest of that run is, by the fact that
+  we are recovering, gone.
+- **Limitation reported rather than designed away:** a recovered process is not
+  this process's child, so `waitpid` cannot reach it and its exit code or signal
+  is unobservable. `RecoveredSession` therefore has no `wait`, returns no
+  `SandboxExit`, and has no `Drop` that kills anything. What it offers is
+  `kill_group`/`kill_pid` (same `targets <= 1` refusal as `stop`) and
+  `verify_cleanup` / `verify_cleanup_by(deadline)`, which polls until the kernel
+  says `ESRCH` instead of treating a sent signal as proof. Making exit facts
+  survive a restart needs the detached supervisor of slice B.
+- Generations stay at 1. Sessions are one-shot UUIDs; recover-then-cleanup bumps
+  nothing and nothing re-prepares into an existing slot. The field is kept
+  because the re-prepare flow that increments it is slice B, and a record shape
+  that grew a field then would break every record written before it.
+- F6 follow-up: `ActivatedSandbox::drop` now kills the process **group** before
+  the pid and the reap, so "let it go out of scope" is no longer a quietly
+  weaker guarantee than calling `stop()`.
+- Loom (completes R05 scenario 6): 2 models added, 7 total — a recovery
+  reconciling while another party confirms the same cleanup (exactly one
+  `CleanupConfirmed` winner, and a recovery that sees the cleanup already proven
+  records nothing), and a recovery racing a stop-then-cleanup (never adopt after
+  cleanup). The recovery's read-decide-record is deliberately *not* one critical
+  section — `reconcile` is pure over an already-read state — and these models are
+  what say that gap is safe.
+- Gates: 153 unit (126 + 27 new) + 23 live (21 + 2 new) x3; loom 7/7; workspace
+  3591/0/1, 33 suites; strict clippy clean (also under `nono_loom`); fmt clean;
+  both lint scripts exit 0.
+- Removal detection (each restored to green afterwards): dropping `O_NOFOLLOW`
+  from the record open makes the symlinked-record test *pass the load* and
+  return the decoy (`left: None`); dropping it from the store-directory open
+  lands the store on the link's 0755 target (`StorePermissions{mode: 493}`
+  instead of `StoreSymlink`); making enumeration skip what it cannot parse turns
+  4 accounted-for records into 1; deleting the schema-version check reads a
+  version-2 record as if it were version 1; deleting the directory permission
+  check accepts a 0755 store. The explicit record `fchmod` is deliberately NOT
+  claimed as a detectable guard: umask can only *remove* bits from `O_CREAT`'s
+  0600, so its removal cannot widen a record — it makes the stated mode exact
+  rather than umask-dependent, and any umask restrictive enough to demonstrate
+  it also stops the test from creating its own directories.
+- Not tested, and named as such: the foreign-owner refusal
+  (`StoreForeignOwner`). Planting a directory owned by another uid needs
+  privileges the test suite does not have; the code path is one `st_uid`
+  comparison beside the permission check that *is* removal-detected.

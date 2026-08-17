@@ -58,8 +58,9 @@ der = { version = "0.8", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
-# "process" and "signal" carry the lifecycle module's fork/waitpid/kill path.
-nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
+# "process" and "signal" carry the lifecycle module's fork/waitpid/kill path;
+# "dir" and "fs" carry the durable session store's openat/renameat/readdir path.
+nix = { workspace = true, features = ["dir", "fs", "process", "signal", "user"] }
 # Pure-Rust Secret Service backend (zbus over the D-Bus socket) so the binary
 # does not link libdbus and starts on hosts without it. crypto-rust keeps
 # session encryption pure-Rust; async-io is the runtime (avoids a tokio
@@ -67,8 +68,9 @@ nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
 keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# "process" and "signal" carry the lifecycle module's fork/waitpid/kill path.
-nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
+# "process" and "signal" carry the lifecycle module's fork/waitpid/kill path;
+# "dir" and "fs" carry the durable session store's openat/renameat/readdir path.
+nix = { workspace = true, features = ["dir", "fs", "process", "signal", "user"] }
 keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 
 [build-dependencies]

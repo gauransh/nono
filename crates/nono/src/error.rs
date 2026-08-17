@@ -259,6 +259,12 @@ impl NonoError {
             Self::Lifecycle(crate::lifecycle::LifecycleError::Prepare(_)) => {
                 NonoDiagnosticCode::ConfigurationError
             }
+            // The durable session store is a directory and a set of files;
+            // every way it can refuse is a statement about that storage, which
+            // is what `IoError` names.
+            Self::Lifecycle(crate::lifecycle::LifecycleError::Session(_)) => {
+                NonoDiagnosticCode::IoError
+            }
             Self::Lifecycle(
                 crate::lifecycle::LifecycleError::Transition(_)
                 | crate::lifecycle::LifecycleError::Activation(_)

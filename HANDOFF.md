@@ -1,6 +1,6 @@
 # HANDOFF — Parallel Stream 1: Crystal Nono fork (generic sandbox substrate)
 
-Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 1
+Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 6
 
 STATUS: IN PROGRESS — this stream is NOT yet done. Only the final integration
 agent may declare the combined system complete; this file records the current
@@ -55,7 +55,35 @@ frozen-contract state of THIS repository only.
   failure), so a stop signals the whole run and verification probes a group
   rather than a pid `waitpid` already consumed. A sent signal is never a
   basis; only `ConfirmedAbsent` moves the run to `CleanupVerified`.
-- Still being added: durable supervisor/session store, attach/detach/resize,
+- Landed (iteration 6, macOS live-verified; Linux written-unverified):
+  `nono::lifecycle::{SessionStore, SessionRecord, SessionSummary, RecoveredSession,
+  RecoveryDecision, SessionStoreError, CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES}`
+  plus `lifecycle::{Sessions, reconcile}` (module-only). The durable half of
+  ADR-0001 §6: `SessionStore::open(dir)` (0700, checked-not-repaired, opened
+  `O_DIRECTORY | O_NOFOLLOW` with every record reached by `openat` against that
+  descriptor), `SessionStore::prepare(plan)` (a schema-versioned 0600 record
+  written after the gate-ready observation, updated at every later transition),
+  `sessions()` (one `Result` per record — a corrupt record is reported beside
+  its healthy siblings, never instead of them), and `recover(id)` (probe the
+  recorded identity, then the pure `reconcile()` decision table).
+  `PreparedSandbox::prepare` is unchanged: without a store nothing is written
+  and nothing behaves differently.
+
+  Two contract points a consumer must build on:
+
+  1. **A record may lag the live state by one step.** It is written after the
+     transition it describes, outside the lifecycle lock. Reconciliation on load
+     is what makes that safe; a consumer must not treat a record's `state` as a
+     statement about the present.
+  2. **A recovered process is not the recovering process's child**, so its exit
+     code or signal is *not observable* — `RecoveredSession` has no `wait` and
+     returns no `SandboxExit`. Recovery reports presence and absence
+     (`kill_group` / `kill_pid` / `verify_cleanup_by(deadline)`, which polls
+     until `ESRCH` rather than treating a sent signal as proof). Exit facts that
+     survive a caller restart need the detached supervisor of the next slice.
+
+- Still being added: detached supervisor (exit facts across a restart,
+  re-prepare with an incremented generation), attach/detach/resize,
   `SupportReport` (ADR-0001 §6-7).
 
 ## Toolchain and platform requirements
@@ -79,6 +107,11 @@ frozen-contract state of THIS repository only.
 | `cargo test --workspace --no-fail-fast` (after F6, iteration 5) | 3562 passed / 0 failed / 1 ignored, 33 suites |
 | `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F6) | 126 unit (109 unchanged + 17 new `cleanup`) + 21 live (16 unchanged + 5 new: own-process-group, verify-after-exit + duplicate refusal, honest `StillPresent` survivor then `ConfirmedAbsent`, `stop()` kills the group, stopped-before-activation verify); live suite clean on 3 consecutive runs |
 | removal detection for the R11 foundation | deleting the child's `setpgid(0, 0)` fails 2 live tests: the group assertion (`getpgid(child) == child`) and — the load-bearing one — the survivor test, which then reports `ConfirmedAbsent{ReapedAndGroupEmpty}` while `/bin/sleep 30` is still running |
+| `cargo test --workspace --no-fail-fast` (after F7, iteration 6) | 3591 passed / 0 failed / 1 ignored, 33 suites |
+| `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F7) | 153 unit (126 unchanged + 27 new `session_store`) + 23 live (21 unchanged + 2 new: a dropped `ActivatedSandbox` ends the whole group, a durable session recorded at every state the run passes through); live suite clean on 3 consecutive runs |
+| removal detection for the F7 guards | record `O_NOFOLLOW` dropped → the symlinked record is followed and the planted decoy is returned (`left: None`); store-dir `O_NOFOLLOW` dropped → the store lands on the link's 0755 target (`StorePermissions{mode: 493}`); skip-on-parse-failure → 4 accounted-for records become 1; schema check deleted → a version-2 record is read as version 1; directory permission check deleted → a 0755 store is accepted; F7 group kill deleted from `ActivatedSandbox::drop` → a dropped run leaves its `sleep` descendant alive |
+| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F7) | 7 loom models pass (5 unchanged + 2 new: recovery-vs-cleanup → exactly one `CleanupConfirmed` winner; recovery-vs-stop-then-cleanup → never adopt after cleanup). Completes the R05 scenario set |
+| `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets --all-features` | clean |
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` | 5 loom models pass (all interleavings); harness verified to fail when the activation CAS is weakened. Cfg name is `nono_loom`, not loom's own `loom`: RUSTFLAGS reaches every crate, and `--cfg loom` makes tokio compile out `tokio::net`, breaking hyper-util (transitive via sigstore-verify) |
 | `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1 |
 | `cargo clippy --workspace --all-targets` | clean |
@@ -94,6 +127,8 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
   command_runtime dry-run test (+ F1b: same for 3 flaky tool-sandbox git
   tests). Details: NONO_UPSTREAM_DELTA.md.
 - F2 (fork-only docs): SOURCE_LOCK.json, baseline docs, ADR-0001, this file.
+- F3-F7 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
+  slice in NONO_UPSTREAM_DELTA.md with its disposition and deletion condition.
 
 ## Remaining external blockers
 

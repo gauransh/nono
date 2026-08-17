@@ -31,7 +31,10 @@ use loom::sync::Arc;
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::thread;
 use nono::lifecycle::sync_core::{SharedLifecycle, Transition};
-use nono::lifecycle::{LifecycleOp as Op, LifecycleState as S, TransitionError};
+use nono::lifecycle::{
+    AbsenceBasis, CleanupVerification, LifecycleOp as Op, LifecycleState as S, RecoveryDecision,
+    SurvivorEvidence, TransitionError, reconcile,
+};
 
 /// What one racing thread came back with.
 type Outcome = Result<Transition, TransitionError>;
@@ -369,5 +372,155 @@ fn two_racing_cleanup_confirmations_leave_exactly_one_winner() {
             }
         }
         assert_eq!(shared.state(), S::CleanupVerified);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// f. A session recovered from the durable store reconciles its record while
+//    another party confirms the same cleanup. One absence must not be counted
+//    twice.
+//
+//    The recovery's read-decide-record is deliberately *not* one critical
+//    section: `reconcile` is a pure function over a state the caller has
+//    already read, so there is a real gap between "I saw `failed`" and "I
+//    record the confirmation". This model is what says that gap is safe — the
+//    state machine, not the reader, decides who wins.
+// ---------------------------------------------------------------------------
+
+/// The verdict a probe of a process that is provably gone produces.
+fn absent() -> CleanupVerification {
+    CleanupVerification::ConfirmedAbsent {
+        basis: AbsenceBasis::PidAbsent { pid: 4242 },
+    }
+}
+
+/// The verdict a probe of a live pid whose start time still matches produces.
+fn present() -> CleanupVerification {
+    CleanupVerification::StillPresent {
+        survivors: SurvivorEvidence::IdentityMatch { pid: 4242 },
+    }
+}
+
+#[test]
+fn a_recovery_and_a_cleanup_never_both_confirm_the_same_absence() {
+    loom::model(|| {
+        let shared = Arc::new(SharedLifecycle::new(S::Failed));
+
+        let recovering = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let observed = shared.state();
+                let decision = reconcile(observed, &absent());
+                // A recovery that finds the cleanup already proven records
+                // nothing. That is the whole of "never adopt after cleanup" on
+                // the write side.
+                decision
+                    .is_process_gone()
+                    .then(|| shared.mark(Op::CleanupConfirmed))
+            })
+        };
+        let confirming = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || shared.mark(Op::CleanupConfirmed))
+        };
+
+        let recovered = joined(recovering);
+        let confirmed = joined(confirming);
+
+        let mut attempts = vec![confirmed];
+        if let Some(outcome) = recovered {
+            attempts.push(outcome);
+        }
+        assert_eq!(
+            wins(&attempts),
+            1,
+            "one absence was confirmed twice: {attempts:?}"
+        );
+        for attempt in attempts {
+            match attempt {
+                Ok(change) => assert_eq!(
+                    change,
+                    Transition {
+                        from: S::Failed,
+                        to: S::CleanupVerified
+                    }
+                ),
+                Err(err) => assert_eq!(
+                    err,
+                    TransitionError {
+                        from: S::CleanupVerified,
+                        op: Op::CleanupConfirmed
+                    }
+                ),
+            }
+        }
+        assert_eq!(shared.state(), S::CleanupVerified);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// g. A recovery reconciles the same record a stop is finishing on. Once the
+//    cleanup is proven, no interleaving may still produce an adoption — the pid
+//    it would adopt has been proven absent, so anything answering to that
+//    number now is a reissue.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_recovery_never_adopts_a_run_whose_cleanup_was_already_proven() {
+    loom::model(|| {
+        let shared = Arc::new(SharedLifecycle::new(S::Stopping));
+
+        let stopping = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let reaped = shared.mark(Op::StopObserved);
+                let confirmed = shared.mark(Op::CleanupConfirmed);
+                (reaped, confirmed)
+            })
+        };
+        let recovering = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let observed = shared.state();
+                // The probe says the pid is alive. Before the cleanup lands
+                // that is a survivor worth reporting; after it, the same
+                // observation can only be a number the kernel handed to
+                // somebody else.
+                (observed, reconcile(observed, &present()))
+            })
+        };
+
+        let (reaped, confirmed) = joined(stopping);
+        let (seen, decision) = joined(recovering);
+
+        // Nothing else moves this machine, so the stop path always lands.
+        assert_eq!(
+            reaped,
+            Ok(Transition {
+                from: S::Stopping,
+                to: S::Stopped
+            })
+        );
+        assert_eq!(
+            confirmed,
+            Ok(Transition {
+                from: S::Stopped,
+                to: S::CleanupVerified
+            })
+        );
+        assert_eq!(shared.state(), S::CleanupVerified);
+
+        assert!(
+            !(seen == S::CleanupVerified && decision.is_still_running()),
+            "a run whose cleanup was proven was adopted anyway: {decision:?}"
+        );
+        if seen == S::CleanupVerified {
+            assert_eq!(decision, RecoveryDecision::AlreadyVerified);
+        } else {
+            assert!(
+                decision.is_still_running(),
+                "before the cleanup lands, a live pid is a survivor: {decision:?}"
+            );
+        }
     });
 }

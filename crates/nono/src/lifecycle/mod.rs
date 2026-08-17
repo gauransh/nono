@@ -34,14 +34,25 @@
 //! - [`identity`][self]: [`ProcessIdentity`], pid plus what makes it unique.
 //! - [`cleanup`][self]: [`CleanupVerification`], which probes after the fact
 //!   rather than treating a sent signal as proof.
+//! - [`session_store`][self]: [`SessionStore`], the schema-versioned durable
+//!   record and the identity-reconciled [`SessionStore::recover`] that reads it
+//!   back after the caller restarts.
 //!
 //! # What it does not contain yet
 //!
-//! The durable session store, the recoverable supervisor, and attach all arrive
-//! in later slices. Until the durable store lands,
-//! every prepared session is generation 1 and nothing survives its supervisor:
-//! dropping a [`PreparedSandbox`] or an [`ActivatedSandbox`] kills and reaps
-//! the child rather than leaving it running.
+//! The recoverable supervisor and attach arrive in later slices. Nothing yet
+//! survives its supervisor *by design*: dropping a [`PreparedSandbox`] or an
+//! [`ActivatedSandbox`] kills and reaps the run rather than leaving it running,
+//! and every prepared session is generation 1 because nothing re-prepares into
+//! an existing session's slot. What the durable store adds is the ability to
+//! reason honestly about a run whose supervisor died *anyway* — a crash, a
+//! `SIGKILL`, a machine that went away — rather than a supported way to detach.
+//!
+//! One consequence of that is worth stating here rather than only in
+//! [`session_store`][self]: a recovered process is not this process's child, so
+//! `waitpid` cannot reach it and its exit code or signal is not observable
+//! after a restart. Recovery reports presence and absence, and never
+//! manufactures a [`SandboxExit`] it did not witness.
 //!
 //! [`SandboxPlan::validate`] still performs no existence or canonicalization
 //! checks — those belong to [`PreparedSandbox::prepare`], at the point where
@@ -73,6 +84,7 @@ mod gate;
 mod identity;
 mod plan;
 mod prepare;
+mod session_store;
 mod state;
 
 // The shared core is crate-internal in every ordinary build. Under `--cfg
@@ -100,6 +112,10 @@ pub use plan::{
     ValidatedPlan,
 };
 pub use prepare::{PrepareError, PreparedSandbox};
+pub use session_store::{
+    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, RecoveredSession, RecoveryDecision, SessionRecord,
+    SessionStore, SessionStoreError, SessionSummary, Sessions, reconcile,
+};
 pub use state::{LifecycleOp, LifecycleState, TransitionError};
 
 use crate::error::NonoError;
@@ -141,6 +157,11 @@ pub enum LifecycleError {
     /// run's end was observed, or a second time after it was already proven.
     #[error(transparent)]
     Cleanup(#[from] CleanupError),
+
+    /// The durable session store refused an operation, or a record could not
+    /// be trusted.
+    #[error(transparent)]
+    Session(#[from] SessionStoreError),
 }
 
 impl From<PlanError> for NonoError {
@@ -182,6 +203,12 @@ impl From<ReapError> for NonoError {
 impl From<CleanupError> for NonoError {
     fn from(err: CleanupError) -> Self {
         Self::Lifecycle(LifecycleError::Cleanup(err))
+    }
+}
+
+impl From<SessionStoreError> for NonoError {
+    fn from(err: SessionStoreError) -> Self {
+        Self::Lifecycle(LifecycleError::Session(err))
     }
 }
 

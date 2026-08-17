@@ -116,6 +116,7 @@ use super::gate::{
 };
 use super::identity::ProcessIdentity;
 use super::plan::{ResourceLimits, SessionMode, ValidatedPlan};
+use super::session_store::SessionHandle;
 use super::state::{LifecycleOp, LifecycleState, TransitionError};
 use super::sync_core::{SharedLifecycle, Transition};
 use std::ffi::{CString, c_char};
@@ -278,6 +279,14 @@ pub struct PreparedSandbox {
     child_owned: bool,
     last_exit: Option<SandboxExit>,
     event_sink: Option<Arc<dyn EventSink>>,
+    /// The durable record this run writes to, when it has one.
+    ///
+    /// `None` for [`Self::prepare`], which is unchanged and leaves nothing on
+    /// disk; `Some` only for a run created through
+    /// [`super::SessionStore::prepare`]. Shared by `Arc` so the
+    /// [`ActivatedSandbox`] this hands off to writes the same record rather
+    /// than a second copy that could disagree with it.
+    session: Option<Arc<SessionHandle>>,
 }
 
 impl PreparedSandbox {
@@ -378,6 +387,10 @@ impl PreparedSandbox {
                     child_owned: true,
                     last_exit: None,
                     event_sink: plan.event_sink().cloned(),
+                    // Attached afterwards by `SessionStore::prepare`, which can
+                    // only build the record once the identity and process group
+                    // below are facts.
+                    session: None,
                 };
 
                 // Drawn *after* the fork so the token never exists in the
@@ -426,6 +439,40 @@ impl PreparedSandbox {
     #[must_use]
     pub fn identity(&self) -> &ProcessIdentity {
         &self.identity
+    }
+
+    /// The process group the child leads, which is its own pid.
+    pub(crate) fn process_group(&self) -> i32 {
+        self.process_group
+    }
+
+    /// Start writing this run's state to a durable record.
+    ///
+    /// Called by [`super::SessionStore::prepare`] once the record exists, which
+    /// is the only path that has one. Attaching after the fork is deliberate:
+    /// the record names the child's identity and process group, and neither is
+    /// a fact until the child's "at the gate" message has arrived.
+    pub(crate) fn attach_session(&mut self, session: Arc<SessionHandle>) {
+        self.session = Some(session);
+    }
+
+    /// Give up the child without ending it, for tests that need a run to
+    /// outlive its handle.
+    ///
+    /// Reproduces what a *crashed* caller leaves behind, which no ordinary API
+    /// on this type can: the gate and status descriptors are closed (so the
+    /// child's `read` returns 0 and it exits by itself, exactly as it would if
+    /// the supervisor process had died) while the kill-and-reap that
+    /// [`Drop`] would otherwise perform is skipped.
+    ///
+    /// Test-only, and deliberately not public. The supported way for a run to
+    /// outlive its supervisor is the detached supervisor of a later slice; this
+    /// is a way to *simulate a crash*, not a way to detach.
+    #[cfg(test)]
+    pub(crate) fn abandon(mut self) {
+        self.gate = None;
+        self.status = None;
+        self.child_owned = false;
     }
 
     /// The exit facts recorded on this handle, if the run ended here.
@@ -548,6 +595,7 @@ impl PreparedSandbox {
                     self.shared.state(),
                     ActivationObservation::ExecOrKilledPreExec,
                     self.event_sink.clone(),
+                    self.session.clone(),
                 ))
             }
             Ok(Some((tag, errno))) => {
@@ -593,6 +641,7 @@ impl PreparedSandbox {
             self.identity.clone(),
         );
         self.last_exit = Some(exit.clone());
+        self.persist_exit();
         Ok(exit)
     }
 
@@ -658,10 +707,19 @@ impl PreparedSandbox {
         Ok(change.to)
     }
 
-    /// Tell the sink about a change that already happened.
+    /// Tell the sink, and the durable record, about a change that already
+    /// happened.
     ///
-    /// Always outside the shared core's lock: the sink is consumer code and
-    /// may do anything, including calling back in.
+    /// Always outside the shared core's lock, and always *after* the change:
+    /// the sink is consumer code and may do anything, including calling back
+    /// in, and the record write is filesystem I/O that must never happen with
+    /// the lock the gate's single-use guarantee depends on in hand.
+    ///
+    /// The consequence of writing after the fact is stated rather than hidden:
+    /// a supervisor that dies between the transition and this call leaves a
+    /// record one step stale. That is why
+    /// [`super::SessionStore::recover`] reconciles a loaded record against the
+    /// live system instead of believing it.
     fn report(&self, change: Transition) {
         if let Some(sink) = &self.event_sink {
             sink.emit(&LifecycleEvent::StateChanged {
@@ -670,6 +728,26 @@ impl PreparedSandbox {
                 observation: Observation::DirectlyObserved,
             });
         }
+        if let Some(session) = &self.session {
+            session.persist(change.to, self.recorded_activation());
+        }
+    }
+
+    /// Write the run's end to the durable record, if there is one.
+    ///
+    /// Called by the paths that record a [`SandboxExit`] *after* the transition
+    /// that produced it, so the activation fact the exit carries reaches the
+    /// record instead of arriving one write too late.
+    fn persist_exit(&self) {
+        if let Some(session) = &self.session {
+            session.persist(self.shared.state(), self.recorded_activation());
+        }
+    }
+
+    /// Whether the customer's program was observed to start, as far as this
+    /// handle knows. `None` until the run ends here.
+    fn recorded_activation(&self) -> Option<ActivationObservation> {
+        self.last_exit.as_ref().map(SandboxExit::activation)
     }
 
     /// Wait for the child's "sandbox applied, at the gate" record.
@@ -754,6 +832,7 @@ impl PreparedSandbox {
             self.identity.clone(),
         );
         self.last_exit = Some(exit.clone());
+        self.persist_exit();
         // The child is reaped by this value's `Drop`, which the caller reaches
         // by propagating the error.
         PrepareError::ChildFailed { exit }
@@ -817,6 +896,7 @@ impl PreparedSandbox {
         self.status = None;
         self.zeroize_secrets();
         self.last_exit = Some(SandboxExit::new(outcome, activation, self.identity.clone()));
+        self.persist_exit();
     }
 
     /// Close an expired gate and stop the child behind it.
@@ -834,6 +914,7 @@ impl PreparedSandbox {
                     ActivationObservation::NotActivated,
                     self.identity.clone(),
                 ));
+                self.persist_exit();
             }
         }
         self.status = None;
