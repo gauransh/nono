@@ -1,0 +1,29 @@
+{
+  "parallel_run_id": "EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C",
+  "stream": "parallel-stream-1-nono-substrate",
+  "branch": "parallel/nono-substrate-v1",
+  "resolved_at": "2026-08-17",
+  "nono_upstream": {
+    "repo": "https://github.com/nolabs-ai/nono",
+    "ref": "main",
+    "sha": "149579a7b0753ee413680169fa937eea82da46a0"
+  },
+  "leash_upstream": {
+    "repo": "https://github.com/strongdm/leash",
+    "ref": "main",
+    "sha": "fd8e0c1deb978d1871e080cd09a7f9e9c394c406",
+    "role": "read-only reference"
+  },
+  "crystal_base": {
+    "repo": "https://github.com/gauransh/itsm-sandbox-policy-engine",
+    "ref": "main",
+    "sha": "9dfbc16a5b1a6001558b76b836678009e6789c6e",
+    "role": "read-only reference (local checkout: /Users/gauranshtandon/Documents/Vedaya/itsm-sandbox-policy-engine)"
+  },
+  "toolchain": {
+    "cargo": "1.97.1",
+    "rustc": "1.97.1",
+    "workspace_msrv": "1.95",
+    "host": "aarch64-apple-darwin (Darwin 23.6.0)"
+  }
+}
