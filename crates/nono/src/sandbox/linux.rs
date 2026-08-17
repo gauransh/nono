@@ -1827,6 +1827,9 @@ struct SockFprog {
     filter: *const SockFilterInsn,
 }
 
+/// Number of instructions in the architecture-validation prologue.
+const ARCH_GUARD_LEN: usize = 6;
+
 /// Prefix a syscall-number filter with native-architecture validation.
 ///
 /// The architecture check closes the compat-ABI path (for example, i386
@@ -1834,7 +1837,12 @@ struct SockFprog {
 /// rejects x32, which reports the x86_64 audit architecture while setting a
 /// marker bit in the syscall number. Keeping this as a fixed-size array means
 /// raw-cloned children can build static filters without allocating.
-fn seccomp_arch_guard(errno_ret: u32) -> [SockFilterInsn; 6] {
+///
+/// `mismatch_action` is the raw `SECCOMP_RET_*` value returned when the caller
+/// is not on the native ABI. Enforcement filters pass an errno action so a
+/// compat-ABI process cannot slip past syscall numbers keyed to the native ABI;
+/// filters that only widen access pass `SECCOMP_RET_ALLOW`.
+fn seccomp_arch_guard(mismatch_action: u32) -> [SockFilterInsn; ARCH_GUARD_LEN] {
     [
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
@@ -1852,7 +1860,7 @@ fn seccomp_arch_guard(errno_ret: u32) -> [SockFilterInsn; 6] {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
-            k: errno_ret,
+            k: mismatch_action,
         },
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
@@ -1870,22 +1878,26 @@ fn seccomp_arch_guard(errno_ret: u32) -> [SockFilterInsn; 6] {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
-            k: errno_ret,
+            k: mismatch_action,
         },
     ]
 }
 
+/// Prepend the arch guard to a fixed-size program (`M` must equal `N + 6`).
+///
+/// This is a pure prepend: BPF jump targets are relative offsets, so no jump
+/// inside `tail` is invalidated.
 fn prepend_seccomp_arch_guard<const N: usize, const M: usize>(
     tail: [SockFilterInsn; N],
-    errno_ret: u32,
+    mismatch_action: u32,
 ) -> [SockFilterInsn; M] {
     let mut guarded = [SockFilterInsn {
         code: BPF_RET | BPF_K,
         jt: 0,
         jf: 0,
-        k: errno_ret,
+        k: mismatch_action,
     }; M];
-    let prefix = seccomp_arch_guard(errno_ret);
+    let prefix = seccomp_arch_guard(mismatch_action);
 
     let mut index = 0;
     while index < prefix.len() {
@@ -1900,41 +1912,39 @@ fn prepend_seccomp_arch_guard<const N: usize, const M: usize>(
     guarded
 }
 
+/// Prepend the arch guard to a dynamically sized program.
+///
+/// This is a pure prepend: BPF jump targets are relative offsets, so no jump
+/// inside `tail` is invalidated.
 fn prepend_seccomp_arch_guard_vec(
     tail: Vec<SockFilterInsn>,
-    errno_ret: u32,
+    mismatch_action: u32,
 ) -> Vec<SockFilterInsn> {
-    let prefix = seccomp_arch_guard(errno_ret);
+    let prefix = seccomp_arch_guard(mismatch_action);
     let mut guarded = Vec::with_capacity(prefix.len() + tail.len());
     guarded.extend_from_slice(&prefix);
     guarded.extend(tail);
     guarded
 }
 
-/// Install a seccomp-notify BPF filter for openat/openat2.
+/// Build the openat/openat2 seccomp-notify BPF program.
 ///
-/// Returns the notify fd. Must be called BEFORE `Sandbox::apply_auto()` (Landlock
-/// `restrict_self()`), so the supervisor can still receive notifications for
-/// paths that Landlock would block.
+/// Non-native ABIs (i386 compat, x32) are **allowed**, not denied. This filter
+/// only widens access: it exists so the supervisor can receive notifications
+/// for paths Landlock would otherwise block. Landlock remains the enforcement
+/// layer, so a process that evades this filter through a compat ABI gains
+/// nothing — it simply gets Landlock's denial instead of a supervisor prompt.
+/// Denying here would break legitimate 32-bit processes.
 ///
-/// The BPF filter routes openat/openat2 to `SECCOMP_RET_USER_NOTIF` and
-/// allows all other syscalls with `SECCOMP_RET_ALLOW`.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The kernel doesn't support seccomp user notifications (< 5.0)
-/// - The `seccomp()` syscall fails
-/// - `SECCOMP_FILTER_FLAG_NEW_LISTENER` is not available
-pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-
-    // BPF program:
-    //   ld  [nr]                     ; load syscall number
-    //   jeq SYS_OPENAT, notify       ; if openat -> notify
-    //   jeq SYS_OPENAT2, notify      ; if openat2 -> notify
-    //   ret SECCOMP_RET_ALLOW        ; else allow
-    //   notify: ret SECCOMP_RET_USER_NOTIF
+/// Instruction layout (after the 6-instruction arch prologue):
+/// ```text
+///  0: ld  [nr]
+///  1: jeq SYS_OPENAT  jt=+2 (-> 4: notify)
+///  2: jeq SYS_OPENAT2 jt=+1 (-> 4: notify)
+///  3: ret ALLOW
+///  4: ret USER_NOTIF
+/// ```
+fn build_seccomp_notify_filter() -> [SockFilterInsn; 11] {
     let filter = [
         // 0: Load syscall number
         SockFilterInsn {
@@ -1972,6 +1982,29 @@ pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
             k: SECCOMP_RET_USER_NOTIF,
         },
     ];
+    prepend_seccomp_arch_guard::<5, 11>(filter, SECCOMP_RET_ALLOW)
+}
+
+/// Install a seccomp-notify BPF filter for openat/openat2.
+///
+/// Returns the notify fd. Must be called BEFORE `Sandbox::apply_auto()` (Landlock
+/// `restrict_self()`), so the supervisor can still receive notifications for
+/// paths that Landlock would block.
+///
+/// The BPF filter routes openat/openat2 to `SECCOMP_RET_USER_NOTIF` and
+/// allows all other syscalls with `SECCOMP_RET_ALLOW`. Syscalls made through a
+/// non-native ABI are allowed as well; see `build_seccomp_notify_filter`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The kernel doesn't support seccomp user notifications (< 5.0)
+/// - The `seccomp()` syscall fails
+/// - `SECCOMP_FILTER_FLAG_NEW_LISTENER` is not available
+pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let filter = build_seccomp_notify_filter();
 
     let prog = SockFprog {
         len: filter.len() as u16,
@@ -3324,7 +3357,13 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
 /// BPF cannot dereference `msghdr`/`mmsghdr`; the supervisor performs those
 /// checks instead.
 ///
-/// Instruction layout:
+/// Non-native ABIs (i386 compat, x32) are **denied** with `EACCES`. This
+/// filter is enforcement: it is the only thing routing AF_UNIX operations to
+/// the supervisor for `sockaddr_un.sun_path` allowlist checks, and syscall
+/// numbers differ entirely across ABIs, so a program reaching `connect()`
+/// through the compat ABI would bypass the allowlist outright.
+///
+/// Instruction layout (after the 6-instruction arch prologue):
 /// ```text
 ///  0: ld  [nr]
 ///  1: jeq SYS_CONNECT  jt=+5 (->  7: notify)
@@ -3336,7 +3375,9 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
 ///  7: ret USER_NOTIF
 /// ```
 fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
-    vec![
+    let errno_ret = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
+
+    let filter = vec![
         // 0: ld [nr]
         SockFilterInsn {
             code: BPF_LD | BPF_W | BPF_ABS,
@@ -3393,7 +3434,8 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
         },
-    ]
+    ];
+    prepend_seccomp_arch_guard_vec(filter, errno_ret)
 }
 
 /// Install a seccomp-notify BPF filter for proxy-only network mode (Linux-only).
@@ -3431,7 +3473,10 @@ pub fn prepare_seccomp_proxy_filter(has_bind_ports: bool) -> PreparedSeccompNoti
 /// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` and
 /// routes them to the supervisor, which checks `sockaddr_un.sun_path`
 /// against the `unix_sockets` allowlist. Connections to unlisted paths
-/// are denied with `EACCES`. Returns the notify fd the supervisor must poll.
+/// are denied with `EACCES`. Syscalls issued through a non-native ABI
+/// (i386 compat, x32) are denied with `EACCES` as well, because their
+/// syscall numbers would otherwise sidestep the allowlist entirely.
+/// Returns the notify fd the supervisor must poll.
 ///
 /// Installing the filter traps `sendmsg()`, so callers must arrange a handoff
 /// that does not rely on post-install `SCM_RIGHTS`.
@@ -4529,41 +4574,21 @@ mod tests {
 
     #[test]
     fn test_bpf_filter_instruction_count() {
-        // The BPF filter should have exactly 5 instructions:
+        // 6 arch-prologue instructions plus the 5-instruction body:
         // ld, jeq openat, jeq openat2, ret allow, ret notify
-        let filter = [
-            SockFilterInsn {
-                code: BPF_LD | BPF_W | BPF_ABS,
-                jt: 0,
-                jf: 0,
-                k: SECCOMP_DATA_NR_OFFSET,
-            },
-            SockFilterInsn {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: 2,
-                jf: 0,
-                k: SYS_OPENAT as u32,
-            },
-            SockFilterInsn {
-                code: BPF_JMP | BPF_JEQ | BPF_K,
-                jt: 1,
-                jf: 0,
-                k: SYS_OPENAT2 as u32,
-            },
-            SockFilterInsn {
-                code: BPF_RET | BPF_K,
-                jt: 0,
-                jf: 0,
-                k: SECCOMP_RET_ALLOW,
-            },
-            SockFilterInsn {
-                code: BPF_RET | BPF_K,
-                jt: 0,
-                jf: 0,
-                k: SECCOMP_RET_USER_NOTIF,
-            },
-        ];
-        assert_eq!(filter.len(), 5);
+        let filter = build_seccomp_notify_filter();
+        assert_eq!(filter.len(), 11);
+
+        let body = &filter[ARCH_GUARD_LEN..];
+        assert_eq!(body.len(), 5);
+        assert_eq!(body[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(body[0].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(body[1].k, SYS_OPENAT as u32);
+        assert_eq!(body[1].jt, 2);
+        assert_eq!(body[2].k, SYS_OPENAT2 as u32);
+        assert_eq!(body[2].jt, 1);
+        assert_eq!(body[3].k, SECCOMP_RET_ALLOW);
+        assert_eq!(body[4].k, SECCOMP_RET_USER_NOTIF);
     }
 
     fn evaluate_static_bpf(filter: &[SockFilterInsn], nr: i32, args: [u64; 6]) -> u32 {
@@ -5175,26 +5200,174 @@ mod tests {
     #[test]
     fn test_build_seccomp_af_unix_filter_notifies_all_syscalls() {
         let filter = build_seccomp_af_unix_filter();
-        // 8 instructions: 0 ld-nr, 1-5 jeq dispatch, 6 ALLOW, 7 USER_NOTIF
+        // 6 arch-prologue instructions plus 8 body instructions:
+        // 0 ld-nr, 1-5 jeq dispatch, 6 ALLOW, 7 USER_NOTIF.
         // No check_fd block — the IPC handshake completes before the filter
         // is installed, so no fd-based exemption is needed.
-        assert_eq!(filter.len(), 8);
-        assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
-        assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter.len(), ARCH_GUARD_LEN + 8);
 
-        assert_eq!(filter[1].k, SYS_CONNECT as u32);
-        assert_eq!(filter[1].jt, 5); // -> insn 7 (USER_NOTIF)
-        assert_eq!(filter[2].k, SYS_BIND as u32);
-        assert_eq!(filter[2].jt, 4); // -> insn 7
-        assert_eq!(filter[3].k, SYS_SENDTO as u32);
-        assert_eq!(filter[3].jt, 3); // -> insn 7
-        assert_eq!(filter[4].k, SYS_SENDMSG as u32);
-        assert_eq!(filter[4].jt, 2); // -> insn 7 (no special exemption)
-        assert_eq!(filter[5].k, SYS_SENDMMSG as u32);
-        assert_eq!(filter[5].jt, 1); // -> insn 7
+        let body = &filter[ARCH_GUARD_LEN..];
+        assert_eq!(body[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(body[0].k, SECCOMP_DATA_NR_OFFSET);
 
-        assert_eq!(filter[6].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[7].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(body[1].k, SYS_CONNECT as u32);
+        assert_eq!(body[1].jt, 5); // -> body insn 7 (USER_NOTIF)
+        assert_eq!(body[2].k, SYS_BIND as u32);
+        assert_eq!(body[2].jt, 4); // -> body insn 7
+        assert_eq!(body[3].k, SYS_SENDTO as u32);
+        assert_eq!(body[3].jt, 3); // -> body insn 7
+        assert_eq!(body[4].k, SYS_SENDMSG as u32);
+        assert_eq!(body[4].jt, 2); // -> body insn 7 (no special exemption)
+        assert_eq!(body[5].k, SYS_SENDMMSG as u32);
+        assert_eq!(body[5].jt, 1); // -> body insn 7
+
+        assert_eq!(body[6].k, SECCOMP_RET_ALLOW);
+        assert_eq!(body[7].k, SECCOMP_RET_USER_NOTIF);
+    }
+
+    /// Assert that `filter` opens with the 6-instruction architecture
+    /// prologue and that an ABI mismatch yields `mismatch_action`.
+    fn assert_arch_guard_prologue(name: &str, filter: &[SockFilterInsn], mismatch_action: u32) {
+        assert!(
+            filter.len() > ARCH_GUARD_LEN,
+            "{name}: program is shorter than the arch prologue"
+        );
+        assert_eq!(
+            filter[0].code,
+            BPF_LD | BPF_W | BPF_ABS,
+            "{name}: insn 0 must load a seccomp_data word"
+        );
+        assert_eq!(
+            filter[0].k, SECCOMP_DATA_ARCH_OFFSET,
+            "{name}: insn 0 must load seccomp_data.arch before seccomp_data.nr"
+        );
+        assert_eq!(
+            filter[1].code,
+            BPF_JMP | BPF_JEQ | BPF_K,
+            "{name}: insn 1 must compare the loaded arch"
+        );
+        assert_eq!(
+            filter[1].k, NATIVE_AUDIT_ARCH,
+            "{name}: insn 1 must compare against the native audit arch"
+        );
+        assert_eq!(
+            filter[2].code,
+            BPF_RET | BPF_K,
+            "{name}: insn 2 must return on arch mismatch"
+        );
+        assert_eq!(
+            filter[2].k, mismatch_action,
+            "{name}: wrong action for a non-native ABI"
+        );
+        assert_eq!(
+            filter[3].k, SECCOMP_DATA_NR_OFFSET,
+            "{name}: insn 3 must reload seccomp_data.nr for the x32 check"
+        );
+        assert_eq!(
+            filter[4].code,
+            BPF_JMP | BPF_JSET | BPF_K,
+            "{name}: insn 4 must test the x32 marker bit"
+        );
+        assert_eq!(
+            filter[4].k, X32_SYSCALL_BIT,
+            "{name}: insn 4 must test X32_SYSCALL_BIT"
+        );
+        assert_eq!(
+            filter[5].k, mismatch_action,
+            "{name}: wrong action for an x32 syscall number"
+        );
+
+        // Behavioural cross-check: a foreign arch and an x32-tagged syscall
+        // number must both short-circuit to the mismatch action.
+        assert_eq!(
+            evaluate_static_bpf_with_arch(filter, NATIVE_AUDIT_ARCH ^ 1, 0, [0; 6]),
+            mismatch_action,
+            "{name}: non-native audit arch must not reach the syscall dispatch"
+        );
+        assert_eq!(
+            evaluate_static_bpf_with_arch(filter, NATIVE_AUDIT_ARCH, X32_SYSCALL_BIT, [0; 6]),
+            mismatch_action,
+            "{name}: x32 syscall numbers must not reach the syscall dispatch"
+        );
+    }
+
+    /// Every seccomp program this module builds must start with the
+    /// architecture prologue. A filter that loads `seccomp_data.nr` without
+    /// first validating `seccomp_data.arch` is bypassable through a non-native
+    /// ABI, whose syscall numbers do not match the native ones.
+    ///
+    /// The mismatch action is asserted too, so the deliberate asymmetry is
+    /// pinned: enforcement filters deny, and the openat-notify filter — which
+    /// only widens access on top of Landlock — allows.
+    #[test]
+    fn test_every_seccomp_program_starts_with_arch_guard() {
+        let eperm = SECCOMP_RET_ERRNO | (libc::EPERM as u32);
+        let eacces = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
+
+        assert_arch_guard_prologue(
+            "block_network",
+            &build_seccomp_block_network_filter(),
+            eperm,
+        );
+        assert_arch_guard_prologue(
+            "tcp_only_network",
+            &build_seccomp_tcp_only_network_filter(),
+            eperm,
+        );
+        assert_arch_guard_prologue("proxy(bind)", &build_seccomp_proxy_filter(true), eacces);
+        assert_arch_guard_prologue("proxy(no bind)", &build_seccomp_proxy_filter(false), eacces);
+        assert_arch_guard_prologue("af_unix", &build_seccomp_af_unix_filter(), eacces);
+
+        // The openat notify filter is the deliberate exception: Landlock is
+        // the enforcement layer, so a compat-ABI open gains nothing by
+        // skipping the supervisor notification, and denying here would break
+        // legitimate 32-bit processes.
+        assert_arch_guard_prologue(
+            "openat_notify",
+            &build_seccomp_notify_filter(),
+            SECCOMP_RET_ALLOW,
+        );
+    }
+
+    /// The AF_UNIX fix must be a pure prepend: BPF jump targets are relative,
+    /// so the original body has to survive byte-for-byte behind the prologue.
+    #[test]
+    fn test_af_unix_filter_body_is_unchanged_by_arch_guard() {
+        let filter = build_seccomp_af_unix_filter();
+        let expected_body = [
+            (BPF_LD | BPF_W | BPF_ABS, 0_u8, 0_u8, SECCOMP_DATA_NR_OFFSET),
+            (BPF_JMP | BPF_JEQ | BPF_K, 5, 0, SYS_CONNECT as u32),
+            (BPF_JMP | BPF_JEQ | BPF_K, 4, 0, SYS_BIND as u32),
+            (BPF_JMP | BPF_JEQ | BPF_K, 3, 0, SYS_SENDTO as u32),
+            (BPF_JMP | BPF_JEQ | BPF_K, 2, 0, SYS_SENDMSG as u32),
+            (BPF_JMP | BPF_JEQ | BPF_K, 1, 0, SYS_SENDMMSG as u32),
+            (BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW),
+            (BPF_RET | BPF_K, 0, 0, SECCOMP_RET_USER_NOTIF),
+        ];
+
+        let body = &filter[ARCH_GUARD_LEN..];
+        assert_eq!(body.len(), expected_body.len());
+        for (index, (code, jt, jf, k)) in expected_body.iter().enumerate() {
+            let insn = &body[index];
+            assert_eq!(
+                (insn.code, insn.jt, insn.jf, insn.k),
+                (*code, *jt, *jf, *k),
+                "af_unix body instruction {index} changed; the arch guard must \
+                 be a pure prepend, not a rewrite"
+            );
+        }
+
+        // Native-ABI behaviour is untouched by the prepend.
+        for nr in [SYS_CONNECT, SYS_BIND, SYS_SENDTO, SYS_SENDMSG, SYS_SENDMMSG] {
+            assert_eq!(
+                evaluate_static_bpf(&filter, nr, [0; 6]),
+                SECCOMP_RET_USER_NOTIF
+            );
+        }
+        assert_eq!(
+            evaluate_static_bpf(&filter, libc::SYS_read as i32, [0; 6]),
+            SECCOMP_RET_ALLOW
+        );
     }
 
     #[test]
