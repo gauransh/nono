@@ -24,9 +24,13 @@ is reference.
   updates this file in the same commit; the final SHA is the tip of
   `parallel/nono-substrate-v1` at handoff. Do not cite a SHA from prose in this
   file as the integration pin — read the tip.
-- **No fork remote exists.** `gauransh/nono` is absent. Pushing is an explicit
-  pending integration step that requires operator authorization; until it
-  happens, leash-rs consumes this checkout by path (§9.1).
+- **Fork remote:** `https://github.com/gauransh/nono` (public fork of
+  `nolabs-ai/nono`), branch `parallel/nono-substrate-v1` — pushed and
+  CI-verified. leash-rs pins it by `rev` (§9.1).
+- **No upstream PR has been opened.** Upstream's `AGENTS.md` hard-stops any PR
+  that has no prior issue and disclosure in that issue's discussion. Candidates
+  and their order are in `docs/UPSTREAMING.md`; filing the issues is an
+  operator decision.
 
 ### 1.1 Upstream has moved — the re-diff
 
@@ -318,18 +322,28 @@ workflow was modified.
 
 ## 6. Row status summary
 
-Authoritative source: `BLOCKED_ROWS.json`. Summary:
+Authoritative source: `BLOCKED_ROWS.json`. **All 20 rows PASS**, verified in CI
+at the branch tip on both platforms (run `32058841453`):
 
-| | Rows |
+```
+ubuntu-latest   14 PASS  0 FAIL  1 NOT_RUN   (macOS-only target; its Linux half passed)
+macos-latest    13 PASS  0 FAIL  2 NOT_RUN   (the two Linux gates, on a Docker-less host)
+```
+
+No row is BLOCKED. The Linux execution blocker that once held seven rows is
+cleared: verification runs on every push and depends on no developer machine.
+
+Running on Linux for the first time, and on macOS 26 for the first time, found
+five real defects that the development host could never surface — all fixed,
+each with a test that fails when its guard is removed:
+
+| Defect | Only visible on |
 |---|---|
-| **PASS** (19) | R01 upstream tests green · R02 lifecycle as library APIs · **R03 prepare cannot exec early** · **R04 activation single-use** · R05 races tested · **R06 mode semantics honest (Linux half)** · **R07 Linux Landlock fail-closed** · **R09 detached/attach survive caller restart** · **R10 exit facts observed** · **R11 cleanup verification** · R12 support report · R13 event delivery · R14 no CLI invocation · R15 no product types · R16 deltas documented · R17 locally-achievable rows green · R18 blockers reproducible · R19 this file · R20 all work committed |
-| **IN_PROGRESS** (1) | R08 macOS Seatbelt — green on macOS 14 (14/14 mode pairs), one pair open on macOS 15 (see section 8) |
-| **BLOCKED** (0) | — the Linux execution blocker is cleared; verification runs in CI on every push |
-
-The seven rows in bold were `BLOCKED` on Linux execution and are now verified on
-a real kernel (run `32052788218`).
-
----
+| A dead client held the session's client slot, breaking caller-death reattach | Linux (macOS passed by timing luck) |
+| Terminal backpressure starved control traffic from any client, so a run that ignored its stdin could stop the supervisor answering `Hello` | Linux (present on macOS, hidden by buffer sizes) |
+| 100%-CPU supervisor spin on a finished terminal (`POLLHUP` on a zero-interest entry) | Linux |
+| A second client silently overwritten instead of refused during an in-flight request | either, once looked for |
+| Directory-only Landlock rights silently masked away when requested on a file | Linux |
 
 ## 7. Fork deltas
 
@@ -350,77 +364,69 @@ condition in `NONO_UPSTREAM_DELTA.md` §4.
 
 ## 8. Remaining external blockers
 
-**None. The Linux blocker is cleared.**
+**None.**
 
-Linux verification now runs on every push, on a real kernel, via the fork's own
-`stream-gates` workflow (`.github/workflows/stream-gates.yml`, ubuntu-latest
+Linux verification runs on every push, on a real kernel, via the fork's own
+`stream-gates` workflow (`.github/workflows/stream-gates.yml`, `ubuntu-latest`
 job). It does not depend on this or any developer machine.
 
-> **Reproduce:** push to `gauransh/nono` (or run the workflow manually) and read
-> the `stream gates (ubuntu-latest)` job:
+> **Reproduce:**
 > ```
 > gh run list  --repo gauransh/nono --branch parallel/nono-substrate-v1
 > gh run view <id> --repo gauransh/nono --log
 > ```
 
-**Result (run `32052788218`, ubuntu-latest, x86_64, kernel 6.x):**
+**Result at the branch tip (run `32058841453`):**
 
 ```
-gates: 14 PASS  0 FAIL  1 NOT_RUN  (of 15)
-PASS  linux-landlock-live    129 passed / 0 failed
-PASS  linux-lifecycle-live    54 passed / 0 failed / 1 ignored
-PASS  workspace-tests       3765 passed / 0 failed
-PASS  miri-pure-lifecycle     56 passed / 0 failed
-NOT_RUN lifecycle-modes-live  macOS-only target; its Linux half is linux-landlock-live (PASS)
+ubuntu-latest    gates: 14 PASS  0 FAIL  1 NOT_RUN
+  linux-landlock-live   129 passed / 0 failed
+  linux-lifecycle-live   56 passed / 0 failed / 1 ignored
+  workspace-tests      3769 passed / 0 failed
+  miri-pure-lifecycle    56 passed / 0 failed
+macos-latest     gates: 13 PASS  0 FAIL  2 NOT_RUN
+  lifecycle-modes-live   14 passed / 0 failed      (macOS 26.5.2)
+  lifecycle-detached     31 passed / 0 failed
 ```
 
-Running on Linux for the first time found four real defects that macOS could
-never surface, all fixed (delta F12): a 100%-CPU supervisor spin on a finished
-terminal (Linux reports POLLHUP even for a zero-interest poll entry); a dead
-client holding the session's client slot, which broke caller-death reattach; a
-second client silently overwritten instead of refused during an in-flight
-request; and directory-only Landlock rights being silently masked away when
-requested on a file path instead of refused.
+Every `NOT_RUN` names the capability its host lacks and is never counted as a
+pass: on Linux it is the macOS-only Seatbelt mode matrix (whose Linux half,
+`linux-landlock-live`, passed); on macOS it is the two Linux gates.
 
-**Local Docker remains wedged on this machine** (backend process runs, no
-daemon socket; `docker desktop status` cannot reach it while `docker desktop
-start` reports it already running; the disk is also near full). That is now a
-convenience gap only — it is no longer on the path to Linux verification, and
-the gate script still reports the two Linux gates honestly as `NOT_RUN` with
+**Local Docker on the development machine remains wedged** (backend process
+runs, no daemon socket; `docker desktop status` cannot reach it while `docker
+desktop start` reports it already running; the disk is also near full). This is
+a convenience gap only — it is no longer on the path to Linux verification, and
+`scripts/stream-gates.sh` reports the two Linux gates honestly as `NOT_RUN` with
 the operator action when run on a Docker-less macOS host.
 
-**That open item is closed (delta F13; `BLOCKED_ROWS.json` R08 still needs its
-row flipped).** The runner is macOS 26.5.2 / Darwin 25.5.0, not macOS 15, and
-the pair that failed there was failing for something outside the grant: `cat(1)`
-sizes its copy buffer from `fstat(fileno(stdout))` and dies when that is
-refused, and macOS 26 evaluates `file-read-metadata` for an `fstat` of a
-descriptor the confined process merely *inherited* — which the harness's own
-stdout, a gate log file, always is. macOS 14 does not evaluate it at all. **No
-SBPL operation was added and nothing new is bundled:** `read_contents` is
-`file-read-data` + `file-map-executable` on both versions and enforces exactly
-that on both. The two pairs that read bytes now read with `/usr/bin/cmp -s`,
-which writes nothing and so needs only the mode under test. Evidence — the
-runner's own kernel log line and the probe matrix that isolated it — is in
-PLATFORM_CAPABILITY_BASELINE.md under "Version differences observed live"; all
-14 pairs are green on `macos-latest` in run 32058137420.
+### 8.1 A note for whoever ports this further
+
+Two of the five defects CI found were invisible on the development platform for
+the same structural reason: **macOS and Linux disagree about what a poll on a
+descriptor nobody is interested in means, and about how much a socket or pty
+will buffer before it pushes back.** A supervisor written and tested on one of
+them will encode the other's timing as an assumption without anyone noticing.
+Run the `ubuntu-latest` job before believing any change to `supervisor.rs`,
+`terminal.rs`, or `prepare.rs` — a green macOS suite is not evidence for those
+files.
 
 ## 9. Integration instructions for leash-rs
 
 ### 9.1 Pin
 
-Until a fork remote exists, a path dependency:
-
 ```toml
 [dependencies]
-nono = { path = "../nono" }              # this checkout
+nono = { git = "https://github.com/gauransh/nono", rev = "<tip of parallel/nono-substrate-v1>" }
 ```
 
-Once pushed:
+Read the tip rather than copying a SHA out of this file:
 
-```toml
-[dependencies]
-nono = { git = "https://github.com/<org>/nono", rev = "<final HEAD of parallel/nono-substrate-v1>" }
 ```
+git ls-remote https://github.com/gauransh/nono parallel/nono-substrate-v1
+```
+
+A path dependency on a local checkout also works for development.
 
 **Pin by `rev`, never by `branch`.** A branch pin means the substrate under your
 sandbox can change without your lockfile moving.

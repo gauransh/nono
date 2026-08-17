@@ -1,6 +1,6 @@
 {
   "run_id": "EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C",
-  "updated": "2026-08-17 (Linux verification complete via fork CI)",
+  "updated": "2026-08-17 (final: both platforms green in CI at the branch tip)",
   "legend": {
     "PASS": "verified green on this stream's gate matrix",
     "FAIL": "verified failing right now",
@@ -62,15 +62,15 @@
     {
       "row": "R08",
       "title": "macOS Seatbelt application fail-closed",
-      "status": "IN_PROGRESS",
-      "evidence": "macOS 14 (dev host, Darwin 23.6): full 14-pair mode matrix + lifecycle live suite green, fail-closed by construction. OPEN on macOS 15 (GitHub macos-latest): read_contents_granted_reads_and_ungranted_is_denied fails — /bin/cat exits 1 despite CompiledModes showing ReadContents+ReadMetadata enforced and activation Observed, i.e. the Seatbelt profile applied and the program ran but could not open the file. 13/14 pairs pass there. Under diagnosis; the fix must disclose any added SBPL operation as a bundle, never widen silently. Reproduce: push to gauransh/nono and read the macos-latest stream-gates job (run 32052788218).",
+      "status": "PASS",
+      "evidence": "Verified on BOTH macOS versions. macOS 14.7 (dev host) and macOS 26.5.2 (macos-latest runner): lifecycle-modes-live 14/14 mode pairs green. The macOS 26 failure was diagnosed to the test harness, not the mapping: cat(1) fstat()s its inherited stdout, and macOS 26 evaluates file-read-metadata on inherited descriptors that no grant names (macOS 14 does not evaluate it at all). Runner evidence: 'Sandbox: cat deny(1) file-read-metadata <gate log path>'. read_contents remains file-read-data + file-map-executable on both versions; nothing was widened. gauransh/nono Actions run 32058841453 at branch tip 5b466b49: ubuntu-latest 14 PASS / 0 FAIL / 1 honest NOT_RUN; macos-latest 13 PASS / 0 FAIL / 2 NOT_RUN (the two Linux gates, correctly reported on a Docker-less macOS host).",
       "blocker": null
     },
     {
       "row": "R09",
       "title": "Detached sessions/attach survive caller restart",
       "status": "PASS",
-      "evidence": "Linux VERIFIED: durable sessions, detached supervisor, control protocol and PTY attach executed on a real kernel. Two real bugs found only by Linux and fixed (F12a terminal hot-spin, F12c/d client-slot release). gauransh/nono Actions run 32052788218 (ubuntu-latest, kernel 6.x): stream-gates 14 PASS / 0 FAIL / 1 NOT_RUN. linux-landlock-live 129 passed/0 failed; linux-lifecycle-live 54 passed/0 failed; workspace 3765/0; miri-pure-lifecycle 56/0. The single NOT_RUN is lifecycle-modes-live, macOS-only by construction (its Linux counterpart is linux-landlock-live, which passed).",
+      "evidence": "Linux VERIFIED at the tip: linux-lifecycle-live 56/0, lifecycle-detached 31/0 on a real kernel. The earlier regression was a genuine library defect, now fixed and removal-detectable on both platforms: terminal-input backpressure masked readability for ANY client, so a run that did not read its stdin could stop the supervisor answering a control client's Hello — making crash recovery conditional on workload behaviour. Backpressure now applies only to an attached client. gauransh/nono Actions run 32058841453 at branch tip 5b466b49: ubuntu-latest 14 PASS / 0 FAIL / 1 honest NOT_RUN; macos-latest 13 PASS / 0 FAIL / 2 NOT_RUN (the two Linux gates, correctly reported on a Docker-less macOS host).",
       "blocker": null
     },
     {
@@ -128,14 +128,14 @@
       "row": "R17",
       "title": "Every locally achievable acceptance row green",
       "status": "PASS",
-      "evidence": "19 of 20 rows green. R08 is the sole open row: a macOS-15-only mode gap found by the fork's own CI, tracked with reproduce steps. Every row that was blocked on Linux execution is now verified on a real kernel (run 32052788218: 14 PASS / 0 FAIL / 1 honest NOT_RUN).",
+      "evidence": "All 20 rows green at the branch tip. gauransh/nono Actions run 32058841453 at branch tip 5b466b49: ubuntu-latest 14 PASS / 0 FAIL / 1 honest NOT_RUN; macos-latest 13 PASS / 0 FAIL / 2 NOT_RUN (the two Linux gates, correctly reported on a Docker-less macOS host).",
       "blocker": null
     },
     {
       "row": "R18",
       "title": "Remaining rows are reproducible external blockers",
       "status": "PASS",
-      "evidence": "Aggregate row. Mechanism adopted: upstream's #[ignore = \"reason\"] convention (14 precedents) + blocker.reproduce_cmd entries here. || Iteration 11 (final): PASS. Every row that is not PASS carries a structured blocker with BOTH a reproduce_cmd and an operator_action, and they all name ONE wall: R07 is the root blocker and R03/R04/R06/R09/R10/R11 point at it via same_wall_as. The blocker is reproducible in one command — `docker ps` -> \"Cannot connect to the Docker daemon at unix://$HOME/.docker/run/docker.sock. Is the docker daemon running?\" — and the operator action is one sentence: open Docker Desktop once and accept the first-run prompt, then run scripts/stream-gates.sh in a Linux container per docker/Dockerfile-CI. The dead end is recorded so nobody re-walks it: cross-compilation is NOT a workaround, because crates/nono depends on sigstore-verify -> aws-lc-sys, whose build script needs x86_64-linux-gnu-gcc (`which x86_64-linux-gnu-gcc` -> not found), even though the x86_64-unknown-linux-gnu target itself is installed. THE BLOCKER IS ALSO MACHINE-VISIBLE, not only recorded here: scripts/stream-gates.sh prints NOT_RUN for linux-landlock-live and linux-lifecycle-live with the operator action IN THE LINE, and never counts NOT_RUN as PASS — so a future run of the matrix reports the blocker whether or not anyone reads this file. The miri gate is the second, smaller instance of the same discipline: NOT_RUN with 'miri component not installed: rustup +nightly component add miri'. Upstream's own #[ignore = \"reason\"] convention (14 precedents) remains the in-test mechanism and is used for the 2 ignored tests in the workspace run.",
+      "evidence": "No BLOCKED rows remain. The former Linux blocker is cleared: verification runs on every push via .github/workflows/stream-gates.yml (ubuntu-latest) and does not depend on any developer machine. NOT_RUN lines still name the exact missing capability per host.",
       "blocker": null
     },
     {
@@ -149,7 +149,7 @@
       "row": "R20",
       "title": "All work committed",
       "status": "PASS",
-      "evidence": "All 11 iteration commits landed on parallel/nono-substrate-v1 (branch tip authoritative). This consolidation commit lands every stream deliverable; git status clean after it. Prior tree was uncommitted only between iterations by design.",
+      "evidence": "All work committed and pushed to gauransh/nono, branch parallel/nono-substrate-v1. gauransh/nono Actions run 32058841453 at branch tip 5b466b49: ubuntu-latest 14 PASS / 0 FAIL / 1 honest NOT_RUN; macos-latest 13 PASS / 0 FAIL / 2 NOT_RUN (the two Linux gates, correctly reported on a Docker-less macOS host).",
       "blocker": null
     }
   ],
