@@ -54,4 +54,28 @@ jobs:
         run: rustup toolchain install nightly --component miri
 
       - name: Run gate matrix
+        env:
+          STREAM_GATES_LOG_DIR: ${{ runner.temp }}/gate-logs
         run: ./scripts/stream-gates.sh
+
+      # A summary line names the gate that failed; the reason lives in the
+      # per-gate log the script writes. Print those logs on failure and keep
+      # them as an artifact, so a red run is diagnosable without a second push.
+      - name: Show failing gate logs
+        if: failure()
+        run: |
+          shopt -s nullglob
+          for log in "${{ runner.temp }}"/gate-logs/*.log; do
+            echo "::group::${log##*/}"
+            tail -n 300 "$log"
+            echo "::endgroup::"
+          done
+
+      - name: Upload gate logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/gate-logs
+          if-no-files-found: warn
+          retention-days: 7

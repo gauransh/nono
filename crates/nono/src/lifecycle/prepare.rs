@@ -1928,7 +1928,7 @@ impl PlatformSandbox {
     /// syscalls with a typed error.
     #[cfg(target_os = "linux")]
     pub(super) fn build(plan: &ValidatedPlan) -> Result<Self, PrepareError> {
-        use crate::sandbox::{Sandbox, SeccompNetFallback, SeccompOpts};
+        use crate::sandbox::{Sandbox, SeccompOpts};
 
         let abi = Sandbox::detect_abi().map_err(|err| PrepareError::SandboxSpec {
             reason: err.to_string(),
