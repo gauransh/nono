@@ -1,446 +1,709 @@
 # HANDOFF — Parallel Stream 1: Crystal Nono fork (generic sandbox substrate)
 
-Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 9
+Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · **FINAL form**, iteration 11 · 2026-08-17
 
-STATUS: IN PROGRESS — this stream is NOT yet done. Only the final integration
-agent may declare the combined system complete; this file records the current
-frozen-contract state of THIS repository only.
+STATUS: this stream's work is complete to the limit of what this host can verify.
+It is **not** a declaration that the combined system is done — only the final
+integration agent may say that. This file is the frozen-contract state of THIS
+repository, and it is what leash-rs builds against.
 
-## Branch and base
+**Read these three things first, in this order:** §8 (the one external blocker),
+§9 (integration instructions, including the one line you must add to `main`),
+and `BLOCKED_ROWS.json` (the authoritative per-row status). Everything else here
+is reference.
 
-- Branch: `parallel/nono-substrate-v1` (local repo: /Users/gauranshtandon/Documents/Vedaya/nono)
-- Upstream base: nolabs-ai/nono @ `149579a7b0753ee413680169fa937eea82da46a0` (main at lock time)
-- HEAD SHA: recorded per-iteration below; the branch tip is authoritative
-  (convention: each iteration's commit updates this file in the same commit
-  where possible; the final SHA is stated by the last iteration entry).
-- No GitHub fork remote exists yet (`gauransh/nono` absent). Push/publish is an
-  explicit pending integration step requiring operator authorization.
+---
 
-## Crates / packages
+## 1. Branch and base
 
-- `nono` (crates/nono) — the library leash-rs will consume. NOT published to
-  crates.io by this stream; consume via git/path pin (below).
-- `nono-cli`, `nono-proxy`, `nono-test-support`, `nono-ffi` (bindings/c) —
-  unchanged roles from upstream.
+- **Branch:** `parallel/nono-substrate-v1`
+- **Repository:** `/Users/gauranshtandon/Documents/Vedaya/nono` (local only)
+- **Upstream base (pin):** `nolabs-ai/nono` @
+  `149579a7b0753ee413680169fa937eea82da46a0`
+- **HEAD convention:** the branch tip is authoritative. Each iteration's commit
+  updates this file in the same commit; the final SHA is the tip of
+  `parallel/nono-substrate-v1` at handoff. Do not cite a SHA from prose in this
+  file as the integration pin — read the tip.
+- **No fork remote exists.** `gauransh/nono` is absent. Pushing is an explicit
+  pending integration step that requires operator authorization; until it
+  happens, leash-rs consumes this checkout by path (§9.1).
 
-## API entry points (target shape; see docs/adr/0001-generic-lifecycle.md)
+### 1.1 Upstream has moved — the re-diff
 
-- Today (upstream baseline): `nono::CapabilitySet` → `nono::Sandbox::apply_auto/
-  apply_landlock/apply_seccomp/apply_external`; `QueryContext`; `SandboxState`;
-  `supervisor::{SupervisorSocket, ApprovalBackend, …}`.
-- Landed (iteration 2): `nono::lifecycle::{LifecycleState, LifecycleOp,
-  TransitionError, SandboxPlan, ValidatedPlan, PlanError, GateConfig,
-  SessionMode, EventSink, LifecycleEvent, Observation, LifecycleError}`
-  (pure layer: state machine + validation + event trait).
-- Landed (iteration 3, macOS live-verified; Linux written-unverified):
-  `PreparedSandbox::prepare(ValidatedPlan) -> (PreparedSandbox,
-  ActivationHandle)`, `activate(&handle) -> ActivatedSandbox`,
-  `stop_before_activation()`, `ActivatedSandbox::wait() -> SandboxExit`,
-  `SandboxExit` (typed exit facts + `ActivationObservation`),
-  `ProcessIdentity` (pid + start_time + boot_id). Security review pass
-  applied (fd sweep in child, random release/abort nonces, honest
-  three-valued activation observation).
-- Landed (iteration 4): the lifecycle state and its one-shot gate write moved
-  behind a single lock (`lifecycle::sync_core::SharedLifecycle`, crate-internal
-  — public only under `--cfg loom`), with `PreparedSandbox`/`ActivatedSandbox`
-  rewired onto it. No public API change: same types, same signatures, same
-  observable behavior; the 96 existing lifecycle unit tests and all 16 live
-  tests pass unmodified. Proven by 5 Loom models (ADR-0001 §2).
-- Landed (iteration 5, macOS live-verified; Linux written-unverified):
-  `nono::lifecycle::{CleanupVerification, AbsenceBasis, SurvivorEvidence,
-  IndeterminateReason, UnsupportedReason, CleanupError}` plus
-  `ActivatedSandbox::{stop, verify_cleanup}` and
-  `PreparedSandbox::verify_cleanup`. The prepared child now leads its own
-  process group (`setpgid(0, 0)`, typed `PreExecStage::ProcessGroup` on
-  failure), so a stop signals the whole run and verification probes a group
-  rather than a pid `waitpid` already consumed. A sent signal is never a
-  basis; only `ConfirmedAbsent` moves the run to `CleanupVerified`.
-- Landed (iteration 6, macOS live-verified; Linux written-unverified):
-  `nono::lifecycle::{SessionStore, SessionRecord, SessionSummary, RecoveredSession,
-  RecoveryDecision, SessionStoreError, CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES}`
-  plus `lifecycle::{Sessions, reconcile}` (module-only). The durable half of
-  ADR-0001 §6: `SessionStore::open(dir)` (0700, checked-not-repaired, opened
-  `O_DIRECTORY | O_NOFOLLOW` with every record reached by `openat` against that
-  descriptor), `SessionStore::prepare(plan)` (a schema-versioned 0600 record
-  written after the gate-ready observation, updated at every later transition),
-  `sessions()` (one `Result` per record — a corrupt record is reported beside
-  its healthy siblings, never instead of them), and `recover(id)` (probe the
-  recorded identity, then the pure `reconcile()` decision table).
-  `PreparedSandbox::prepare` is unchanged: without a store nothing is written
-  and nothing behaves differently.
+Upstream `main` is now `9078ffcf`, **three commits past the pin**. All three were
+fetched and diffed at iteration 11. Full analysis in `NONO_UPSTREAM_DELTA.md` §2;
+the summary an integrator needs:
 
-  Two contract points a consumer must build on:
+| Commit | Scope | Affects the fork? |
+|---|---|---|
+| `5be192ad` refactor(seccomp): all filters include arch guard | `crates/nono/src/sandbox/linux.rs`, 461 lines. `ArchGuarded<T>` makes the arch prologue **structurally unskippable**; `af_unix` filter grows 8 → 14 rules. | Same file the fork edits, but **no conflict** (measured). Strictly improves the fail-closed story the fork depends on. |
+| `36243aa5` feat(policy): allow unlink for atomic-write temp files | CLI only. | Conceptually overlaps F11's `FsMode::AtomicWrite`, solved at CLI-policy level where F11 solves it at capability level. **They must not both ship.** |
+| `9078ffcf` feat(remote): remote session connect and ps | CLI only, +2151 lines, WebSocket to a hosted console. | No library conflict. Conceptually adjacent to F9/F10's attach, at a different layer. |
 
-  1. **A record may lag the live state by one step.** It is written after the
-     transition it describes, outside the lifecycle lock. Reconciliation on load
-     is what makes that safe; a consumer must not treat a record's `state` as a
-     statement about the present.
-  2. **A recovered process is not the recovering process's child**, so its exit
-     code or signal is *not observable* — `RecoveredSession` has no `wait` and
-     returns no `SandboxExit`. Recovery reports presence and absence
-     (`kill_group` / `kill_pid` / `verify_cleanup_by(deadline)`, which polls
-     until `ESRCH` rather than treating a sent signal as proof). Exit facts that
-     survive a caller restart need the detached supervisor of the next slice.
+**The rebase onto `9078ffcf` is textually clean** — verified by
+`git merge-tree --write-tree` (returns a tree) and by a full `git rebase` of all
+11 fork commits in an isolated `git clone --shared` ("Successfully rebased",
+zero conflicts). The predicted `linux.rs` conflict did not materialise: the
+fork's additions sit ~370 lines from upstream's. **One caveat that matters:**
+`sandbox/linux.rs` is `cfg(target_os = "linux")` in its entirety, so a macOS host
+cannot *compile* the rebased file at all. Rebase, then read the `ubuntu-latest`
+job of `.github/workflows/stream-gates.yml` before believing the clean result.
 
-- Landed (iteration 7, macOS live-verified; Linux written-unverified):
-  **R12, the machine-readable support report.**
-  `nono::lifecycle::{SupportReport, SUPPORT_REPORT_SCHEMA_VERSION, Capability,
-  SupportStatus, Determination, SupportReason, HostFacts, KernelFacts,
-  LandlockFacts, LandlockRight, LandlockRightSupport, NetworkFilteringFacts,
-  NetworkMechanism, NetworkMechanismSupport, IdentityFacts, CleanupFacts,
-  EventObservationSupport, EventFamily, EventFidelity, DarkSpot,
-  DarkSpotEntry}` (all re-exported at the crate root except `Capability`,
-  which stays `lifecycle::Capability` so it cannot be misread as a peer of
-  `CapabilitySet`).
+---
 
-  `SupportReport::gather() -> SupportReport` is **infallible**. Every field is
-  a `Capability<T>` carrying `status` (`available` / `partial` / `unavailable`
-  / `unknown`), `determination` (`probed_live` / `platform_api` / `declared`),
-  a typed `reason`, and optional typed `facts`. **No bare boolean appears
-  anywhere in the serialized tree**, and a test walks the JSON to keep it that
-  way. Upstream's `SupportInfo { is_supported: bool, … }` is untouched.
+## 2. Crates and packages
 
-  Three points a consumer should read before trusting it:
+| Crate | Path | Role |
+|---|---|---|
+| **`nono`** | `crates/nono` | **The library leash-rs consumes.** Version `0.73.0`. Not published to crates.io by this stream. |
+| `nono-cli` | `crates/nono-cli` | Unchanged from upstream except two test-hygiene fixes (F1/F1b). Not a dependency of `nono`. |
+| `nono-proxy`, `nono-test-support` | | Unchanged roles from upstream. |
+| `nono-ffi` | `bindings/c` | Unchanged role; one forced `map_error` arm because its match is exhaustive. |
 
-  1. On macOS, `seatbelt` is `platform_api`, **not** `probed_live`.
-     `sandbox_init` is linked (so certainly present) but applies to the
-     calling process irreversibly; the only honest live probe forks first, and
-     this library will not fork a consumer to answer a diagnostic question.
-     The rationale is in `reason.why_not_probed`.
-  2. On Linux, `seccomp` is `probed_live` (upstream already ships a
-     fork-isolated probe) but `seccomp_user_notification` is `unknown` — it
-     cannot be established without installing a filter that cannot be removed,
-     and a kernel version is not proof.
-  3. `event_observation` reports `kernel_denial` as `not_observed` on **both**
-     platforms. The library emits no denial events; the CLI's macOS
-     `log stream` reconstruction is CLI machinery and is not claimed here.
+`crates/nono` is a **leaf** in the workspace graph — it does not depend on
+`nono-cli`, so no CLI code is reachable from the library even indirectly
+(`BLOCKED_ROWS.json` R14).
 
-- Landed (iteration 7): **R13, the generic event vocabulary.**
-  `nono::lifecycle::{LifecycleEvent, LifecycleEventKind, ActivationOutcome}`.
-  **API shape change:** `LifecycleEvent` is now a struct — an envelope
-  (`session_id`, `generation`, `seq`, `observed_at`, `identity`,
-  `observation`) around a closed `what: LifecycleEventKind`. The previous
-  `LifecycleEvent::StateChanged { from, to, observation }` survives as
-  `LifecycleEventKind::StateChanged { from, to }`; a consumer that matched the
-  old enum matches `event.what()` instead. No other public type changed.
+---
 
-  `seq` counts a run's events from zero, is kept across the
-  prepared→activated handoff, and is **the ordering authority**;
-  `observed_at` is a wall clock and explicitly is not. `ActivationOutcome`
-  carries no token material by construction, locked by a structural test.
-  Events the platform cannot show do not exist in the vocabulary — there is no
-  kernel-denial variant to synthesize one into.
+## 3. API entry points — the complete list
 
-- Schema documents, each with a golden JSON example locked by a snapshot test
-  that reads the document itself: `docs/lifecycle/session-record-v2.md` (what
-  this build writes), `docs/lifecycle/session-record-v1.md` (what it still
-  reads — the document doubles as the compatibility test's fixture),
-  `docs/lifecycle/support-report-v1.md`, `docs/lifecycle/lifecycle-event-v1.md`.
+Audited at iteration 11 against `crates/nono/src/lib.rs:100-114` (crate-root
+re-exports) and `crates/nono/src/lifecycle/mod.rs:124-164` (module re-exports).
 
-- Landed (iteration 8): **R09 slice B, the detached supervisor.** A run that
-  outlives the process that started it, with its exit facts still directly
-  observed. See `docs/adr/0002-detached-supervisor.md`.
+Everything below is reachable as `nono::<name>` unless the row says
+`lifecycle::` only.
 
-  **This one needs a line of code from you.** Add, as the *first statement* of
-  your `main`:
+### 3.1 Plan
 
-  ```rust
-  fn main() {
-      nono::lifecycle::supervisor_entry();
-      // ... your program, unchanged ...
-  }
-  ```
+`SandboxPlan` · `ValidatedPlan` · `PlanError` · `GateConfig` · `SessionMode` ·
+`MAX_PLAN_METADATA_BYTES` · `lifecycle::ResourceLimits` *(module-only — see §3.12)*
 
-  It returns immediately and does nothing in every ordinary run. It matters
-  only because a library has no binary of its own to re-execute and cannot
-  fork a long-running supervisor out of a threaded caller: the supervisor
-  *is* your binary, re-executed, and that call is how it recognises itself.
-  Without it, `SessionStore::prepare_detached` fails at its readiness deadline
-  with `PrepareError::SupervisorUnresponsive`, whose message names this
-  function. "First statement" is a real requirement, not a style note: the
-  call removes a private marker from the environment, which is sound only
-  while the process is single-threaded.
+`SandboxPlan::new(program)` → builder (`.args`, `.env`, `.working_dir`,
+`.capabilities`, `.session_mode`, `.detached`, `.gate`, `.metadata`, `.sink`) →
+`.validate() -> Result<ValidatedPlan, PlanError>`. Validation is the typestate
+boundary: nothing forks until a plan is `Validated`.
 
-  New API:
+### 3.2 Prepare
 
-  | Item | What it is |
-  |---|---|
-  | `lifecycle::supervisor_entry()` | The entry hook above. |
-  | `SessionStore::prepare_detached(plan)` | `-> (DetachedSession, ActivationHandle)`. Requires `plan.detached(true)`; refuses otherwise (`PrepareError::DetachedNotRequested`). |
-  | `SessionStore::attach_control(session_id)` | Connect to a live supervisor by id. |
-  | `SessionStore::control_socket_path(session_id)` | Where that socket is. |
-  | `RecoveredSession::attach()` / `::supervisor()` | Connect to the supervisor a recovery just proved alive. |
-  | `DetachedSession::{activate, wait, stop, status, verify_cleanup, detach, supervisor, opened_in}` | The run, over the socket. |
-  | `WaitOutcome::{Exit(SandboxExit), StillRunning}` | A bounded wait's two honest answers. |
-  | `SessionStatus::{state, record, events, exit}` | What `status()` returns. |
-  | `RecoveryDecision::Attachable` | New variant: the record's supervisor answered its identity probe. |
-  | `SupervisorPresence::{NeverDetached, Alive, Gone}` | New third input to `reconcile`. |
-  | `ControlRequest` / `ControlReply` / `ControlRefusal` / `FrameError` | Protocol v1, exported so a consumer can match refusals. |
-  | `ActivationHandle::{from_parts, token}` | The token is now readable and rebuildable, because a detached run is activated by whichever process holds it — see the warning below. |
-  | `DetachedError`, `LifecycleError::Detached` | The new failure aggregate. |
-  | `DETACHED_EVENT_RING_CAPACITY`, `CONTROL_TIMEOUT`, `MAX_CONTROL_WAIT`, `MAX_CONTROL_FRAME_BYTES`, `CONTROL_PROTOCOL_VERSION`, `OLDEST_SUPPORTED_SCHEMA_VERSION` | Documented bounds. |
+`PreparedSandbox` · `PrepareError`
 
-  Four consumer-visible consequences, none of them hidden:
+- `PreparedSandbox::prepare(ValidatedPlan) -> Result<(PreparedSandbox, ActivationHandle)>`
+  — ephemeral, no store, no file.
+- `PreparedSandbox::{activate, stop_before_activation, verify_cleanup, apply}`
+- `Drop` kills the process group, then the pid, then reaps.
 
-  1. **A headless detached run's standard streams are `/dev/null`.** A
-     supervisor that held its launcher's terminal or pipes would keep them
-     open after the launcher exited, which is the thing "detached" is for.
-     Giving output back is what the PTY of slice C is for.
-  2. **Dropping a `DetachedSession` does not end the run** — it closes a
-     socket. That is the opposite of `PreparedSandbox` and `ActivatedSandbox`,
-     and `detach()` exists so the intent can be said out loud.
-  3. **`ActivationHandle::token()` is now public.** It has to be: the process
-     that activates a detached run is very often not the one that prepared it,
-     and the library cannot transport the bytes for you. They are a start
-     button for a held child — the library never puts them in argv, an
-     environment, a log, a `Debug`, or a record, and where you put them is
-     your decision.
-  4. **The session record is schema v2.** v1 records still load (upgraded in
-     memory: no supervisor, no exit facts, empty event ring) and are written
-     back as v2. A record from a version neither of those is still refused.
+### 3.3 Activate
 
-  Events while detached are **not deliverable live** — `EventSink` is
-  caller-side and a detached supervisor has no caller. It keeps the last
-  `DETACHED_EVENT_RING_CAPACITY` (32) events in the record instead, oldest
-  dropped, and `DetachedSession::status().events()` is how you read them. A
-  consumer that needs every event stays connected.
+`ActivationHandle` · `ActivationError` · `ACTIVATION_TOKEN_BYTES`
 
-- Landed (iteration 9): **R09 slice C, the run's terminal.** A detached run can
-  now have a real PTY, owned by the supervisor, that a client attaches to,
-  types at, resizes, detaches from, and comes back to — across a restart of the
-  caller.
+- `PreparedSandbox::activate(&ActivationHandle) -> Result<ActivatedSandbox, ActivationError>`
+- `ActivationHandle::{from_parts, token}` — the token is public **because it has
+  to be**: a detached run is very often activated by a different process than
+  prepared it, and the library cannot transport bytes for you. See §9.5.
 
-  **Interactive is a question of ownership, not a feature flag.** A PTY master
-  has to be held for as long as the run lives, and the ephemeral paths have
-  nothing that outlives the call to hold one. So an interactive plan has to be
-  a *detached* plan:
+### 3.4 Wait and exit facts
 
-  ```rust
-  let plan = SandboxPlan::new("/bin/sh")
-      .args(["-c", "..."])
-      .session_mode(SessionMode::Interactive)
-      .detached(true)                     // required, and refused without it
-      .capabilities(caps)
-      .validate()?;
+`ActivatedSandbox` · `SandboxExit` · `ExitOutcome` · `ActivationObservation` ·
+`PreExecStage` · `SupervisorStage` · `ReapError` · `PRE_EXEC_EXIT_CODE`
 
-  let (session, handle) = store.prepare_detached(plan)?;
-  // Attach *before* activating: the window size has to reach the terminal
-  // before the program starts, or a program that reads its size at startup
-  // reads the zeroes a fresh PTY carries.
-  let mut terminal = session.attach(WindowSize::new(40, 100))?;
-  terminal.activate(&handle)?;
-  ```
+- `ActivatedSandbox::{wait, try_wait, stop, verify_cleanup}`
+- `SandboxExit` is verbatim `waitpid`: `Exited{code}` / `Signaled{signal}` —
+  never `128 + n`. `PreExecFailure{stage, errno}` arrives on a 5-byte status
+  record, so a sentinel exit code carries no protocol.
+- `ActivationObservation` is **three-valued** (`Observed` / `NotActivated` /
+  `ExecOrKilledPreExec`) and there is deliberately **no `bool` accessor**.
 
-  `PreparedSandbox::prepare` and `SessionStore::prepare` refuse an interactive
-  plan with the new `PrepareError::InteractiveNeedsSupervisor`, which names the
-  method that does implement it.
+### 3.5 Stop
 
-  New API:
+`StopError` · `PreparedSandbox::stop_before_activation` ·
+`ActivatedSandbox::stop` · `DetachedSession::stop`
 
-  | Item | What it is |
-  |---|---|
-  | `DetachedSession::attach(window)` | `-> AttachedTerminal`. The last control frame this connection carries until a detach. |
-  | `AttachedTerminal::{write_input, resize, ping, read_event, activate, detach, ack, session_id, supervisor}` | The terminal, over the same socket. Every call is deadline-bounded; `read_event` takes the deadline explicitly. |
-  | `TerminalEvent::{Output(Vec<u8>), Ended(TerminalEnd), Pong, Idle}` | What a read found. `Idle` is a quiet terminal, not a failure. |
-  | `AttachAck::{state, buffered, dropped, exit}` | The run's state at the attach, how much scrollback is about to arrive, **how much the ring could not keep**, and the exit facts if it has already ended. |
-  | `TerminalEnd::{state, exit}` | The `SessionEnded` payload. `exit` is an `Option` because a run can reach a terminal state whose facts were never observed. |
-  | `WindowSize::{new, rows, cols}` | Character cells. Pixels are deliberately not carried — almost nothing sets them and almost nothing honours them. |
-  | `AttachError`, `AttachViolation`, `AttachTag`, `Peer`, `LifecycleError::Attach` | The typed failures and the wire vocabulary, exported so a consumer can match on them. |
-  | `MAX_ATTACH_PAYLOAD_BYTES` (32 KiB), `SCROLLBACK_CAPACITY_BYTES` (256 KiB) | Documented bounds. |
-  | `ControlRequest::Attach`, `ControlReply::AttachAck`, `ControlRefusal::NoTerminal` | Protocol v1 additions. |
-  | `PrepareError::{InteractiveNeedsSupervisor, Terminal}`, `PreExecStage::ControllingTerminal` | New typed refusals. |
+### 3.6 Cleanup verification
 
-  Five consumer-visible consequences, none of them hidden:
+`CleanupVerification` · `AbsenceBasis` · `SurvivorEvidence` ·
+`IndeterminateReason` · `UnsupportedReason` · `CleanupError`
 
-  1. **One viewer at a time.** Attach occupies the supervisor's single client
-     slot; a second connection is refused `ControlRefusal::Busy` exactly as it
-     was before. There is no separate "already attached" answer because a
-     second attach cannot reach the supervisor to be refused.
-  2. **A headless run has no terminal**, and an attach to one is refused
-     `ControlRefusal::NoTerminal` rather than seating you in front of silence.
-  3. **Scrollback is bounded, and says so.** Output produced while nobody is
-     attached goes to a 256 KiB oldest-dropped ring. `AttachAck::dropped()` is
-     how many bytes were lost; a consumer that needs every byte stays attached.
-     Output already handed to a client and not consumed is *not* replayed —
-     the ring covers from the detach onwards.
-  4. **A stalled client is dropped; the run is not.** A client that stops
-     reading eventually stalls the terminal (that is what backpressure is for);
-     after ten seconds the client goes, output returns to the ring, and the run
-     carries on.
-  5. **A stop hangs the terminal up.** The supervisor drains the master and
-     closes it before the kill, because a session leader holding a controlling
-     terminal cannot finish exiting until that terminal has drained — and the
-     process that would drain it is the one about to block in `waitpid`. The
-     practical effect is that a stopped interactive run may be observed as
-     `Signaled { SIGHUP }` rather than `SIGKILL`; the exit reports what was
-     seen, as always. A later attach still works and still replays the ring.
+Four answers, closed enum, typed evidence payloads. **A sent signal is never a
+basis.** `verify_cleanup` on `PreparedSandbox`, `ActivatedSandbox`,
+`DetachedSession`; `RecoveredSession::{verify_cleanup, verify_cleanup_by}`.
 
-  One repository-internal change worth flagging to a reviewer: macOS `killpg`
-  answers **`EPERM`, not `ESRCH`**, for a process group whose every member is
-  already a zombie, so a stop that raced the run's own exit used to report "the
-  signal could not be delivered". `ActivatedSandbox::{stop, drop}` now read that
-  as "nothing left in the group to signal" — and only there, where the group id
-  is an unreaped child's own pid and so cannot have been reissued.
-  `RecoveredSession::kill_group` keeps the strict reading, because its recorded
-  group id may well have been reissued.
+### 3.7 State machine
 
-- Still being added: re-prepare with an incremented generation, and resource
-  ceilings — each reported by `SupportReport` rather than left to inference
-  (ADR-0001 §6). `interactive_session` and `attach` are now `available`.
+`LifecycleState` · `LifecycleOp` · `TransitionError`
 
-- Landed (iteration 10, macOS live-verified; Linux mapping host-verified
-  against a faked ABI, Linux live behind the R07 blocker):
-  `nono::{FsMode, FsModeSet, FsModeCapability, CompiledModes, ModeBundle,
-  ModeRefusal, ModeAlwaysAllowed, ModeDelegation, ModeEnforceability,
-  BundleReason, RefusalReason, AlwaysAllowedReason, DelegationTarget,
-  ModeTarget}`, `CapabilitySet::{allow_path_modes, allow_file_modes,
-  fs_mode_capabilities, add_fs_modes}`, `Sandbox::compile_fs_modes(&caps) ->
-  Result<Vec<CompiledModes>>`, and `SupportReport::fs_modes()`. A per-path
-  grant over thirteen named operations instead of the three coarse
-  `AccessMode` bundles.
+10 states × 11 ops, exhaustive matrix test. Every mutation anywhere in the module
+goes through `LifecycleState::apply`, so the legal-transition table has exactly
+one definition.
 
-  **`AccessMode`, `allow_path` and `allow_file` are unchanged** — same
-  signatures, same rules, same profile bytes. A capability set that uses none
-  of the new API compiles to exactly what it compiled to before, including
-  macOS's unconditional `(allow process-exec*)`.
+### 3.8 Sessions, durability and recovery
 
-  **Read the compilation before you apply it.** `Sandbox::compile_fs_modes`
-  returns, per grant, `enforced` / `bundled` (a mode the caller did *not* ask
-  for that the grant confers anyway, with the mode that dragged it in and the
-  reason) / `always_allowed` (the platform cannot restrict this at all — an
-  *absence* of enforcement, not a denial) / `refused` / `delegated`. It is the
-  same compilation the profile or ruleset is built from. A refusal fails
-  `PreparedSandbox::prepare` with `NonoError::ModeUnsupported`.
+`SessionStore` · `SessionRecord` · `SessionSummary` · `RecoveredSession` ·
+`RecoveryDecision` · `SupervisorPresence` · `SessionStoreError` ·
+`CURRENT_SCHEMA_VERSION` · `OLDEST_SUPPORTED_SCHEMA_VERSION` · `MAX_RECORD_BYTES` ·
+`lifecycle::{Sessions, reconcile}` *(module-only)*
 
-  **Two things a consumer must plan around.** (1) `read_metadata` is
-  `unrestrictable` on Linux: Landlock has no right covering `stat(2)`, so a
-  metadata-only grant is a no-op there and a metadata *denial* cannot be
-  expressed at all — check `SupportReport::fs_modes()` rather than assuming
-  parity. (2) `truncate` needs Landlock ABI ≥ 3 and `rename` (and therefore
-  `atomic_write`) needs ABI ≥ 2; below those the grant is **refused**, not
-  degraded.
+- `SessionStore::{open, prepare, prepare_detached, sessions, recover,
+  attach_control, control_socket_path}`
+- `RecoveredSession::{attach, supervisor, kill_group, kill_pid, verify_cleanup,
+  verify_cleanup_by}`
 
-  **One behaviour change, scoped to opt-in callers.** On macOS, a capability
-  set carrying at least one mode grant gets `(allow process-exec* (<filter>))`
-  per `execute`-granted path instead of the blanket grant. A program in a
-  directory granted only `read_contents` is refused at `execve` with
-  `ActivationError::PreExecFailed { stage: Exec, errno: EPERM }` — so a
-  consumer that adopts the vocabulary must grant `execute` on the paths its
-  program and interpreters live in (`/bin`, `/usr`, `/System`,
-  `/private/var/db` is what the live tests use).
+### 3.9 Detached supervisor and control protocol
 
+`lifecycle::supervisor_entry` · `DetachedSession` · `DetachedError` ·
+`SessionStatus` · `WaitOutcome` · `ControlRequest` · `ControlReply` ·
+`ControlRefusal` · `FrameError` · `CONTROL_PROTOCOL_VERSION` ·
+`CONTROL_TIMEOUT` · `MAX_CONTROL_WAIT` · `MAX_CONTROL_FRAME_BYTES` ·
+`DETACHED_EVENT_RING_CAPACITY`
 
-## Toolchain and platform requirements
+`DetachedSession::{activate, wait, stop, status, verify_cleanup, attach, detach,
+supervisor, opened_in}`. Dropping a `DetachedSession` closes a socket and the run
+carries on — the opposite of every other handle in the module.
 
-- MSRV: 1.95 (workspace `rust-version`); edition 2024.
-- Feature flags: `system-keyring` (default-on) — no lifecycle-specific flags yet.
-- Platforms: macOS (Seatbelt) and Linux (Landlock ≥ ABI per support report;
-  fail-closed below). Live-Linux gates require a Linux environment (Docker
-  provisioning in progress on this host).
+### 3.10 Terminal and attach
 
-## Test commands and results (this iteration)
+`AttachedTerminal` · `TerminalEvent` · `TerminalEnd` · `AttachAck` ·
+`WindowSize` · `AttachError` · `AttachViolation` · `AttachTag` · `Peer` ·
+`MAX_ATTACH_PAYLOAD_BYTES` (32 KiB) · `SCROLLBACK_CAPACITY_BYTES` (256 KiB)
 
-| Command | Result |
+`DetachedSession::attach(WindowSize) -> AttachedTerminal`;
+`AttachedTerminal::{write_input, resize, ping, read_event, activate, detach, ack,
+session_id, supervisor}`. Every call is deadline-bounded; `read_event` takes the
+deadline explicitly and can answer `TerminalEvent::Idle`, because a quiet
+terminal is a fact and not a timeout.
+
+### 3.11 Identity, events, support
+
+- `ProcessIdentity` — pid + platform start time + boot id.
+- `EventSink` · `LifecycleEvent` · `LifecycleEventKind` · `ActivationOutcome` ·
+  `Observation`
+- `SupportReport::gather()` (infallible) · `lifecycle::Capability` *(module-only)* ·
+  `SupportStatus` · `Determination` · `SupportReason` · `HostFacts` ·
+  `KernelFacts` · `LandlockFacts` · `LandlockRight` · `LandlockRightSupport` ·
+  `NetworkFilteringFacts` · `NetworkMechanism` · `NetworkMechanismSupport` ·
+  `IdentityFacts` · `CleanupFacts` · `EventObservationSupport` · `EventFamily` ·
+  `EventFidelity` · `DarkSpot` · `DarkSpotEntry` ·
+  `SUPPORT_REPORT_SCHEMA_VERSION`
+
+### 3.12 Capability modes (F11)
+
+`FsMode` · `FsModeSet` · `FsModeCapability` · `CompiledModes` · `ModeBundle` ·
+`ModeRefusal` · `ModeAlwaysAllowed` · `ModeDelegation` · `ModeEnforceability` ·
+`BundleReason` · `RefusalReason` · `AlwaysAllowedReason` · `DelegationTarget` ·
+`ModeTarget`
+
+Plus `CapabilitySet::{allow_path_modes, allow_file_modes, fs_mode_capabilities,
+add_fs_modes}` and `Sandbox::compile_fs_modes(&caps) -> Result<Vec<CompiledModes>>`.
+
+### 3.13 Errors, and three deliberate non-exports
+
+`LifecycleError` is the single aggregate, reached through `NonoError::Lifecycle`,
+with a `diagnostic_code` arm per variant.
+
+Three names are **module-only on purpose**, documented at `lib.rs:93-99`:
+
+| Name | Why not at the crate root |
 |---|---|
-| `cargo test --workspace --no-fail-fast` (upstream baseline @149579a7, macOS) | 3409 passed / 3 failed / 1 ignored — all 3 macOS-host portability bugs (see WORKLOG) |
-| same, after F1+F1b fixes | 3412 passed / 0 failed / 1 ignored — green on 5 consecutive runs; full bin-test binary stressed 20x, 0 failures (baseline: 23/20 runs) |
-| `cargo test --workspace --no-fail-fast` (after F3+F4, iteration 3) | 3527 passed / 0 failed / 1 ignored, 32 suites |
-| `cargo test --workspace --no-fail-fast` (after F5, iteration 4) | 3540 passed / 0 failed / 1 ignored, 33 suites — reproduced on 2 runs |
-| `cargo test -p nono lifecycle` / `--test lifecycle_live` | 96 unit + 16 live; live suite clean on 10 consecutive runs |
-| same, after F5 (shared lifecycle core) | 109 unit (96 unchanged + 13 new `sync_core`) + 16 live, unmodified |
-| `cargo test --workspace --no-fail-fast` (after F6, iteration 5) | 3562 passed / 0 failed / 1 ignored, 33 suites |
-| `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F6) | 126 unit (109 unchanged + 17 new `cleanup`) + 21 live (16 unchanged + 5 new: own-process-group, verify-after-exit + duplicate refusal, honest `StillPresent` survivor then `ConfirmedAbsent`, `stop()` kills the group, stopped-before-activation verify); live suite clean on 3 consecutive runs |
-| removal detection for the R11 foundation | deleting the child's `setpgid(0, 0)` fails 2 live tests: the group assertion (`getpgid(child) == child`) and — the load-bearing one — the survivor test, which then reports `ConfirmedAbsent{ReapedAndGroupEmpty}` while `/bin/sleep 30` is still running |
-| `cargo test --workspace --no-fail-fast` (after F7, iteration 6) | 3591 passed / 0 failed / 1 ignored, 33 suites |
-| `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F7) | 153 unit (126 unchanged + 27 new `session_store`) + 23 live (21 unchanged + 2 new: a dropped `ActivatedSandbox` ends the whole group, a durable session recorded at every state the run passes through); live suite clean on 3 consecutive runs |
-| removal detection for the F7 guards | record `O_NOFOLLOW` dropped → the symlinked record is followed and the planted decoy is returned (`left: None`); store-dir `O_NOFOLLOW` dropped → the store lands on the link's 0755 target (`StorePermissions{mode: 493}`); skip-on-parse-failure → 4 accounted-for records become 1; schema check deleted → a version-2 record is read as version 1; directory permission check deleted → a 0755 store is accepted; F7 group kill deleted from `ActivatedSandbox::drop` → a dropped run leaves its `sleep` descendant alive |
-| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F7) | 7 loom models pass (5 unchanged + 2 new: recovery-vs-cleanup → exactly one `CleanupConfirmed` winner; recovery-vs-stop-then-cleanup → never adopt after cleanup). Completes the R05 scenario set |
-| `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets --all-features` | clean |
-| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` | 5 loom models pass (all interleavings); harness verified to fail when the activation CAS is weakened. Cfg name is `nono_loom`, not loom's own `loom`: RUSTFLAGS reaches every crate, and `--cfg loom` makes tokio compile out `tokio::net`, breaking hyper-util (transitive via sigstore-verify) |
-| `cargo test --workspace --no-fail-fast` (after F8, iteration 7) | 3621 passed / 0 failed / 1 ignored, 33 suites |
-| `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F8) | 181 unit (153 unchanged + 28 new: 17 `support`, 8 `events`, 1 `session_store` golden, 2 reshaped) + 25 live (22 unchanged + 3: whole-vocabulary happy run, stopped run, refused activation carries no token material); live suite clean on 3 consecutive runs |
-| removal detection for the F8 guards | adding one `bool` field to `CleanupFacts` fails both no-bare-boolean tests *and* the golden-example test, naming the JSON pointer `/cleanup_verification/facts/probes_work`; adding a `token_digest` field to an `ActivationOutcome` variant fails the token-material test with the offending JSON; giving `ActivatedSandbox` its own emitter instead of sharing the prepared one restarts `seq` at 0 mid-run and fails both live sequence tests (`left: 0, right: 9`); changing one field of one golden example in `docs/lifecycle/*.md` fails that document's snapshot test |
-| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F8) | 7 loom models pass, unchanged — F8 adds no shared-state machinery, and the one lock it touches (`SessionHandle`'s record mutex) is now released *before* the sink is called |
-| `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1; re-run green after F8 |
-| `cargo test --workspace --no-fail-fast` (after F9 + review #2, iteration 8) | 3674 passed / 0 failed / 2 ignored, 34 suites |
-| `cargo test -p nono lifecycle` (after F9 + review #2) | 218 unit (181 unchanged + 37 new: 13 `protocol`, 13 `supervisor`, 3 `detached`, 8 `session_store` for schema v2 + `SupervisorPresence`, plus 2 reshaped `support` tests and 1 new `prepare` refusal test) |
-| `cargo test -p nono --test lifecycle_detached` (new, `harness = false`) | 15 passed / 0 failed / 1 ignored; clean on 3 consecutive runs, no leaked supervisor processes and no leftover store directories |
-| `cargo test -p nono --test lifecycle_live` (after F9) | 25 passed, unmodified; clean on 3 consecutive runs |
-| removal detection for the F9 guards | hello version check deleted → the wrong-version client is greeted instead of refused (`left: Hello{protocol: 1, …}`); frame-length bound deleted → the supervisor reads a body that never arrives and the oversize test fails with "the supervisor must answer"; stale-socket unlink deleted from `recover` → "recovery must remove the stale socket it just proved dead"; hello-first guard deleted → a `Status` sent before any hello is served; **peer-uid consult** deleted (either the `peer_uid` call or the whole `accept_decision` consult) → `the_live_accept_path_consults_the_peer_credential` fails with "a connection from another uid must not become the client", and hardcoding `Serve` additionally fails the busy-refusal test |
-| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F9) | 7 loom models pass, unchanged — F9 adds no shared-state machinery inside a process (the supervisor loop is single-threaded by construction), and the one signature change (`reconcile` gaining `SupervisorPresence`) is a pure argument the models pass `NeverDetached` for |
-| `cargo test --workspace --no-fail-fast` (after F10, iteration 9) | 3703 passed / 0 failed / 2 ignored, 34 suites |
-| `cargo test -p nono lifecycle` (after F10) | 235 unit (218 unchanged + 17 new: 14 `terminal`, 1 `protocol` attach round trip, 1 `exit` zombie-group, 1 reshaped `support` pair) |
-| `cargo test -p nono --test lifecycle_detached` (after F10) | 27 passed / 0 failed / 1 ignored (15 unchanged + 12 new); clean on 3 consecutive runs, no leaked supervisors and no leftover store directories |
-| `cargo test -p nono --test lifecycle_live` (after F10) | 25 passed, unmodified; clean on 3 consecutive runs |
-| removal detection for the F10 guards | unknown-tag guard deleted from `FrameDecoder::next_frame` (decode as `Input` instead) → `a_tag_this_protocol_does_not_have_is_named_not_skipped` fails *and* the live `a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run` fails with "an unknown terminal frame tag must end the channel"; scrollback bound deleted from `Scrollback::push` → the two ring unit tests fail (`left: 524288, right: 262144`) and the live flood test fails with "the ring must stay bounded: 406282 bytes buffered, bound is 262144"; the `EPERM` arm deleted from `kill_own_group` → `a_group_of_zombies_is_nothing_left_to_signal_not_a_refusal` fails on macOS, and with it every detached stop that races the run's own exit |
-| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F10) | 7 loom models pass, unchanged — F10 adds no shared-state machinery inside a process (the supervisor loop is single-threaded by construction) |
-| `cargo test --workspace --no-fail-fast` (after F11, iteration 10) | 3744 passed / 0 failed / 2 ignored, 35 suites |
-| `cargo test -p nono` (after F11) | 1012 lib unit (235 lifecycle unchanged + 24 new `capability_modes` + 3 new `support` mode-table tests) + 25 `lifecycle_live` + 27 `lifecycle_detached` + 14 new `lifecycle_modes_live` + the rest of the integration suites; all green |
-| `cargo test -p nono --test lifecycle_modes_live` (new, macOS-only) | 14 passed / 0 failed; clean on 3 consecutive runs. One positive/negative pair per mode macOS can express, each pair differing in exactly one mode, all driven through real `prepare`/`activate`/`wait` |
-| `cargo test -p nono --test lifecycle_live` (after F11) | 25 passed, unmodified; clean on 3 consecutive runs |
-| `cargo test -p nono --test lifecycle_detached` (after F11) | 27 passed / 0 failed / 1 ignored, unmodified |
-| removal detection for the F11 guards | ABI gate deleted (the `refuse` closure made to return `None`) → 3 tests fail, `truncate_is_refused_below_abi_v3_rather_than_dropped` printing `left: []` against `right: [ModeRefusal { mode: Truncate, why: UnsupportedRight { right: Truncate, abi: 1, needed_abi: 3 } }]` — i.e. the silent-widening path is exactly what the assertion catches; Landlock's always-allowed arm deleted → `read_metadata_is_a_disclosed_no_op_not_a_grant` fails (a `stat` grant would be reported as enforced on a platform that cannot enforce it); macOS exec scoping deleted (unconditional `(allow process-exec*)` restored for mode-built profiles) → the live pair `execute_granted_runs_an_unheard_of_program_and_ungranted_is_refused_at_exec` fails with "activation was expected to fail; the run ended `Ok(Exited { code: 0 })`" |
-| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F11) | 7 loom models pass, unchanged — F11 adds no shared-state machinery; the mode compilers are pure functions |
-| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
-| `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
-| `cargo fmt --all -- --check` | clean |
-| `cargo test --doc -p nono` | 11 passed |
+| `lifecycle::ResourceLimits` | Would collide with `resource::ResourceLimits`, a different type for a different purpose (cgroup ceilings on the CLI's enforcement path). |
+| `lifecycle::Capability` | At the crate root it would read as a peer of `CapabilitySet`. It is not — it is "what a platform supports", not "what a sandbox grants". |
+| `lifecycle::{Sessions, reconcile}` | An iterator type and a name too generic for a crate root. |
 
-Full gate for every iteration: `make ci` equivalent (clippy -D warnings -D
-clippy::unwrap_used, fmt check, workspace tests) + scripts above.
+### 3.14 Upstream API, unchanged
 
-## Fork deltas so far
+`CapabilitySet` · `AccessMode` · `Sandbox::{apply_auto, apply_landlock,
+apply_seccomp, apply_external}` · `QueryContext` · `SandboxState` ·
+`SupportInfo` · `supervisor::{SupervisorSocket, SupervisorListener,
+ApprovalBackend, …}` — all behave exactly as they did at `149579a7`.
 
-- F1 (upstream-suitable): BSD-grep trailing-slash portability fix in
-  scripts/test-list-aliases.sh + scripts/lint-docs.sh; ENV_LOCK acquisition in
-  command_runtime dry-run test (+ F1b: same for 3 flaky tool-sandbox git
-  tests). Details: NONO_UPSTREAM_DELTA.md.
-- F2 (fork-only docs): SOURCE_LOCK.json, baseline docs, ADR-0001, this file.
-- F3-F10 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
-  slice in NONO_UPSTREAM_DELTA.md with its disposition and deletion condition.
-- F11 (fork substrate, upstream-suitable candidate): the
-  `crates/nono/src/capability_modes/` mode vocabulary and its two platform
-  mappings. Row F11 in NONO_UPSTREAM_DELTA.md, including the
-  `capability.rs` rebase-conflict surface and how the placement mitigates it.
+---
 
-## Remaining external blockers
+## 4. Toolchain, flags, cfgs and markers
 
-- Linux verification environment (blocks Linux halves of R03/R04/R06/R07/R10
-  and the F4/F11 Linux code paths): Docker daemon down on this macOS host — Docker
-  Desktop launched headlessly but needs its GUI first-run acceptance.
-  Reproduce: `docker ps` → "Cannot connect to the Docker daemon". Operator
-  action: open Docker Desktop once and accept the prompt.
-  Cross-compile is NOT a workaround: the `nono` lib depends on
-  `sigstore-verify` → `aws-lc-sys`, which requires `x86_64-linux-gnu-gcc`.
-  Reproduce: `RUSTC=~/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/rustc
-  cargo check --target x86_64-unknown-linux-gnu -p nono`.
+### 4.1 Toolchain
 
-## Integration instructions for leash-rs (current)
+- **MSRV 1.95** (workspace `rust-version`), **edition 2024**.
+- Built and verified on 1.88.0 and 1.96.0 aarch64-apple-darwin.
 
-1. Pin: `nono = { git = "<fork remote once pushed>", rev = "<final HEAD>" }`
-   — until a remote exists, use a path dependency on this checkout.
-2. Consume library APIs only; no `nono` CLI invocation is or will be required
-   (guarded by grep gate, BLOCKED_ROWS R14).
-3. Product semantics (CrystalOS/HCP/Cedar/Leash policy, activation
-   authorization meaning, event forwarding) stay in leash-rs; the fork provides
-   only generic mechanics (BLOCKED_ROWS R15 guard).
-4. **Add `nono::lifecycle::supervisor_entry();` as the first statement of
-   `main`.** One line, a no-op in every ordinary run, and the precondition for
-   detached sessions (R09). Without it `SessionStore::prepare_detached` fails
-   closed at its readiness deadline with an error that names the call. It must
-   be *first*: it removes a private environment marker, which is sound only
-   while the process is single-threaded. See ADR-0002.
-5. The full lifecycle contract and its guarantees will be documented in
-   docs/adr/ + API docs as rows land; BLOCKED_ROWS.json is the authoritative
-   per-row status.
+### 4.2 Cargo feature flags
 
-## Known incompatibilities
+| Feature | Default | Meaning |
+|---|---|---|
+| `system-keyring` | **on** | OS keyring access (macOS Keychain / Linux Secret Service). Headless and container consumers opt out with `default-features = false`. |
 
-- None yet beyond upstream's own platform limits (see
-  PLATFORM_CAPABILITY_BASELINE.md).
+**No lifecycle-specific feature flag exists.** The lifecycle is unconditionally
+compiled. That is deliberate: a sandbox lifecycle behind a feature flag is a
+lifecycle some builds silently do not have.
 
-## Proposed upstream PRs
+### 4.3 cfg gates
 
-- F1/F1b as a portability+test-hygiene PR (upstream requires issue-first per
-  AGENTS.md Coding Agent Contribution Policy — not filed; listed for the
-  operator).
+| cfg | Set by | Effect |
+|---|---|---|
+| `nono_loom` | `RUSTFLAGS='--cfg nono_loom'`, only for the loom gate | Makes `lifecycle::sync_core` public so the out-of-crate `tests/loom_lifecycle.rs` can drive it from several threads, and swaps in loom's instrumented primitives. **Never set for a released build** — the public API is identical either way. |
+
+The cfg is `nono_loom`, **not** loom's own `loom`, and this is not cosmetic:
+`RUSTFLAGS` reaches every crate in the build, and `--cfg loom` makes `tokio`
+compile out `tokio::net`, which `hyper-util` (transitive via `sigstore-verify`)
+then fails to find. `build.rs` declares the cfg via `cargo::rustc-check-cfg`, so
+`unexpected_cfgs` still catches a real typo.
+
+### 4.4 Environment markers — protocol, not configuration
+
+| Variable | Set by | Read by |
+|---|---|---|
+| `NONO_LIFECYCLE_SUPERVISOR` | The library, on the `execve` that creates a supervisor. Private. | `supervisor_entry()` |
+
+**This is a protocol field that happens to travel in the environment. It is not a
+configuration knob and must not be documented, set, forwarded, logged or
+inspected by a consumer.** `supervisor_entry()` **removes it from the environment
+before any other work**, so it can never be inherited by a customer child.
+Setting it yourself makes your process a supervisor for a session that does not
+exist.
+
+That removal is also why "first statement of `main`" is a hard requirement rather
+than a style note: removing an environment variable is sound only while the
+process is single-threaded.
+
+### 4.5 Platform requirements
+
+| | macOS | Linux |
+|---|---|---|
+| Mechanism | Seatbelt (`sandbox_init`) | Landlock + seccomp |
+| Minimum | any macOS with Seatbelt | Landlock ABI per `SupportReport`; **fail-closed below**, never degraded |
+| `truncate` mode | supported | needs Landlock **ABI ≥ 3**; refused below |
+| `rename` / `atomic_write` modes | supported | needs Landlock **ABI ≥ 2**; refused below |
+| `read_metadata` mode | **enforceable** (the one place macOS is finer) | **unrestrictable** — Landlock has no right covering `stat(2)` |
+| Live-verified by this stream | **yes** | **no** — see §8 |
+
+Unix only. There is no Windows path and none is planned.
+
+---
+
+## 5. Final test matrix
+
+Produced by `scripts/stream-gates.sh` on `Darwin arm64`, iteration 11. **This is
+the gate report** — the script's output is the artifact, not a transcription of
+one.
+
+```
+PASS     workspace-tests        3744 passed / 0 failed / 2 ignored (35 suites)
+PASS     nono-crate-tests       1145 passed / 0 failed / 1 ignored (8 suites)
+PASS     lifecycle-live         25 passed / 0 failed / 0 ignored (1 suites)
+PASS     lifecycle-modes-live   14 passed / 0 failed / 0 ignored (1 suites)
+PASS     lifecycle-detached     27 passed / 0 failed / 1 ignored (1 suites)
+PASS     loom-lifecycle         7 passed / 0 failed / 0 ignored (1 suites)
+PASS     clippy-strict          clean
+PASS     clippy-loom            clean
+PASS     fmt-check              clean
+PASS     lint-docs              clean
+PASS     lint-aliases           clean
+PASS     doc-tests              11 passed / 0 failed / 0 ignored (1 suites)
+NOT_RUN  miri-pure-lifecycle    miri component not installed: rustup +nightly component add miri
+NOT_RUN  linux-landlock-live    Linux execution environment unavailable: docker daemon down (open Docker Desktop once and accept the first-run prompt)
+NOT_RUN  linux-lifecycle-live   Linux execution environment unavailable: docker daemon down (open Docker Desktop once and accept the first-run prompt)
+
+gates: 12 PASS  0 FAIL  3 NOT_RUN  (of 15)
+```
+
+**`NOT_RUN` is never `PASS`.** The script exits nonzero only on `FAIL`, so a host
+that cannot answer a gate reports honestly on the ones it can — and a row whose
+evidence depends on a `NOT_RUN` gate is `BLOCKED` in `BLOCKED_ROWS.json`, not
+`PASS`.
+
+CI: `.github/workflows/stream-gates.yml` runs the same script on `macos-latest`
+and `ubuntu-latest`. **The ubuntu job is what will close the Linux halves the
+first time this fork is pushed to a remote with Actions enabled.** No upstream
+workflow was modified.
+
+---
+
+## 6. Row status summary
+
+Authoritative source: `BLOCKED_ROWS.json`. Summary:
+
+| | Rows |
+|---|---|
+| **PASS** (12) | R01 upstream tests green · R02 lifecycle exists as library APIs · R05 races tested (loom is host-independent) · R08 macOS Seatbelt fail-closed · R12 support report · R13 event delivery · R14 no CLI invocation · R15 no product types · R16 deltas documented · R17 locally-achievable rows green · R18 blockers reproducible · R19 this file |
+| **BLOCKED** (7) | R03 prepare cannot exec early · R04 activation single-use · R06 mode semantics honest · **R07 Linux Landlock fail-closed (root blocker)** · R09 detached/attach · R10 exit facts · R11 cleanup verification — **all seven complete on macOS, all seven waiting on the same Linux runner** |
+| **IN_PROGRESS** (1) | R20 all work committed — iterations 1–10 are committed (11 commits, tip `be442758`); iteration 11 was instructed to be left uncommitted for review, so this row is not PASS while `git status` is non-empty. It flips at the commit that lands the eight documentation and gate-tooling files listed in its evidence. |
+
+---
+
+## 7. Fork deltas
+
+Eleven rows, one per slice, each with files, upstreaming disposition and deletion
+condition in `NONO_UPSTREAM_DELTA.md` §4.
+
+- **F1/F1b** *(upstream-suitable)* — BSD-grep trailing-slash portability fix in
+  two scripts; `ENV_LOCK` acquisition in four flaky tests.
+- **F2** *(fork-only)* — the stream's process artifacts.
+- **F3–F10** *(fork substrate)* — `crates/nono/src/lifecycle/`: pure typed
+  skeleton, OS-backed prepare/activate/wait, loom core, cleanup verification,
+  durable session store, support report + event vocabulary, detached supervisor,
+  supervisor-owned PTY.
+- **F11** *(upstream-suitable candidate)* — `crates/nono/src/capability_modes/`,
+  the mode vocabulary and its two platform mappings.
+
+---
+
+## 8. Remaining external blockers
+
+**One blocker. It is the reason seven rows are `BLOCKED`, and it is not a
+software problem.**
+
+> **Reproduce:**
+> ```
+> docker ps
+> ```
+> ```
+> Cannot connect to the Docker daemon at unix:///Users/gauranshtandon/.docker/run/docker.sock.
+> Is the docker daemon running?
+> ```
+>
+> **Operator action:** open Docker Desktop once and accept the first-run prompt;
+> then run `scripts/stream-gates.sh` in a Linux container per
+> `docker/Dockerfile-CI`.
+
+Docker Desktop is installed and has been launched headlessly, but it requires a
+GUI first-run acceptance that no automated path can supply.
+
+**Cross-compilation is NOT a workaround.** `crates/nono` depends on
+`sigstore-verify` → `aws-lc-sys`, whose build script needs a Linux linker:
+
+```
+$ which x86_64-linux-gnu-gcc
+x86_64-linux-gnu-gcc not found
+```
+
+The `x86_64-unknown-linux-gnu` *target* is installed; the linker is what is
+missing. Re-verified at iteration 11.
+
+**The equivalent remote unblock:** push this branch to a remote with Actions
+enabled and let the `ubuntu-latest` job of `.github/workflows/stream-gates.yml`
+run. That closes the same gap without a local Docker daemon.
+
+**A second, much smaller blocker,** noted so it is not mistaken for a failure:
+`miri-pure-lifecycle` is `NOT_RUN` because no nightly toolchain with the miri
+component is installed on this host (`rustup +nightly component add miri`), and
+this host has 1.9 GiB free, which is not enough to install one safely. The gate
+covers only the syscall-free half of the lifecycle (state machine, plan
+validation, gate classification, recovery decision table — 56 tests) and is a
+supplement to the loom gate, not a substitute for it.
+
+---
+
+## 9. Integration instructions for leash-rs
+
+### 9.1 Pin
+
+Until a fork remote exists, a path dependency:
+
+```toml
+[dependencies]
+nono = { path = "../nono" }              # this checkout
+```
+
+Once pushed:
+
+```toml
+[dependencies]
+nono = { git = "https://github.com/<org>/nono", rev = "<final HEAD of parallel/nono-substrate-v1>" }
+```
+
+**Pin by `rev`, never by `branch`.** A branch pin means the substrate under your
+sandbox can change without your lockfile moving.
+
+Headless or container consumers that do not want an OS keyring:
+
+```toml
+nono = { path = "../nono", default-features = false }
+```
+
+### 9.2 The one line you must add
+
+```rust
+fn main() {
+    nono::lifecycle::supervisor_entry();   // MUST be the first statement
+    // ... your program, unchanged ...
+}
+```
+
+It returns immediately and does nothing in every ordinary run. It matters because
+a library has no binary of its own to re-execute and cannot fork a long-running
+supervisor out of a threaded caller (allocator locks held by threads that no
+longer exist; the macOS ObjC runtime aborts outright). **The supervisor *is* your
+binary, re-executed**, and that call is how it recognises itself.
+
+Without it, `SessionStore::prepare_detached` fails closed at a 20-second
+readiness deadline with `PrepareError::SupervisorUnresponsive`, **whose message
+names this function**.
+
+"First statement" is a hard requirement: the call removes a private environment
+marker (§4.4), which is sound only while the process is single-threaded.
+
+### 9.3 The flow
+
+```rust
+use nono::lifecycle::{SandboxPlan, SessionMode, SessionStore, WindowSize};
+use nono::{CapabilitySet, FsMode, FsModeSet};
+
+// 1. PLAN — nothing forks until validate() succeeds.
+let plan = SandboxPlan::new("/usr/bin/my-tool")
+    .args(["--flag", untrusted_arg])       // literal: there is no shell
+    .env("PATH", "/usr/bin:/bin")
+    .working_dir("/absolute/path")
+    .capabilities(caps)
+    .validate()?;                          // -> ValidatedPlan
+
+// 2. PREPARE — forks, applies the sandbox, sweeps descriptors, HOLDS.
+//    The customer program has not started. Nothing of yours is reachable by it.
+let (prepared, handle) = PreparedSandbox::prepare(plan)?;
+
+// ... your authorization decision happens HERE, on your side, in your terms ...
+
+// 3. ACTIVATE — single-use. A replay is AlreadyActivated; a stop makes it
+//    refuse forever; an expiry refuses even a correct token.
+let activated = prepared.activate(&handle)?;
+
+// 4. WAIT — typed facts, verbatim from waitpid.
+let exit = activated.wait()?;
+match exit.outcome() {
+    ExitOutcome::Exited { code }     => { /* the program's own code */ }
+    ExitOutcome::Signaled { signal } => { /* never 128 + n */ }
+    ExitOutcome::PreExecFailure { stage, errno } => { /* never a customer code */ }
+    ExitOutcome::GateAborted         => { /* stop or expiry, never Exited{1} */ }
+    ExitOutcome::SupervisorFailure { .. } => { /* the reap itself failed */ }
+}
+
+// 5. CLEANUP VERIFY — four answers, and a sent signal is never a basis.
+match activated.verify_cleanup()? {
+    CleanupVerification::ConfirmedAbsent { basis }  => { /* proven gone */ }
+    CleanupVerification::StillPresent { survivors } => { /* honest: something is left */ }
+    CleanupVerification::Indeterminate { reason }   => { /* NOT a proof of absence */ }
+    CleanupVerification::Unsupported { reason }     => { /* stated, not inferred */ }
+}
+```
+
+**Detached and interactive**, when the run must outlive the process that started
+it:
+
+```rust
+let store = SessionStore::open(state_dir)?;             // 0700, checked not repaired
+
+let plan = SandboxPlan::new("/bin/sh")
+    .args(["-i"])
+    .session_mode(SessionMode::Interactive)             // requires .detached(true)
+    .detached(true)
+    .capabilities(caps)
+    .validate()?;
+
+let (session, handle) = store.prepare_detached(plan)?;  // needs §9.2's line
+
+// Attach BEFORE activating: the window size has to reach the terminal before
+// the program starts, or a program that reads its size at startup reads the
+// zeroes a fresh PTY carries.
+let mut term = session.attach(WindowSize::new(40, 100))?;
+term.activate(&handle)?;
+term.write_input(b"echo hello\n")?;
+match term.read_event(deadline)? {
+    TerminalEvent::Output(bytes) => { /* ... */ }
+    TerminalEvent::Ended(end)    => { /* end.exit() is the typed SandboxExit */ }
+    TerminalEvent::Idle          => { /* a quiet terminal is a fact */ }
+    TerminalEvent::Pong          => { /* ... */ }
+}
+term.detach()?;              // the run carries on
+// ... your process restarts ...
+let store = SessionStore::open(state_dir)?;
+match store.recover(session_id)? {
+    RecoveryDecision::Attachable      => { let s = store.attach_control(session_id)?; }
+    RecoveryDecision::AlreadyVerified => { /* terminal; never re-adopt */ }
+    RecoveryDecision::ProcessGone { basis }  => { /* ... */ }
+    RecoveryDecision::StillRunning { survivors } => { /* ... */ }
+    RecoveryDecision::Unsettled { reason } | RecoveryDecision::Unsupported { reason } => { }
+}
+```
+
+### 9.4 Boundary rules — what stays on your side
+
+**The library provides mechanics and never meaning.** These stay in leash-rs and
+must not migrate into the fork (`BLOCKED_ROWS.json` R15 is the standing grep
+guard, and it is re-run at every gate):
+
+- CrystalOS / HCP / Cedar / Leash policy types and evaluation.
+- What an activation *authorizes* — the library gives you a start button for a
+  held child, not an authorization decision.
+- Event forwarding, aggregation, retention and interpretation. `EventSink` is
+  caller-side by design.
+- Any product concept in a session record. The record deliberately carries no
+  command line and no environment: a record that carried the run's argv would be
+  a durable copy of whatever secrets it held.
+
+### 9.5 The activation token
+
+`ActivationHandle::token()` is public. It has to be — the process that activates
+a detached run is very often not the one that prepared it, and the library cannot
+transport bytes for you.
+
+The library never puts those bytes in an argv, an environment, a log, a `Debug`
+impl, an event or a record. **Where you put them is your decision, and it is a
+security decision.** They are a start button for a held child.
+
+### 9.6 Process-exec scoping — read this before adopting modes
+
+**One behaviour change, scoped precisely to opt-in callers.**
+
+A capability set that uses only `allow_path` / `allow_file` compiles to exactly
+what it compiled to before, byte for byte, **including macOS's unconditional
+`(allow process-exec*)`**. Every existing consumer is unaffected.
+
+A capability set carrying **at least one** mode grant gets
+`(allow process-exec* (<filter>))` per `execute`-granted path instead of the
+blanket grant. A program in a directory granted only `read_contents` is then
+refused at `execve` with
+`ActivationError::PreExecFailed { stage: Exec, errno: EPERM }`.
+
+**So a consumer that adopts the mode vocabulary must grant `execute` on the paths
+its program *and its interpreters* live in.** The live tests use `/bin`, `/usr`,
+`/System`, `/private/var/db`. `process-exec*` rather than `process-exec` is
+deliberate, so a `#!` program whose interpreter is granted still runs.
+
+Two more things to plan around:
+
+1. **`read_metadata` is `unrestrictable` on Linux.** Landlock has no right
+   covering `stat(2)`, so a metadata-only grant is a no-op there and a metadata
+   *denial* cannot be expressed at all. Check `SupportReport::fs_modes()` rather
+   than assuming parity.
+2. **`truncate` needs ABI ≥ 3 and `rename` (so `atomic_write`) needs ABI ≥ 2.**
+   Below those the grant is **refused**, not degraded — because on those kernels
+   the operation is not restrictable at all, and a rule that compiled to nothing
+   would read as enforcement.
+
+Read the compilation before you apply it:
+
+```rust
+for compiled in Sandbox::compile_fs_modes(&caps)? {
+    compiled.enforced();        // what the platform will actually enforce
+    compiled.bundled();         // modes you did NOT ask for that this grant confers anyway
+    compiled.always_allowed();  // the platform cannot restrict this — an ABSENCE of
+                                // enforcement, not a denial
+    compiled.refused();         // fails prepare with NonoError::ModeUnsupported
+    compiled.delegated();       // enforced, by another mechanism (UnixSocketCapability)
+}
+```
+
+It is the **same** compilation the profile or ruleset is built from, so the
+disclosure and the enforcement cannot disagree.
+
+### 9.7 `LifecycleEvent` is a struct, not an enum
+
+**API shape note for anyone porting from an early iteration.** `LifecycleEvent`
+was an enum through iteration 6 and is now an **envelope struct**:
+
+```rust
+pub struct LifecycleEvent {
+    session_id: Option<Uuid>,   // Some in practice
+    generation: u64,
+    seq: u64,                   // THE ordering authority
+    observed_at: SystemTime,    // explicitly NOT the ordering authority — a wall clock can step
+    identity: Option<ProcessIdentity>,
+    observation: Observation,   // Direct vs Reconstructed
+    what: LifecycleEventKind,
+}
+```
+
+`LifecycleEvent::StateChanged { from, to, observation }` is now
+`LifecycleEventKind::StateChanged { from, to }`, reached via `event.what()`, with
+`observation` on the envelope. **A consumer that matched the old enum matches
+`event.what()` instead.** No other public type changed shape.
+
+`seq` counts a run's events from zero and is unbroken across the
+prepared → activated handoff. Events the platform cannot show **do not exist in
+the vocabulary** — there is no kernel-denial variant to synthesize one into.
+
+---
+
+## 10. Known incompatibilities and stated limits
+
+Nothing here is a bug report. Each is a limit that is disclosed rather than
+discovered.
+
+1. **No Linux verification.** See §8. Every Linux-facing claim in this document
+   should be read as "this is what the code intends" until the `ubuntu-latest`
+   job has been green once.
+2. **Generations are always 1.** Re-prepare into an existing session's slot with
+   an incremented generation was scoped for R09 and did not land. The field, the
+   wire checks on both sides and the record column all exist and are exercised;
+   nothing increments them.
+3. **A headless detached run's standard streams are `/dev/null`.** A supervisor
+   holding its launcher's terminal or pipes would keep them open after the
+   launcher exited, which is the thing detachment is for. Output comes back via
+   the PTY path (§9.3), not from a headless run.
+4. **One viewer at a time.** Attach occupies the supervisor's single client slot;
+   a second connection is refused `ControlRefusal::Busy`. There is deliberately
+   no separate "already attached" answer, because a second attach cannot reach
+   the supervisor to be refused.
+5. **Scrollback is bounded and lossy, and says so.** 256 KiB oldest-dropped ring;
+   `AttachAck::dropped()` is how many bytes were lost. Output already handed to a
+   client and not consumed is **not** replayed — the ring covers from the detach
+   onwards.
+6. **A stalled client is dropped; the run is not.** After a 10-second stall the
+   client goes, output returns to the ring, and the run carries on.
+7. **A stop hangs the terminal up**, so a stopped interactive run may be observed
+   as `Signaled { SIGHUP }` rather than `SIGKILL`. This is not cosmetic: a
+   session leader holding a controlling terminal cannot finish exiting until that
+   terminal has drained, and the process that would drain it is the one about to
+   block in `waitpid`. The exit reports what was seen, as always.
+8. **`ExecOrKilledPreExec` is genuinely ambiguous.** A child killed between the
+   gate release and `execve` closes its status descriptor exactly as a successful
+   exec does. Reported as a third value, never collapsed to a bool.
+9. **A descendant that calls `setsid` escapes the process group** and is
+   invisible to both `stop` and cleanup verification. Closing it needs a
+   cgroup-class mechanism this stream does not build.
+10. **Process-group ids are reusable after the reap.** A later group hit is
+    reported as "something is in that group", mitigated but not eliminated by the
+    boot-id re-check.
+11. **Gate expiry freezes while the machine sleeps.** The deadline is measured
+    with `Instant`, which does not advance across suspend; and expiry is
+    evaluated *lazily*, at the next operation, so an abandoned never-activated
+    detached session holds its supervisor until something asks.
+12. **Same-uid is not a boundary.** Peer-UID checks and 0700/0600 permissions
+    keep *other* users out. A hostile process running as the same uid can read
+    the store, connect to the socket legitimately, and `ptrace` its peers. See
+    `THREAT_MODEL.md` §3.
+13. **macOS `killpg` answers `EPERM`, not `ESRCH`,** for a process group whose
+    every member is already a zombie. `ActivatedSandbox::{stop, drop}` read that
+    as "nothing left to signal" — **and only there**, where the group id is an
+    unreaped child's own pid and so cannot have been reissued.
+    `RecoveredSession::kill_group` keeps the strict reading, because its recorded
+    group id may well have been.
+14. **Darwin `TIOC*` constants are hand-carried** in `lifecycle/terminal.rs`
+    because `libc` declares none for Apple targets. A unit test recomputes all
+    three from the BSD `_IOC` encoding rule, so a transposed digit fails there
+    rather than as an `ENOTTY` at the point of use.
+15. **The sandbox-extension path is not mode-aware.** `sandbox_extension_consume`
+    and its three filter rules are untouched by F11; the mode vocabulary does not
+    describe what a consumed token widens.
+16. **A byte-for-byte copy of a macOS platform binary cannot be `execve`d at
+    all** on a recent macOS — the kernel `SIGKILL`s it (exit 137) over the trust
+    cache, and `codesign --force --sign -` does not change that. This bit the
+    live test fixtures and is recorded so it does not bite an integrator who
+    assumes a sandbox denial.
+
+---
+
+## 11. Proposed upstream PRs
+
+Full procedure, ordering rationale and compliance steps in
+**`docs/UPSTREAMING.md`**. Summary:
+
+| Order | Delta | Why here |
+|---|---|---|
+| 1 | **F1/F1b** — portability + test hygiene | Smallest, independent, a bug fix for maintainers on macOS, evidence is a failure rate (16/20 → 0/20) rather than an argument. |
+| 2 | **F11** — mode-aware fs capability vocabulary | Answers a gap upstream documents in its own words; adds no dependency; changes no existing behaviour. **Do not open until the ubuntu job is green** — its Linux half has never run. |
+| 3 | **The lifecycle (F3–F10)** — **RFC first, PR second** | ~15 modules, a staged model upstream does not have, and one line of embedder cooperation in `main`. That is a design conversation, not a diff. `SupportReport` (part of F8) is adoptable alone and may be worth proposing first if the larger conversation stalls. |
+| never | **F2** + gate tooling | Process artifacts. Strip list in `docs/UPSTREAMING.md` §6.1. |
+
+**Hard stop, quoted from upstream `AGENTS.md`:** an agent *must not* open a pull
+request if "an issue does not already exist for the proposed change". **No issue
+exists upstream for F1, F11 or the lifecycle.** Every one of them is currently
+under that hard stop. Holding the work locally is not a contribution attempt and
+is not prohibited; filing the issues is an operator decision.

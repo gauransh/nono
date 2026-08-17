@@ -1,0 +1,57 @@
+# Stream gate matrix for the Crystal Nono substrate fork (fork-only workflow).
+#
+# This does not replace or modify any upstream workflow. It runs
+# scripts/stream-gates.sh, which prints PASS / FAIL / NOT_RUN per gate and
+# exits nonzero only on FAIL — so a runner that cannot answer a gate says so
+# instead of pretending.
+#
+# THE UBUNTU JOB IS THE POINT. Every row this stream reports BLOCKED is blocked
+# on one thing: no Linux kernel has ever executed the fork's Landlock mapping,
+# its seccomp preparation, or the lifecycle's Linux pre-exec arms. The macOS
+# host that developed them cannot run them (Docker daemon down, and
+# cross-compilation dead-ends at aws-lc-sys wanting x86_64-linux-gnu-gcc). The
+# ubuntu-latest job below is what closes that gap the first time this fork is
+# pushed to a remote with Actions enabled; until then those gates report
+# NOT_RUN with the operator action in the line.
+#
+# Fork-only artifact: strip this file from any upstream PR branch
+# (see docs/UPSTREAMING.md).
+
+name: stream-gates
+
+on:
+  push:
+    branches: ["parallel/**"]
+  pull_request:
+    branches: ["parallel/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: stream gates (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup component add clippy rustfmt
+
+      # Optional: miri is a nightly component. Installing it here is what turns
+      # the miri-pure-lifecycle gate from NOT_RUN into a real answer. It is a
+      # separate step so a nightly outage degrades the gate to NOT_RUN rather
+      # than failing the job.
+      - name: Install nightly + miri (best effort)
+        continue-on-error: true
+        run: rustup toolchain install nightly --component miri
+
+      - name: Run gate matrix
+        run: ./scripts/stream-gates.sh

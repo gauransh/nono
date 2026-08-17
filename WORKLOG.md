@@ -741,3 +741,254 @@ is a `process-exec-interpreter` check against `/bin/sh`.
   mapping they call is fully host-tested. Cross-compilation is still not a
   workaround — `aws-lc-sys` wants `x86_64-linux-gnu-gcc`, reconfirmed this
   iteration.
+
+## 2026-08-17 — Iteration 11: consolidation, gate tooling, final statuses (no delta row)
+
+No substrate change this iteration. Nothing was added to `crates/nono`. The work
+was making the stream's own claims checkable by someone who did not write them,
+and then reading the result honestly.
+
+### The upstream re-diff, and a prediction that was wrong
+
+`NONO_UPSTREAM_DELTA.md` §2 had said "UNKNOWN — not yet diffed" since iteration 1,
+which was true at clone time (pinned == tip) and had quietly stopped being true.
+Upstream is now `9078ffcf`, three commits on: a 461-line seccomp arch-guard
+refactor of `crates/nono/src/sandbox/linux.rs`, a CLI atomic-write unlink rule,
+and 2151 lines of remote `connect`/`ps`. Each verified with `git show --stat`
+before a word was written about it.
+
+**The predicted conflict did not happen, and the measurement is more useful than
+the prediction was.** The expectation going in was a real rebase conflict in
+`linux.rs` against F11's mapping additions and F4's `prepare_seccomp` use. It is
+clean:
+
+```
+$ git merge-tree --write-tree HEAD origin/main
+5b5c174d704fd262ee0c5e72cf99024a3c075856          # a tree, not a conflict report
+
+$ git rebase 9078ffcf                             # in an isolated --shared clone
+Successfully rebased and updated refs/heads/probe. # all 11 fork commits, 0 conflicts
+```
+
+The reason is worth recording because it is a payoff and not luck. The fork's
+placement rule has been "append functions, never weave" since F4, and the hunk
+table shows what that bought: fork hunks at old lines 5 / 594 / 910 / 1271 / 5801,
+upstream's at 1642–3368 and 4901–5010. Nearest approach ~370 lines.
+`prepare_seccomp_with_abi`'s signature is byte-identical either side, so F4's one
+call site and F11's two rule loops need no edit at all.
+
+Two things kept the finding honest rather than triumphant. `rustfmt --edition 2024
+--check` parses the merged file with no diff — that is a *parse*, not a compile.
+And `sandbox/linux.rs` is `cfg(target_os = "linux")` in its entirety, so a macOS
+host cannot compile the one file both changesets touch. §5.0 now says so in as
+many words: **rebase, then run the ubuntu job before believing the clean result.**
+
+One semantic hazard survives the clean rebase and git will never mention it:
+upstream `36243aa5` extended `nono-cli/src/capability_ext.rs` — the file F11
+ported the atomic-write temp-sibling rule *out of*, with attribution — so the two
+copies can now drift. Recorded in §5.1 as a semantic-only row, and in
+`docs/UPSTREAMING.md` §1.3 as "re-read this file after every rebase".
+
+`36243aa5` is also the most interesting of the three: upstream solved atomic-write
+unlink as one more hardcoded CLI policy rule, which is exactly the fourth member
+of F11's published `ATOMIC_WRITE_MEMBERS` arriving one rule at a time. That is
+evidence the bundle is the right shape — and a warning that the two must not both
+ship, or the CLI regex and the mode compiler both emit `file-write-unlink` for the
+same pattern and only one of them discloses it.
+
+### `scripts/stream-gates.sh` — three outcomes, and no fourth
+
+The contract's §12 asks CI to distinguish PASS / FAIL / NOT_RUN and never let
+NOT_RUN read as PASS. The script is that, and the design decision behind it is
+one line long: **a NOT_RUN reason must name the capability this host lacks, not
+the fact that it lacks one.** "unavailable" is not a reason; "docker daemon down
+(open Docker Desktop once and accept the first-run prompt)" is. Every reason is
+*probed* rather than hardcoded, so a host that has since started Docker gets a
+different line rather than a stale one.
+
+Fifteen gates. The exit status is nonzero if and only if something FAILed, so a
+host that can answer twelve questions reports honestly on twelve instead of
+failing on three.
+
+Two judgements inside it worth writing down:
+
+- **`lifecycle-modes-live` is NOT_RUN on Linux, not PASS.** The target is
+  `#![cfg(target_os = "macos")]`, so on Linux it compiles to zero tests — and
+  zero tests passing is precisely the kind of green that means nothing. The
+  Linux half of that vocabulary is a different gate.
+- **The miri filter is a deliberate subset and says so.** State machine, gate
+  classification, plan validation and the recovery decision table: 56 tests, and
+  the reason the rest are excluded is that they fork, exec, bind sockets and
+  write files, none of which miri interprets. Claiming "miri passes on the
+  lifecycle" would be the overclaim; the gate name is `miri-pure-lifecycle`.
+
+`.github/workflows/stream-gates.yml` runs the same script on `macos-latest` and
+`ubuntu-latest`. No upstream workflow was touched. The header comment says what
+the ubuntu job is *for*, because a future reader should not have to infer that it
+is the thing standing between seven BLOCKED rows and PASS.
+
+### The gate matrix
+
+```
+PASS     workspace-tests        3744 passed / 0 failed / 2 ignored (35 suites)
+PASS     nono-crate-tests       1145 passed / 0 failed / 1 ignored (8 suites)
+PASS     lifecycle-live         25 passed / 0 failed / 0 ignored (1 suites)
+PASS     lifecycle-modes-live   14 passed / 0 failed / 0 ignored (1 suites)
+PASS     lifecycle-detached     27 passed / 0 failed / 1 ignored (1 suites)
+PASS     loom-lifecycle         7 passed / 0 failed / 0 ignored (1 suites)
+PASS     clippy-strict          clean
+PASS     clippy-loom            clean
+PASS     fmt-check              clean
+PASS     lint-docs              clean
+PASS     lint-aliases           clean
+PASS     doc-tests              11 passed / 0 failed / 0 ignored (1 suites)
+NOT_RUN  miri-pure-lifecycle    miri component not installed: rustup +nightly component add miri
+NOT_RUN  linux-landlock-live    Linux execution environment unavailable: docker daemon down (…)
+NOT_RUN  linux-lifecycle-live   Linux execution environment unavailable: docker daemon down (…)
+
+gates: 12 PASS  0 FAIL  3 NOT_RUN  (of 15)
+```
+
+Miri was left NOT_RUN rather than installed. No nightly toolchain exists on this
+host, and `df -h /` reports **1.9 GiB free** — installing a nightly plus the miri
+component plus a separate interpreter target directory on that is a good way to
+turn a missing gate into a broken host. The gate names the exact command
+(`rustup +nightly component add miri`) so the operator can make that trade
+knowingly. Miri is a supplement to the loom gate here, not a substitute for it.
+
+### Evidence gates run for the row statuses
+
+```
+$ grep -rnE 'Command::new\("nono"\)|CARGO_BIN_EXE_nono' crates/nono/src
+(no output, exit 1)
+```
+
+R14 empty. The grep is only the tripwire; the real claim is that `crates/nono` is
+a workspace leaf with no dependency on `nono-cli`, so a CLI invocation is not
+reachable even indirectly. The one place the library re-executes anything is the
+detached supervisor, and what it re-executes is `current_exe()` — the consumer's
+own binary — never a looked-up path, because a path is something an attacker can
+arrange to control.
+
+```
+$ grep -rnE 'RuntimeProvider|LaunchRequest|PolicyBundle|SandboxEvent|Cedar|HCP|CrystalOS|Leash' \
+    crates/nono/src docs/lifecycle docs/adr
+docs/adr/0001-generic-lifecycle.md:17:all generic (no CrystalOS/HCP/Leash/Cedar concepts).
+```
+
+R15: zero hits in `crates/nono/src`, zero in `docs/lifecycle`, one in an ADR — and
+that one is the *negative* statement, the sentence that declares the boundary this
+row exists to enforce. Deleting it would make the grep cleaner and the repository
+less honest. Justified in the row rather than suppressed.
+
+Both blocker reproduce commands re-verified verbatim: `docker ps` still answers
+"Cannot connect to the Docker daemon at
+`unix:///Users/gauranshtandon/.docker/run/docker.sock`", and `which
+x86_64-linux-gnu-gcc` still answers "not found" — while the
+`x86_64-unknown-linux-gnu` *target* is installed, which is the detail that makes
+the cross-compile dead end easy to re-walk if it is not written down.
+
+### The row calls, including the ones that went against the brief
+
+Final: **11 PASS, 7 BLOCKED, 1 IN_PROGRESS, 1 aggregate PASS.**
+
+Three calls needed a judgement rather than a lookup.
+
+**R05 → PASS, not BLOCKED.** Its six siblings are BLOCKED for a Linux runner, and
+at first glance R05 looks the same. It is not. Loom is a model checker: it
+replaces std's atomics, cells and locks with instrumented ones and enumerates
+interleavings inside one process. It performs no syscall, forks nothing, and
+every model drives `sync_core`, which is pure synchronisation over
+`LifecycleState::apply`. **There is no Linux half of this row to be missing.** A
+Linux runner would run the same enumeration and reach the same verdict. Marking
+it BLOCKED would have been a false humility that made the file less accurate, not
+more.
+
+**R08 → PASS, with the residual named rather than rounded off.** The row's three
+scope items are met and audited by name: fourteen live positive/negative mode
+pairs, atomic-write as a capability concept with a published expansion, and
+disclosure that cannot disagree with enforcement because it *is* the compilation.
+It is a macOS-only row, so the Docker wall does not reach it. But
+`sandbox_extension_consume` and its three unconditional filter rules are untouched
+by F11, and the vocabulary still does not describe what a consumed token widens.
+The row says PASS *on the reading that* "mode-aware extension honesty" means the
+mode-aware extension of the vocabulary — and says, in the same breath, that if the
+operator reads it as covering sandbox extensions the row should be re-opened. A
+PASS that names the reading it depends on is checkable; one that does not is a
+guess wearing a green label.
+
+**R20 → IN_PROGRESS, against the instruction to mark it PASS at commit.** The
+instruction was also to leave this iteration uncommitted. Both cannot be true at
+once, and the tie-breaker is the stream's own rule: a row is PASS when it is
+verified, and "it will be committed shortly" is not a verification. `git status`
+is non-empty, so the row is not PASS. Its evidence names the eight uncommitted
+paths and notes that all eight are documentation and gate tooling — no library
+source, no test, no manifest — so the commit that lands them cannot invalidate the
+matrix that produced this iteration's evidence.
+
+R07 was also promoted from TODO to BLOCKED with a structured blocker. TODO reads
+as "not started", and the truth is "cannot be started here"; it is the root
+blocker six other rows point at, and it was the only one of the seven not carrying
+a machine-readable one.
+
+And the one thing R07 still owns in its own right, which did **not** get fixed and
+should not have: `SignalMode::Isolated` degrades silently below Landlock V6 with
+only a `debug!`. The candidate fail-closed fix was deliberately not made, because
+changing fail-closed behaviour on a platform this stream cannot execute would be a
+change nobody could test. Recorded as a decision, not an oversight.
+
+### The threat model, from requirements to mechanisms
+
+`THREAT_MODEL.md` was a discovery seed: boundaries written as "Fork must add…".
+Every one of them now exists as running code, so §1 is a mapping from each seed
+requirement to the mechanism that answers it, plus three boundaries the seed did
+not have (the re-exec entry hook, the control socket, the PTY attach codec). §2
+records both adversarial reviews as finding→fix pairs — thirteen findings, all
+applied in the iteration they were raised.
+
+§3 is the part that matters most and is the part a threat model usually gets
+wrong. Nine residual risks, each accepted and disclosed rather than mitigated into
+vagueness; the first four are typed entries in `SupportReport::dark_spots()`, so a
+consumer reads them from the machine-readable report and not from a document. The
+ninth is stated in capitals because it is the largest and the easiest to lose in a
+list: **no part of this has ever executed on a Linux kernel**, the mapping logic
+is host-tested against a *faked ABI* which tests the decision table and not the
+kernel's answer, and every Linux-facing sentence in that document should be read
+as intent until the ubuntu job has been green once.
+
+### `docs/UPSTREAMING.md`
+
+Rebase procedure with the order that makes it recoverable (record the re-diff
+*first*, measure the conflict surface *before* creating one, dry-run in a
+`--shared` clone), per-delta-row conflict resolutions, the four places the
+upstream pin is written down and must move together, and the three things a rebase
+must not do.
+
+Then the PR ordering — F1 first because it is smallest and its evidence is a
+failure rate; F11 second, and **not until the ubuntu job is green**, because
+proposing Linux behaviour that has only been tested against a faked ABI is exactly
+what upstream's §7 says to stop over; the lifecycle third and **as an RFC, not a
+PR**, because ~15 modules and a library that asks you to change `main` is a design
+conversation.
+
+Upstream's Coding Agent Contribution Policy is quoted verbatim rather than
+paraphrased, because a paraphrase of a hard stop is a way to get one wrong. The
+conclusion is uncomfortable and is written down anyway: **no issue exists upstream
+for F1, F11 or the lifecycle, so all three are currently under a hard stop.**
+Holding the work here is not a contribution attempt and is not prohibited; filing
+the issues is an operator decision, and an agent filing an issue to unblock its
+own PR is the letter of that policy but arguably not its spirit.
+
+### Gates after
+
+`scripts/stream-gates.sh` = 12 PASS / 0 FAIL / 3 NOT_RUN, exit 0. `cargo fmt
+--all -- --check`, `./scripts/lint-docs.sh` and `./scripts/test-list-aliases.sh`
+are inside the matrix (`fmt-check`, `lint-docs`, `lint-aliases`) and each ran
+clean. No source file changed this iteration, so no removal-detection transcript
+applies.
+
+### Left uncommitted, by instruction
+
+`BLOCKED_ROWS.json`, `HANDOFF.md`, `NONO_UPSTREAM_DELTA.md`, `THREAT_MODEL.md`,
+`WORKLOG.md` (modified); `docs/UPSTREAMING.md`, `scripts/stream-gates.sh`,
+`.github/workflows/stream-gates.yml` (new).

@@ -30,8 +30,19 @@ Reuse these; do not duplicate (evidence in API_BASELINE.md / PLATFORM_CAPABILITY
 
 ## 2. Capabilities present only in newer upstream
 
-**UNKNOWN — not yet diffed.** At clone time upstream main == 149579a7 (pinned == tip).
-TODO: re-diff `149579a7..upstream/main` before any rebase or upstream PR; record here.
+Re-diffed at iteration 11 (2026-08-17). At clone time upstream main == `149579a7` (pinned ==
+tip); it has since moved to `9078ffcf`, three commits ahead. Fetched and diffed with
+`git log --oneline 149579a7..origin/main` and `git show --stat` on each.
+
+| Upstream commit | What it adds | Touches the fork? | Relationship to a fork delta |
+|---|---|---|---|
+| `5be192ad` refactor(seccomp): ensure all filters include arch guard (#1636) | A dedicated `arch_guard` module inside `sandbox/linux.rs`: an `ArchGuarded<T>` wrapper with a private field and a `Deref`, so a BPF program **cannot be constructed without** the architecture prologue. `seccomp_arch_guard` gains a configurable `mismatch_action`: the `openat` notification filter answers `SECCOMP_RET_ALLOW` for non-native ABIs (it only expands access, so denying would break 32-bit processes for nothing), the `af_unix` filter answers `EACCES` (BPF cannot dereference `socketcall(2)` arguments, so a compat-ABI call would otherwise fall through to ALLOW), and every other network filter answers `SECCOMP_RET_ERRNO`. `prepare_seccomp_af_unix_filter` grows from 8 to 14 rules. **461 lines changed in one file the fork also edits** (`crates/nono/src/sandbox/linux.rs`, +327/−134). | Same file as F4's `prepare_seccomp_with_abi` use and F11's Landlock mode loops — see §5, where the conflict expectation is recorded with the measurement that resolved it. | **Nearest neighbour, not an overlap.** The arch guard is upstream's own hardening of the seccomp *filter builder*; F4 only *calls* `Sandbox::prepare_seccomp_with_abi` and F11 only adds Landlock rule loops. Neither reimplements a guard upstream now enforces by construction — which is the outcome the fork wanted anyway. |
+| `36243aa5` feat(policy): allow unlink for atomic write temp files (#1657) | CLI-only (`crates/nono-cli/src/policy.rs` +31, `crates/nono-cli/src/sandbox_prepare.rs` +181/−32). Adds `(allow file-write-unlink)` for `.tmp.<pid>.<hash>` siblings so an atomic replace can remove its own temp file, mirroring the existing temp-file *write* grant; also moves the `~/.claude.json` redirect into `prepare_claude_json_redirect`. | No — `crates/nono` and the lifecycle are untouched. | **Conceptual overlap with F11's `FsMode::AtomicWrite`, solved at a different layer, and the fork's is the upstreamable generalisation.** Upstream fixed atomic-write unlink *in CLI policy*, as one more hardcoded regex rule beside the write rule the fork already ported with attribution (`capability_ext.rs:434-460`, hex suffix from `5f0b95a0`). F11 makes the same behaviour a *capability-level* concept: `ATOMIC_WRITE_MEMBERS = {create, write, rename, remove_file}` is a published constant, the members the caller did not name appear in `CompiledModes::bundled`, and a platform that cannot express a member refuses the whole grant instead of silently dropping it. Upstream's change is exactly the fourth member (`remove_file`) arriving one rule at a time. When F11 is proposed upstream, this commit is the evidence that the bundle is the right shape — and the two must not both ship, or the CLI regex and the mode compiler would both emit the unlink rule. |
+| `9078ffcf` feat(remote): add remote session connect and ps (#1656) | CLI-only (+2151/−54 across `nono-cli`, plus `Cargo.lock` and two fixtures). `nono connect` attaches a terminal to a session hosted by `nono-console` over WebSocket (`connect_client.rs`, 1473 lines new), `nono ps --remote`, an OSC-777 `--bridge-status` readiness protocol for `nono attach`, CSI-u detach-sequence matching, terminal-mode restoration after detach, and `docs/protocols/remote-attach-v1.md`. New dependencies `tokio-tungstenite` and `futures-util`. | No library conflict — nothing under `crates/nono` is touched. | **Conceptually adjacent to F9/F10, at a different layer, and deliberately so.** Both are "attach a terminal to a session that is not this process's child". Upstream's is a *product* path: a CLI speaking WebSocket to a hosted console, with enrollment, request signing and a remote protocol document. The fork's is a *library* path: a Unix socket in a 0700 store, peer-UID checked, frame-bounded, with no network, no transport dependency and no service to enrol with. They do not compete and neither subsumes the other; if upstream ever wants a local library-owned attach under `nono connect`, F9/F10's `AttachedTerminal` is the thing to build it on. Worth noting for the rebase: upstream's terminal work is all in `nono-cli/src/pty_proxy.rs`, which the fork does not touch. |
+
+Nothing in these three commits closes a gap listed in §3. The Landlock/Seatbelt capability
+model, the lifecycle, typed exits, cleanup verification, the support report and the event
+vocabulary are all still absent upstream at `9078ffcf`.
 
 ## 3. Capabilities genuinely missing vs the frozen contract
 
@@ -90,9 +101,80 @@ TODO: re-diff `149579a7..upstream/main` before any rebase or upstream PR; record
 
 ## 5. Expected rebase conflicts
 
+### 5.0 Measured against `9078ffcf` (iteration 11)
+
+The list below was written as *expectation*. At iteration 11 it was measured, so the two are
+now separated: what the rebase actually did, then what remains a standing hazard.
+
+**Only two files are touched by both the fork and the three new upstream commits:**
+
+```
+$ comm -12 <(git diff --name-only 149579a7 be442758 | sort) \
+           <(git diff --name-only 149579a7 9078ffcf | sort)
+Cargo.lock
+crates/nono/src/sandbox/linux.rs
+```
+
+**The rebase is textually clean.** Measured twice, in an isolated clone, without touching the
+working tree:
+
+```
+$ git merge-tree --write-tree HEAD origin/main
+5b5c174d704fd262ee0c5e72cf99024a3c075856      # a tree, not a conflict report
+
+$ git clone --shared --no-checkout . /tmp/rebase-probe && \
+  git -C /tmp/rebase-probe checkout -b probe be442758 && \
+  git -C /tmp/rebase-probe rebase 9078ffcf
+Successfully rebased and updated refs/heads/probe.   # all 11 fork commits, 0 conflicts
+```
+
+**Why `linux.rs` did not conflict, even at 461 changed lines.** The two changesets are
+disjoint by line range, and not by luck — the fork's placement rule ("append functions, never
+weave") is what produced it:
+
+| | Fork hunks (old line numbers) | Upstream `5be192ad` hunks (old line numbers) |
+|---|---|---|
+| imports | 5 | — |
+| Landlock mode mapping | 594 (`access_fs_for`, `abi_version_number`, `rights_available`, `mode_cap_access`, `compile_fs_modes`) | — |
+| prepare/apply rule loops | 910, 1271 (appended `for` loops over `fs_mode_capabilities()`) | — |
+| seccomp filter builders | — | 1642 – 3368 (`arch_guard` module, `ArchGuarded`, every filter builder) |
+| tests | 5801 | 4901 – 5010 |
+
+The nearest approach is ~370 lines. The rebased file contains both changesets intact
+(`arch_guard`/`ArchGuarded` at the new line 1821 ff., `abi_version_number`/`access_fs_for` at
+603/634), and `rustfmt --edition 2024 --check` parses it with no diff.
+
+**The API F4 consumes is unchanged.** `pub fn prepare_seccomp_with_abi(caps, abi, opts) ->
+Result<PreparedLandlockSandbox>` is byte-identical before and after; upstream's refactor is
+entirely below it, inside the filter builders. `PreparedLandlockSandbox::apply_raw` is
+likewise untouched. So F4's one call site and F11's two rule loops need no edit.
+
+**`Cargo.lock` merged cleanly** and the rebased lock carries all three sides: `loom` (F5),
+`uuid` (F4) and upstream's new `tokio-tungstenite`. It is still the file most likely to
+conflict on the *next* upstream move, and the resolution is always the same — take upstream's
+lock and re-run `cargo check -p nono`, never hand-edit.
+
+**The one claim this measurement cannot make.** Textual cleanliness is not compile
+cleanliness, and `crates/nono/src/sandbox/linux.rs` is `cfg(target_os = "linux")` in its
+entirety, so a macOS host cannot compile the rebased file at all. `cargo check` on the rebased
+tree would exercise every fork module *except* the one file both changesets touch. That
+verification belongs to the same Linux runner every other Linux row waits on — it is the
+`linux-landlock-live` gate in `scripts/stream-gates.sh` and the `ubuntu-latest` job in
+`.github/workflows/stream-gates.yml`. **Rebase, then run the ubuntu job before believing the
+clean result.**
+
+One semantic hazard survives the clean rebase and is worth naming: upstream changed
+`prepare_seccomp_af_unix_filter` from 8 rules to 14 and updated its own length assertion. No
+fork test asserts a filter length (checked — the fork's `linux.rs` test additions are all
+Landlock right-mapping assertions), so nothing of ours breaks. A future fork change that
+*does* assert one would be a rebase liability; don't add one.
+
+### 5.1 Standing hazards (unrealised so far)
+
 - `crates/nono-cli/src/exec_strategy.rs` (234KB, single file): any upstream churn here will
   conflict with lifecycle extraction work. Mitigation: build the generic lifecycle in
   `crates/nono` as new modules; keep exec_strategy.rs edits minimal and mechanical.
+  *Status at `9078ffcf`: untouched by the fork and untouched by the three new commits.*
 - `crates/nono/src/capability.rs` if upstream evolves `AccessMode` while the fork extends the
   mode vocabulary. **Realised by F11, and mitigated by placement**: the whole vocabulary lives
   in a *new* directory (`crates/nono/src/capability_modes/`), which cannot conflict on rebase.
@@ -114,9 +196,21 @@ TODO: re-diff `149579a7..upstream/main` before any rebase or upstream PR; record
   together: the golden-example snapshot test fails if either changes alone. Fork-only files, so
   this is an internal-consistency constraint rather than a rebase hazard.
 - Scripts under `scripts/` if upstream touches the same lint tooling (F1).
+  *Status at `9078ffcf`: untouched upstream.*
+- `crates/nono-cli/src/capability_ext.rs` — not a textual hazard (the fork does not edit it)
+  but a **semantic** one. F11 ported its atomic-write temp-sibling rule into the library with
+  attribution; upstream `36243aa5` has since extended the CLI's own copy with an unlink rule.
+  The two must be reconciled rather than both carried: if F11 is upstreamed, the CLI regex is
+  what it replaces. Track this row when rebasing, because git will never report it.
 
 ## 6. Deletion conditions policy
 
 Every fork-only row must state how it dies: either (a) upstream merges an equivalent, or
 (b) the generic feature it supports is upstreamed and the fork-only shim becomes
 unnecessary, or (c) the stream ends and process artifacts are stripped from the PR branch.
+
+The mechanics of (c) — which files are fork-only, how a PR branch is stripped of them, and
+the order the deltas should be proposed in — are in `docs/UPSTREAMING.md`, which is the
+operational companion to this table. Every row's **Disposition** column is the input to that
+document's PR ordering, and every row's **Deletion condition** is what makes the row's
+absence checkable later rather than a matter of memory.
