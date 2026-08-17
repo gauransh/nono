@@ -322,8 +322,12 @@ Authoritative source: `BLOCKED_ROWS.json`. Summary:
 
 | | Rows |
 |---|---|
-| **PASS** (13) | R01 upstream tests green · R02 lifecycle exists as library APIs · R05 races tested (loom is host-independent) · R08 macOS Seatbelt fail-closed · R12 support report · R13 event delivery · R14 no CLI invocation · R15 no product types · R16 deltas documented · R17 locally-achievable rows green · R18 blockers reproducible · R19 this file · R20 all work committed (tip `d56e0f8b`, `git status` clean) |
-| **BLOCKED** (7) | R03 prepare cannot exec early · R04 activation single-use · R06 mode semantics honest · **R07 Linux Landlock fail-closed (root blocker)** · R09 detached/attach · R10 exit facts · R11 cleanup verification — **all seven complete on macOS, all seven waiting on the same Linux runner** |
+| **PASS** (19) | R01 upstream tests green · R02 lifecycle as library APIs · **R03 prepare cannot exec early** · **R04 activation single-use** · R05 races tested · **R06 mode semantics honest (Linux half)** · **R07 Linux Landlock fail-closed** · **R09 detached/attach survive caller restart** · **R10 exit facts observed** · **R11 cleanup verification** · R12 support report · R13 event delivery · R14 no CLI invocation · R15 no product types · R16 deltas documented · R17 locally-achievable rows green · R18 blockers reproducible · R19 this file · R20 all work committed |
+| **IN_PROGRESS** (1) | R08 macOS Seatbelt — green on macOS 14 (14/14 mode pairs), one pair open on macOS 15 (see section 8) |
+| **BLOCKED** (0) | — the Linux execution blocker is cleared; verification runs in CI on every push |
+
+The seven rows in bold were `BLOCKED` on Linux execution and are now verified on
+a real kernel (run `32052788218`).
 
 ---
 
@@ -346,49 +350,52 @@ condition in `NONO_UPSTREAM_DELTA.md` §4.
 
 ## 8. Remaining external blockers
 
-**One blocker. It is the reason seven rows are `BLOCKED`, and it is not a
-software problem.**
+**None. The Linux blocker is cleared.**
 
-> **Reproduce:**
-> ```
-> docker ps
-> ```
-> ```
-> Cannot connect to the Docker daemon at unix://$HOME/.docker/run/docker.sock.
-> Is the docker daemon running?
-> ```
->
-> **Operator action:** open Docker Desktop once and accept the first-run prompt;
-> then run `scripts/stream-gates.sh` in a Linux container per
-> `docker/Dockerfile-CI`.
+Linux verification now runs on every push, on a real kernel, via the fork's own
+`stream-gates` workflow (`.github/workflows/stream-gates.yml`, ubuntu-latest
+job). It does not depend on this or any developer machine.
 
-Docker Desktop is installed and has been launched headlessly, but it requires a
-GUI first-run acceptance that no automated path can supply.
+> **Reproduce:** push to `gauransh/nono` (or run the workflow manually) and read
+> the `stream gates (ubuntu-latest)` job:
+> ```
+> gh run list  --repo gauransh/nono --branch parallel/nono-substrate-v1
+> gh run view <id> --repo gauransh/nono --log
+> ```
 
-**Cross-compilation is NOT a workaround.** `crates/nono` depends on
-`sigstore-verify` → `aws-lc-sys`, whose build script needs a Linux linker:
+**Result (run `32052788218`, ubuntu-latest, x86_64, kernel 6.x):**
 
 ```
-$ which x86_64-linux-gnu-gcc
-x86_64-linux-gnu-gcc not found
+gates: 14 PASS  0 FAIL  1 NOT_RUN  (of 15)
+PASS  linux-landlock-live    129 passed / 0 failed
+PASS  linux-lifecycle-live    54 passed / 0 failed / 1 ignored
+PASS  workspace-tests       3765 passed / 0 failed
+PASS  miri-pure-lifecycle     56 passed / 0 failed
+NOT_RUN lifecycle-modes-live  macOS-only target; its Linux half is linux-landlock-live (PASS)
 ```
 
-The `x86_64-unknown-linux-gnu` *target* is installed; the linker is what is
-missing. Re-verified at iteration 11.
+Running on Linux for the first time found four real defects that macOS could
+never surface, all fixed (delta F12): a 100%-CPU supervisor spin on a finished
+terminal (Linux reports POLLHUP even for a zero-interest poll entry); a dead
+client holding the session's client slot, which broke caller-death reattach; a
+second client silently overwritten instead of refused during an in-flight
+request; and directory-only Landlock rights being silently masked away when
+requested on a file path instead of refused.
 
-**The equivalent remote unblock:** push this branch to a remote with Actions
-enabled and let the `ubuntu-latest` job of `.github/workflows/stream-gates.yml`
-run. That closes the same gap without a local Docker daemon.
+**Local Docker remains wedged on this machine** (backend process runs, no
+daemon socket; `docker desktop status` cannot reach it while `docker desktop
+start` reports it already running; the disk is also near full). That is now a
+convenience gap only — it is no longer on the path to Linux verification, and
+the gate script still reports the two Linux gates honestly as `NOT_RUN` with
+the operator action when run on a Docker-less macOS host.
 
-**A second, much smaller blocker,** noted so it is not mistaken for a failure:
-`miri-pure-lifecycle` is `NOT_RUN` because no nightly toolchain with the miri
-component is installed on this host (`rustup +nightly component add miri`), and
-this host has 1.9 GiB free, which is not enough to install one safely. The gate
-covers only the syscall-free half of the lifecycle (state machine, plan
-validation, gate classification, recovery decision table — 56 tests) and is a
-supplement to the loom gate, not a substitute for it.
-
----
+**One open item, not a blocker (see `BLOCKED_ROWS.json` R08):** on macOS 15
+(GitHub `macos-latest`) one mode pair fails —
+`read_contents_granted_reads_and_ungranted_is_denied`: `/bin/cat` exits 1
+although `CompiledModes` shows `ReadContents`+`ReadMetadata` enforced and
+activation `Observed`. The same test passes on macOS 14. 13 of 14 pairs pass on
+macOS 15. Under diagnosis; any additional SBPL operation the fix requires must
+be disclosed as a bundle rather than granted silently.
 
 ## 9. Integration instructions for leash-rs
 
