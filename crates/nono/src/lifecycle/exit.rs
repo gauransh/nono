@@ -32,7 +32,7 @@
 //! can support and never rounds an ambiguity up to a certainty.
 
 use super::cleanup::{CleanupError, CleanupVerification, DeathObservation, verify_and_record};
-use super::events::{EventSink, LifecycleEvent, Observation};
+use super::events::{EventEmitter, LifecycleEventKind};
 use super::gate::StopError;
 use super::identity::ProcessIdentity;
 use super::session_store::SessionHandle;
@@ -384,7 +384,10 @@ pub struct ActivatedSandbox {
     shared: SharedLifecycle,
     activation: ActivationObservation,
     reaped: Option<SandboxExit>,
-    event_sink: Option<Arc<dyn EventSink>>,
+    /// The run's emitter, shared with the [`super::PreparedSandbox`] this came
+    /// from so the event sequence continues across the handoff instead of
+    /// restarting in the middle of the run.
+    events: Arc<EventEmitter>,
     /// The durable record this run writes to, when it has one.
     ///
     /// The same record the [`super::PreparedSandbox`] was writing, shared by
@@ -400,7 +403,7 @@ impl ActivatedSandbox {
         process_group: i32,
         state: LifecycleState,
         activation: ActivationObservation,
-        event_sink: Option<Arc<dyn EventSink>>,
+        events: Arc<EventEmitter>,
         session: Option<Arc<SessionHandle>>,
     ) -> Self {
         // The handoff itself is worth a write: the prepared handle recorded the
@@ -416,7 +419,7 @@ impl ActivatedSandbox {
             shared: SharedLifecycle::new(state),
             activation,
             reaped: None,
-            event_sink,
+            events,
             session,
         }
     }
@@ -471,6 +474,8 @@ impl ActivatedSandbox {
         if matches!(outcome, ExitOutcome::Exited { .. }) {
             self.activation = ActivationObservation::Observed;
         }
+        self.events
+            .emit(LifecycleEventKind::ChildExited { outcome });
         let exit = SandboxExit::new(outcome, self.activation, self.identity.clone());
         // The state machine refuses a second ChildExited, which is why the
         // cached read above returns before reaching this line.
@@ -509,6 +514,7 @@ impl ActivatedSandbox {
             .shared
             .begin_stop()
             .map_err(|err| StopError::NotStoppable { state: err.from })?;
+        self.events.emit(LifecycleEventKind::StopRequested);
         self.report(change);
 
         kill_group(self.process_group).map_err(|errno| StopError::SignalFailed {
@@ -525,6 +531,8 @@ impl ActivatedSandbox {
         })?;
 
         let outcome = reap(self.identity.pid())?;
+        self.events
+            .emit(LifecycleEventKind::StopObserved { outcome });
         self.transition(LifecycleOp::StopObserved);
         let exit = SandboxExit::new(outcome, self.activation, self.identity.clone());
         self.reaped = Some(exit.clone());
@@ -555,6 +563,12 @@ impl ActivatedSandbox {
         };
         let (verification, change) =
             verify_and_record(&self.shared, &self.identity, self.process_group, death)?;
+        // Every verdict, not only a proof of absence: a survivor is a fact a
+        // consumer has to act on, and one it would never hear about if only
+        // successes were reported.
+        self.events.emit(LifecycleEventKind::CleanupVerdict {
+            verdict: verification.clone(),
+        });
         if let Some(change) = change {
             self.report(change);
         }
@@ -580,13 +594,10 @@ impl ActivatedSandbox {
     /// the record can lag the live run by one step — see
     /// [`super::SessionStore::recover`], which is what makes that safe.
     fn report(&self, change: Transition) {
-        if let Some(sink) = &self.event_sink {
-            sink.emit(&LifecycleEvent::StateChanged {
-                from: change.from,
-                to: change.to,
-                observation: Observation::DirectlyObserved,
-            });
-        }
+        self.events.emit(LifecycleEventKind::StateChanged {
+            from: change.from,
+            to: change.to,
+        });
         if let Some(session) = &self.session {
             session.persist(change.to, Some(self.activation));
         }
@@ -602,7 +613,7 @@ impl std::fmt::Debug for ActivatedSandbox {
             .field("state", &self.shared.state())
             .field("activation", &self.activation)
             .field("reaped", &self.reaped)
-            .field("event_sink", &self.event_sink.is_some())
+            .field("events", &self.events)
             .finish()
     }
 }

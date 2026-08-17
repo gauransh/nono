@@ -106,6 +106,7 @@ use super::cleanup::{
     AbsenceBasis, CleanupError, CleanupVerification, DeathObservation, IndeterminateReason,
     SurvivorEvidence, UnsupportedReason, probe_identity, verify_and_record,
 };
+use super::events::{EventEmitter, LifecycleEventKind};
 use super::exit::{ActivationObservation, kill_group, kill_pid};
 use super::gate::{ActivationHandle, StopError};
 use super::identity::ProcessIdentity;
@@ -743,9 +744,17 @@ impl SessionStore {
             metadata,
         );
         self.inner.create(&record)?;
+        let events = prepared.events();
+        // The first write is a fact like every later one, and it is reported
+        // through the run's own emitter so it takes its place in the run's
+        // sequence rather than arriving out of band.
+        events.emit(LifecycleEventKind::RecordPersisted {
+            schema_version: record.schema_version,
+        });
         prepared.attach_session(Arc::new(SessionHandle {
             store: Arc::clone(&self.inner),
             record: Mutex::new(record),
+            events: Some(events),
         }));
         Ok((prepared, handle))
     }
@@ -809,6 +818,9 @@ impl SessionStore {
         let handle = Arc::new(SessionHandle {
             store: Arc::clone(&self.inner),
             record: Mutex::new(record),
+            // A recovered run has no sink: the supervisor that supplied one is
+            // gone, which is why we are here at all.
+            events: None,
         });
         if let Ok(change) = shared.mark(LifecycleOp::SupervisorLost) {
             handle.persist(change.to, None);
@@ -1028,6 +1040,12 @@ impl std::fmt::Debug for RecoveredSession {
 pub(crate) struct SessionHandle {
     store: Arc<StoreInner>,
     record: Mutex<SessionRecord>,
+    /// The run's emitter, when the run has one.
+    ///
+    /// `None` for a recovered session: the supervisor that owned the sink is,
+    /// by the fact that we are recovering, gone, and a recovery has no plan to
+    /// take one from.
+    events: Option<Arc<EventEmitter>>,
 }
 
 impl SessionHandle {
@@ -1045,15 +1063,31 @@ impl SessionHandle {
     ///   because a disk was full — would turn a bookkeeping problem into a
     ///   leaked process.
     pub(crate) fn persist(&self, state: LifecycleState, activation: Option<ActivationObservation>) {
-        let mut guard = self.locked();
-        guard.observe(state, activation);
-        if let Err(err) = self.store.update(&guard) {
-            tracing::warn!(
-                session_id = %guard.session_id,
-                state = %state,
-                error = %err,
-                "session record could not be updated; the record now lags the live run"
-            );
+        // The write happens under the record lock; the report happens after it
+        // is released. A sink is consumer code and may call back in, and a sink
+        // that did so while this held the record lock would deadlock a run over
+        // a bookkeeping write.
+        let persisted = {
+            let mut guard = self.locked();
+            guard.observe(state, activation);
+            match self.store.update(&guard) {
+                Ok(()) => Some(guard.schema_version),
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %guard.session_id,
+                        state = %state,
+                        error = %err,
+                        "session record could not be updated; the record now lags the live run"
+                    );
+                    // No event: nothing was persisted, and reporting a write
+                    // that did not happen is the one thing this vocabulary must
+                    // never do.
+                    None
+                }
+            }
+        };
+        if let (Some(schema_version), Some(events)) = (persisted, self.events.as_ref()) {
+            events.emit(LifecycleEventKind::RecordPersisted { schema_version });
         }
     }
 
@@ -1474,6 +1508,50 @@ mod tests {
     use crate::lifecycle::plan::SandboxPlan;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// The golden example locked by the schema doc.
+    const GOLDEN_DOC: &str = include_str!("../../../../docs/lifecycle/session-record-v1.md");
+    const GOLDEN_PATH: &str = "docs/lifecycle/session-record-v1.md";
+
+    /// The record the schema doc shows: every field at a fixed value, so the
+    /// example in the doc is a thing that can be checked rather than described.
+    fn golden_record() -> SessionRecord {
+        SessionRecord {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            session_id: match Uuid::parse_str("019512f0-0000-7000-8000-000000000001") {
+                Ok(id) => id,
+                Err(_) => Uuid::nil(),
+            },
+            generation: 1,
+            identity: ProcessIdentity::from_parts(
+                4242,
+                Some(1_755_000_000_000_000),
+                Some("1754990000.000000".to_string()),
+            ),
+            process_group: 4242,
+            state: LifecycleState::Running,
+            activation: Some(ActivationObservation::Observed),
+            created_unix_millis: Some(1_755_000_000_000),
+            updated_unix_millis: Some(1_755_000_000_123),
+            // Opaque to this library, and shown here as bytes for exactly that
+            // reason: the store copies them and never reads them.
+            metadata: b"demo".to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_golden_example_in_the_schema_doc_still_matches() -> Result<(), serde_json::Error> {
+        let serialized = serde_json::to_string_pretty(&golden_record())?;
+        assert_eq!(
+            serialized,
+            crate::lifecycle::doc_golden_example(GOLDEN_DOC, GOLDEN_PATH),
+            "the golden example in {GOLDEN_PATH} no longer matches a serialized SessionRecord; \
+             the doc and the type must be updated together"
+        );
+        let parsed: SessionRecord = serde_json::from_str(&serialized)?;
+        assert_eq!(parsed, golden_record());
+        Ok(())
+    }
 
     /// A private directory to build stores under.
     fn temp_dir() -> TempDir {

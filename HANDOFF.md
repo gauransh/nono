@@ -1,6 +1,6 @@
 # HANDOFF — Parallel Stream 1: Crystal Nono fork (generic sandbox substrate)
 
-Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 6
+Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 7
 
 STATUS: IN PROGRESS — this stream is NOT yet done. Only the final integration
 agent may declare the combined system complete; this file records the current
@@ -82,9 +82,64 @@ frozen-contract state of THIS repository only.
      until `ESRCH` rather than treating a sent signal as proof). Exit facts that
      survive a caller restart need the detached supervisor of the next slice.
 
+- Landed (iteration 7, macOS live-verified; Linux written-unverified):
+  **R12, the machine-readable support report.**
+  `nono::lifecycle::{SupportReport, SUPPORT_REPORT_SCHEMA_VERSION, Capability,
+  SupportStatus, Determination, SupportReason, HostFacts, KernelFacts,
+  LandlockFacts, LandlockRight, LandlockRightSupport, NetworkFilteringFacts,
+  NetworkMechanism, NetworkMechanismSupport, IdentityFacts, CleanupFacts,
+  EventObservationSupport, EventFamily, EventFidelity, DarkSpot,
+  DarkSpotEntry}` (all re-exported at the crate root except `Capability`,
+  which stays `lifecycle::Capability` so it cannot be misread as a peer of
+  `CapabilitySet`).
+
+  `SupportReport::gather() -> SupportReport` is **infallible**. Every field is
+  a `Capability<T>` carrying `status` (`available` / `partial` / `unavailable`
+  / `unknown`), `determination` (`probed_live` / `platform_api` / `declared`),
+  a typed `reason`, and optional typed `facts`. **No bare boolean appears
+  anywhere in the serialized tree**, and a test walks the JSON to keep it that
+  way. Upstream's `SupportInfo { is_supported: bool, … }` is untouched.
+
+  Three points a consumer should read before trusting it:
+
+  1. On macOS, `seatbelt` is `platform_api`, **not** `probed_live`.
+     `sandbox_init` is linked (so certainly present) but applies to the
+     calling process irreversibly; the only honest live probe forks first, and
+     this library will not fork a consumer to answer a diagnostic question.
+     The rationale is in `reason.why_not_probed`.
+  2. On Linux, `seccomp` is `probed_live` (upstream already ships a
+     fork-isolated probe) but `seccomp_user_notification` is `unknown` — it
+     cannot be established without installing a filter that cannot be removed,
+     and a kernel version is not proof.
+  3. `event_observation` reports `kernel_denial` as `not_observed` on **both**
+     platforms. The library emits no denial events; the CLI's macOS
+     `log stream` reconstruction is CLI machinery and is not claimed here.
+
+- Landed (iteration 7): **R13, the generic event vocabulary.**
+  `nono::lifecycle::{LifecycleEvent, LifecycleEventKind, ActivationOutcome}`.
+  **API shape change:** `LifecycleEvent` is now a struct — an envelope
+  (`session_id`, `generation`, `seq`, `observed_at`, `identity`,
+  `observation`) around a closed `what: LifecycleEventKind`. The previous
+  `LifecycleEvent::StateChanged { from, to, observation }` survives as
+  `LifecycleEventKind::StateChanged { from, to }`; a consumer that matched the
+  old enum matches `event.what()` instead. No other public type changed.
+
+  `seq` counts a run's events from zero, is kept across the
+  prepared→activated handoff, and is **the ordering authority**;
+  `observed_at` is a wall clock and explicitly is not. `ActivationOutcome`
+  carries no token material by construction, locked by a structural test.
+  Events the platform cannot show do not exist in the vocabulary — there is no
+  kernel-denial variant to synthesize one into.
+
+- Schema documents, each with a golden JSON example locked by a snapshot test
+  that reads the document itself: `docs/lifecycle/session-record-v1.md`,
+  `docs/lifecycle/support-report-v1.md`,
+  `docs/lifecycle/lifecycle-event-v1.md`.
+
 - Still being added: detached supervisor (exit facts across a restart,
   re-prepare with an incremented generation), attach/detach/resize,
-  `SupportReport` (ADR-0001 §6-7).
+  interactive (PTY) sessions — each reported as `not_implemented` by
+  `SupportReport` rather than left to inference (ADR-0001 §6).
 
 ## Toolchain and platform requirements
 
@@ -113,7 +168,11 @@ frozen-contract state of THIS repository only.
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F7) | 7 loom models pass (5 unchanged + 2 new: recovery-vs-cleanup → exactly one `CleanupConfirmed` winner; recovery-vs-stop-then-cleanup → never adopt after cleanup). Completes the R05 scenario set |
 | `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets --all-features` | clean |
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` | 5 loom models pass (all interleavings); harness verified to fail when the activation CAS is weakened. Cfg name is `nono_loom`, not loom's own `loom`: RUSTFLAGS reaches every crate, and `--cfg loom` makes tokio compile out `tokio::net`, breaking hyper-util (transitive via sigstore-verify) |
-| `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1 |
+| `cargo test --workspace --no-fail-fast` (after F8, iteration 7) | 3621 passed / 0 failed / 1 ignored, 33 suites |
+| `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F8) | 181 unit (153 unchanged + 28 new: 17 `support`, 8 `events`, 1 `session_store` golden, 2 reshaped) + 25 live (22 unchanged + 3: whole-vocabulary happy run, stopped run, refused activation carries no token material); live suite clean on 3 consecutive runs |
+| removal detection for the F8 guards | adding one `bool` field to `CleanupFacts` fails both no-bare-boolean tests *and* the golden-example test, naming the JSON pointer `/cleanup_verification/facts/probes_work`; adding a `token_digest` field to an `ActivationOutcome` variant fails the token-material test with the offending JSON; giving `ActivatedSandbox` its own emitter instead of sharing the prepared one restarts `seq` at 0 mid-run and fails both live sequence tests (`left: 0, right: 9`); changing one field of one golden example in `docs/lifecycle/*.md` fails that document's snapshot test |
+| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F8) | 7 loom models pass, unchanged — F8 adds no shared-state machinery, and the one lock it touches (`SessionHandle`'s record mutex) is now released *before* the sink is called |
+| `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1; re-run green after F8 |
 | `cargo clippy --workspace --all-targets` | clean |
 | `cargo fmt --all -- --check` | clean |
 
@@ -127,7 +186,7 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
   command_runtime dry-run test (+ F1b: same for 3 flaky tool-sandbox git
   tests). Details: NONO_UPSTREAM_DELTA.md.
 - F2 (fork-only docs): SOURCE_LOCK.json, baseline docs, ADR-0001, this file.
-- F3-F7 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
+- F3-F8 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
   slice in NONO_UPSTREAM_DELTA.md with its disposition and deletion condition.
 
 ## Remaining external blockers

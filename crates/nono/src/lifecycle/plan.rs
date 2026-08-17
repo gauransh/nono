@@ -518,11 +518,13 @@ fn contains_nul(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::capability::{CapabilitySet, NetworkMode};
-    use crate::lifecycle::{EventSink, LifecycleEvent, LifecycleState, Observation};
+    use crate::lifecycle::events::EventEmitter;
+    use crate::lifecycle::{EventSink, LifecycleEvent, LifecycleEventKind, LifecycleState};
     use std::num::{NonZeroU32, NonZeroU64};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use uuid::Uuid;
 
     const ONE_MIB: NonZeroU64 = match NonZeroU64::new(1024 * 1024) {
         Some(value) => value,
@@ -551,7 +553,7 @@ mod tests {
     impl EventSink for CountingSink {
         fn emit(&self, event: &LifecycleEvent) {
             if let Ok(mut guard) = self.events.lock() {
-                guard.push(*event);
+                guard.push(event.clone());
             }
         }
     }
@@ -826,11 +828,15 @@ mod tests {
             Some(emitted) => emitted,
             None => panic!("event sink must survive validation"),
         };
-        emitted.emit(&LifecycleEvent::StateChanged {
-            from: LifecycleState::Planning,
-            to: LifecycleState::Preparing,
-            observation: Observation::DirectlyObserved,
-        });
+        // Emitted through the run's own emitter, which is the only thing that
+        // builds an event: the envelope's session, sequence, and clock are not
+        // a caller's to invent.
+        EventEmitter::new(Some(Arc::clone(emitted)), Uuid::nil(), 1).emit(
+            LifecycleEventKind::StateChanged {
+                from: LifecycleState::Planning,
+                to: LifecycleState::Preparing,
+            },
+        );
         assert_eq!(sink.count(), 1);
         Ok(())
     }

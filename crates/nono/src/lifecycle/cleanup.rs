@@ -448,8 +448,13 @@ fn rebooted_since_capture(identity: &ProcessIdentity) -> Option<CleanupVerificat
 }
 
 /// What a signal-0 probe found.
+///
+/// Crate-internal rather than private to this module: [`super::SupportReport`]
+/// reports whether the probes cleanup verification is built on answer at all on
+/// this host, and it must ask that question with the *same* mechanism this
+/// module uses rather than a second copy that could drift from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Probe {
+pub(crate) enum Probe {
     /// The target exists and is signalable by this process.
     Present,
     /// `ESRCH`: nothing under that number.
@@ -462,7 +467,7 @@ enum Probe {
 
 /// Does a process with this pid exist? Signal 0 checks without delivering.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn probe_pid(pid: i32) -> Result<Probe, UnsupportedReason> {
+pub(crate) fn probe_pid(pid: i32) -> Result<Probe, UnsupportedReason> {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
@@ -471,7 +476,7 @@ fn probe_pid(pid: i32) -> Result<Probe, UnsupportedReason> {
 
 /// Does any process remain in this group? Signal 0 checks without delivering.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn probe_group(pgid: i32) -> Result<Probe, UnsupportedReason> {
+pub(crate) fn probe_group(pgid: i32) -> Result<Probe, UnsupportedReason> {
     use nix::sys::signal::killpg;
     use nix::unistd::Pid;
 
@@ -490,12 +495,12 @@ fn classify(result: nix::Result<()>) -> Probe {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn probe_pid(_pid: i32) -> Result<Probe, UnsupportedReason> {
+pub(crate) fn probe_pid(_pid: i32) -> Result<Probe, UnsupportedReason> {
     Err(UnsupportedReason::NoProcessProbe)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn probe_group(_pgid: i32) -> Result<Probe, UnsupportedReason> {
+pub(crate) fn probe_group(_pgid: i32) -> Result<Probe, UnsupportedReason> {
     Err(UnsupportedReason::NoProcessProbe)
 }
 

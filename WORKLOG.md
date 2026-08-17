@@ -227,3 +227,94 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
   (`StoreForeignOwner`). Planting a directory owned by another uid needs
   privileges the test suite does not have; the code path is one `st_uid`
   comparison beside the permission check that *is* removal-detected.
+
+## 2026-08-17 — Iteration 7: R12 support report + R13 event vocabulary (delta F8)
+
+- R12, `lifecycle/support.rs` (new: 1630 lines of module + a 533-line test module
+  whose bulk is the hand-built golden report): `SupportReport::gather()`,
+  infallible, returning a tree of `Capability<T>` instead of a boolean. Every
+  capability carries three things a `bool` cannot: a four-valued `SupportStatus`
+  (`available`/`partial`/`unavailable`/**`unknown`**), a `Determination` saying
+  *how* we know (`probed_live` / `platform_api` / `declared`), and a typed
+  `SupportReason`. **The contract is locked structurally, not by review:** a test
+  walks the serialized `serde_json::Value` and rejects `Value::Bool` at any
+  depth.
+- The two honesty calls worth recording, because both could have been quietly
+  rounded up:
+  - **macOS Seatbelt is `platform_api`, not `probed_live`.** `sandbox_init` is
+    linked, so its presence is a compile-time fact — but calling it sandboxes
+    *the calling process*, permanently. There is no cheap live probe: a
+    "trivial" profile is still process-wide, so the only honest one forks
+    (which is what `nono setup --check-only` does, and that is CLI machinery).
+    The rationale rides in `reason.why_not_probed` and a macOS test asserts it
+    mentions the fork.
+  - **Linux seccomp user-notification is `unknown`.** Establishing
+    `SECCOMP_FILTER_FLAG_NEW_LISTENER` means installing a filter that cannot be
+    removed from the process that installs it; upstream's fork-isolated probe
+    covers only the static block-all filter, and inventing a second probe is a
+    mechanism this slice was told not to add. A kernel release number is not
+    proof either (`CONFIG_SECCOMP_FILTER` can be off). `unknown` with the reason
+    is the answer; "no" would have been a guess in the safe-looking direction.
+- Everything else is reuse, not new mechanism: Landlock's per-right table comes
+  from upstream's own `Sandbox::detect_abi` + `DetectedAbi::has_*` (zero diff to
+  `sandbox/*`), seccomp from upstream's `probe_seccomp_block_network_support`,
+  and the cleanup probes from `cleanup::{probe_pid, probe_group}` (made
+  `pub(crate)` so the report cannot drift from the mechanism it describes).
+- Two shapes added deliberately to stop a misreading: `pty` (live
+  `posix_openpt`, closed immediately) is **separate from**
+  `interactive_session` (`not_implemented`), so `pty: available` cannot be read
+  as "the lifecycle will give you one"; and `seatbelt_per_port_tcp` appears in
+  the network table as an explicit `platform_cannot_express`, so its absence is
+  stated rather than left to a reader's inference.
+- `event_observation` reports `kernel_denial` as `not_observed` on **both**
+  platforms. The lifecycle installs no seccomp-notify listener, macOS Seatbelt
+  denials reach userspace only through the system log, and the CLI's
+  `log stream` reconstruction is named in the report as *not* library
+  machinery. `dark_spots` is the typed index of the four limits already recorded
+  in the module docs, each pointing back at the file that records it.
+- R13, `lifecycle/events.rs`: `LifecycleEvent` became an envelope
+  (`session_id`, `generation`, `seq`, `observed_at`, `identity`, `observation`)
+  around a closed `LifecycleEventKind` of 14 variants. `StateChanged` is kept —
+  it is the fact existing consumers already act on — and the rest of the
+  vocabulary was added at the points where the facts are observed.
+  **API shape change, recorded in HANDOFF:** the type is now a struct, so a
+  consumer matches `event.what()`.
+- `seq` is owned by a crate-internal `EventEmitter` shared by `Arc` across the
+  prepared→activated handoff, so a run is one unbroken sequence. Documented
+  guarantee: **`seq` is the ordering authority and `observed_at` is not** — a
+  wall clock can step, and a report that told a consumer to sort by it would be
+  handing over an ordering the library cannot promise.
+- `ActivationOutcome` names the check that refused and never the value that
+  failed it. Locked by walking the serialized tree: no key named
+  token/nonce/secret/digest, no array at any depth (every secret here is a
+  `[u8; N]`), and no long alphanumeric run in either the serde or the `Debug`
+  form.
+- `SessionHandle::persist` was restructured to release the record mutex
+  *before* emitting `RecordPersisted`. The write already happened outside the
+  lifecycle lock; this closes the smaller version of the same rule — consumer
+  code must not run under a library lock — and a write that failed emits
+  nothing at all.
+- Schema docs with golden examples, each locked by a snapshot test that reads
+  the document itself (`include_str!` + the `## Golden example` block), so drift
+  fails the build and the assertion names the doc path:
+  `docs/lifecycle/{session-record,support-report,lifecycle-event}-v1.md`. The
+  support-report example is deliberately a **macOS** capture-shaped value: no
+  Linux example is published, because no Linux host has been observed on this
+  stream and a hand-written Linux capture would be exactly the kind of claim
+  this report exists to prevent.
+- Gates: 181 unit (153 + 28) + 25 live (22 + 3) x3; loom 7/7 unchanged;
+  workspace 3621/0/1, 33 suites; strict clippy clean (also under `nono_loom`);
+  fmt clean; both lint scripts exit 0; no new dependency.
+- Removal detection (each restored to green afterwards): adding one `bool` to
+  `CleanupFacts` fails both no-bare-boolean tests and prints the JSON pointer
+  `/cleanup_verification/facts/probes_work`; adding a `token_digest` field to an
+  `ActivationOutcome` variant fails the token-material test with the offending
+  JSON; giving `ActivatedSandbox` its own emitter instead of sharing the
+  prepared one restarts `seq` at 0 mid-run (`left: 0, right: 9`) and fails both
+  live sequence tests; changing `"seq": 4` to `"seq": 5` in the event schema doc
+  fails that document's snapshot test.
+- Not verified, and named as such: every Linux branch of `support.rs`
+  (`gather_landlock`, `gather_seccomp`, `gather_seccomp_user_notification`, the
+  Linux arm of `gather_network_filtering`) is written-unverified behind the R07
+  Docker blocker. The macOS branches and all platform-independent machinery are
+  live-verified on this host.

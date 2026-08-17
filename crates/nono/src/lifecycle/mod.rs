@@ -22,7 +22,11 @@
 //! - [`plan`][self]: [`SandboxPlan`] and its typestate output [`ValidatedPlan`],
 //!   with pre-launch validation that touches no filesystem.
 //! - [`events`][self]: [`EventSink`] and the fidelity-labelled
-//!   [`LifecycleEvent`].
+//!   [`LifecycleEvent`], whose closed [`LifecycleEventKind`] is the whole
+//!   vocabulary this library can witness — events the platform cannot show are
+//!   absent from it, never synthesized.
+//! - [`support`][self]: [`SupportReport`], what this build can actually
+//!   enforce, per capability, with how each answer was established.
 //! - [`prepare`][self]: [`PreparedSandbox`], which forks a child, sandboxes it,
 //!   and holds it before `execve`.
 //! - [`gate`][self]: [`ActivationHandle`] and the single-use release check.
@@ -86,6 +90,7 @@ mod plan;
 mod prepare;
 mod session_store;
 mod state;
+mod support;
 
 // The shared core is crate-internal in every ordinary build. Under `--cfg
 // nono_loom` it is exported so `tests/loom_lifecycle.rs`, which is an
@@ -100,7 +105,7 @@ pub use cleanup::{
     AbsenceBasis, CleanupError, CleanupVerification, IndeterminateReason, SurvivorEvidence,
     UnsupportedReason,
 };
-pub use events::{EventSink, LifecycleEvent, Observation};
+pub use events::{ActivationOutcome, EventSink, LifecycleEvent, LifecycleEventKind, Observation};
 pub use exit::{
     ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
     ReapError, SandboxExit, SupervisorStage,
@@ -117,6 +122,12 @@ pub use session_store::{
     SessionStore, SessionStoreError, SessionSummary, Sessions, reconcile,
 };
 pub use state::{LifecycleOp, LifecycleState, TransitionError};
+pub use support::{
+    Capability, CleanupFacts, DarkSpot, DarkSpotEntry, Determination, EventFamily, EventFidelity,
+    EventObservationSupport, HostFacts, IdentityFacts, KernelFacts, LandlockFacts, LandlockRight,
+    LandlockRightSupport, NetworkFilteringFacts, NetworkMechanism, NetworkMechanismSupport,
+    SUPPORT_REPORT_SCHEMA_VERSION, SupportReason, SupportReport, SupportStatus,
+};
 
 use crate::error::NonoError;
 use thiserror::Error;
@@ -210,6 +221,32 @@ impl From<SessionStoreError> for NonoError {
     fn from(err: SessionStoreError) -> Self {
         Self::Lifecycle(LifecycleError::Session(err))
     }
+}
+
+/// The JSON example a schema doc locks, extracted from the doc itself.
+///
+/// The three `docs/lifecycle/*-v1.md` schema documents each show one example
+/// under a `## Golden example` heading, and each has a test that serializes a
+/// constructed value and compares it against that block. Reading the doc rather
+/// than duplicating the example in the test is what makes the doc the thing
+/// under test: a type that changes shape fails at the doc, with the doc's path
+/// in the message.
+///
+/// Panics rather than returns, because every caller is a test and a doc that
+/// has lost its example is a failure of exactly the kind this exists to catch.
+#[cfg(test)]
+pub(crate) fn doc_golden_example(doc: &str, path: &str) -> String {
+    const HEADING: &str = "## Golden example";
+    let Some((_, section)) = doc.split_once(HEADING) else {
+        panic!("{path} must contain a '{HEADING}' section");
+    };
+    let Some((_, fenced)) = section.split_once("```json\n") else {
+        panic!("{path}: '{HEADING}' must be followed by a ```json block");
+    };
+    let Some((body, _)) = fenced.split_once("```") else {
+        panic!("{path}: the golden ```json block is never closed");
+    };
+    body.trim_end().to_string()
 }
 
 #[cfg(test)]

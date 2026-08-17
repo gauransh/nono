@@ -87,15 +87,24 @@ pub use keystore::{
 // `lifecycle::ResourceLimits` is deliberately NOT re-exported here: it would
 // collide with `resource::ResourceLimits`, which is a different type with a
 // different purpose (cgroup ceilings on the CLI's enforcement path).
+// `lifecycle::Capability` is deliberately NOT re-exported here: at the crate
+// root the name would read as a peer of `CapabilitySet`, which is a different
+// concept entirely (what a sandbox grants, not what a platform supports). It
+// stays reachable as `lifecycle::Capability`.
 pub use lifecycle::{
     ACTIVATION_TOKEN_BYTES, AbsenceBasis, ActivatedSandbox, ActivationError, ActivationHandle,
-    ActivationObservation, CURRENT_SCHEMA_VERSION, CleanupError, CleanupVerification, EventSink,
-    ExitOutcome, GateConfig, IndeterminateReason, LifecycleError, LifecycleEvent, LifecycleOp,
-    LifecycleState, MAX_PLAN_METADATA_BYTES, MAX_RECORD_BYTES, Observation, PRE_EXEC_EXIT_CODE,
-    PlanError, PreExecStage, PrepareError, PreparedSandbox, ProcessIdentity, ReapError,
-    RecoveredSession, RecoveryDecision, SandboxExit, SandboxPlan, SessionMode, SessionRecord,
-    SessionStore, SessionStoreError, SessionSummary, StopError, SupervisorStage, SurvivorEvidence,
-    TransitionError, UnsupportedReason, ValidatedPlan,
+    ActivationObservation, ActivationOutcome, CURRENT_SCHEMA_VERSION, CleanupError, CleanupFacts,
+    CleanupVerification, DarkSpot, DarkSpotEntry, Determination, EventFamily, EventFidelity,
+    EventObservationSupport, EventSink, ExitOutcome, GateConfig, HostFacts, IdentityFacts,
+    IndeterminateReason, KernelFacts, LandlockFacts, LandlockRight, LandlockRightSupport,
+    LifecycleError, LifecycleEvent, LifecycleEventKind, LifecycleOp, LifecycleState,
+    MAX_PLAN_METADATA_BYTES, MAX_RECORD_BYTES, NetworkFilteringFacts, NetworkMechanism,
+    NetworkMechanismSupport, Observation, PRE_EXEC_EXIT_CODE, PlanError, PreExecStage,
+    PrepareError, PreparedSandbox, ProcessIdentity, ReapError, RecoveredSession, RecoveryDecision,
+    SUPPORT_REPORT_SCHEMA_VERSION, SandboxExit, SandboxPlan, SessionMode, SessionRecord,
+    SessionStore, SessionStoreError, SessionSummary, StopError, SupervisorStage, SupportReason,
+    SupportReport, SupportStatus, SurvivorEvidence, TransitionError, UnsupportedReason,
+    ValidatedPlan,
 };
 pub use net_filter::{FilterResult, HostFilter};
 pub use path::try_canonicalize;

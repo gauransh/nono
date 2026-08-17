@@ -104,7 +104,7 @@
 //! See [`super::exit`].
 
 use super::cleanup::{CleanupError, CleanupVerification, DeathObservation, verify_and_record};
-use super::events::{EventSink, LifecycleEvent, Observation};
+use super::events::{ActivationOutcome, EventEmitter, LifecycleEventKind};
 use super::exit::{
     ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
     STATUS_RECORD_LEN, SandboxExit, SupervisorStage, TAG_GATE_READY, kill_and_reap,
@@ -278,7 +278,12 @@ pub struct PreparedSandbox {
     prepared_at: Instant,
     child_owned: bool,
     last_exit: Option<SandboxExit>,
-    event_sink: Option<Arc<dyn EventSink>>,
+    /// This run's event vocabulary and its `seq` counter.
+    ///
+    /// Shared by `Arc` with the [`ActivatedSandbox`] this hands off to, so the
+    /// run keeps one unbroken sequence across the handoff rather than starting
+    /// a second one in the middle of itself.
+    events: Arc<EventEmitter>,
     /// The durable record this run writes to, when it has one.
     ///
     /// `None` for [`Self::prepare`], which is unchanged and leaves nothing on
@@ -326,6 +331,18 @@ impl PreparedSandbox {
         let prepared_at = Instant::now();
         let state = LifecycleState::Planning.apply(LifecycleOp::BeginPrepare)?;
 
+        // Built before the fork so the first event can be reported before the
+        // child exists — which is also why it is the one event with no
+        // identity. The child inherits the `Arc` and never touches it: every
+        // child path ends in `_exit` or `execve`, so nothing on that side ever
+        // emits or drops.
+        let events = Arc::new(EventEmitter::new(
+            plan.event_sink().cloned(),
+            session_id,
+            FIRST_GENERATION,
+        ));
+        events.emit(LifecycleEventKind::PrepareStarted);
+
         // Built before the fork so the child's path allocates nothing. The
         // parent never touches it: after the fork its descriptor numbers name
         // ends the parent has closed.
@@ -365,10 +382,16 @@ impl PreparedSandbox {
                 drop(gate_read);
                 drop(status_write);
 
+                let identity = ProcessIdentity::capture(child.as_raw());
+                // Every event from here on names the child. Set once: a run has
+                // one child, and an identity that could be replaced would let a
+                // later event relabel an earlier one.
+                events.set_identity(identity.clone());
+
                 let mut prepared = Self {
                     session_id,
                     generation: FIRST_GENERATION,
-                    identity: ProcessIdentity::capture(child.as_raw()),
+                    identity,
                     // The child makes this true with `setpgid(0, 0)`; the
                     // "at the gate" record the parent waits for below is what
                     // confirms it did.
@@ -386,7 +409,7 @@ impl PreparedSandbox {
                     prepared_at,
                     child_owned: true,
                     last_exit: None,
-                    event_sink: plan.event_sink().cloned(),
+                    events,
                     // Attached afterwards by `SessionStore::prepare`, which can
                     // only build the record once the identity and process group
                     // below are facts.
@@ -444,6 +467,15 @@ impl PreparedSandbox {
     /// The process group the child leads, which is its own pid.
     pub(crate) fn process_group(&self) -> i32 {
         self.process_group
+    }
+
+    /// This run's emitter, for the durable record to report its own writes
+    /// through.
+    ///
+    /// Handed out rather than copied: a record that reported its writes on a
+    /// second counter would interleave two sequences into one sink.
+    pub(crate) fn events(&self) -> Arc<EventEmitter> {
+        Arc::clone(&self.events)
     }
 
     /// Start writing this run's state to a durable record.
@@ -510,12 +542,14 @@ impl PreparedSandbox {
         handle: &ActivationHandle,
     ) -> Result<ActivatedSandbox, ActivationError> {
         if handle.session_id() != self.session_id {
+            self.report_activation(ActivationOutcome::RefusedWrongSession);
             return Err(ActivationError::WrongSession {
                 expected: self.session_id,
                 supplied: handle.session_id(),
             });
         }
         if handle.generation() != self.generation {
+            self.report_activation(ActivationOutcome::RefusedWrongGeneration);
             return Err(ActivationError::WrongGeneration {
                 expected: self.generation,
                 supplied: handle.generation(),
@@ -531,6 +565,7 @@ impl PreparedSandbox {
         // which is exactly what the claim is for.
         let observed = self.shared.state();
         if observed != LifecycleState::Prepared {
+            self.report_activation(ActivationOutcome::RefusedGateClosed { state: observed });
             return Err(ActivationError::from_closed_gate(observed));
         }
         if self.has_expired() {
@@ -538,9 +573,11 @@ impl PreparedSandbox {
             // now or ever, so the gate is closed and the child is stopped
             // before the token is even looked at. A later attempt finds the
             // stopped state this leaves behind.
+            self.report_activation(ActivationOutcome::RefusedExpired);
             return Err(self.expire());
         }
         if !ct_eq(&token_digest(handle.token()), &self.token_digest) {
+            self.report_activation(ActivationOutcome::RefusedInvalidToken);
             return Err(ActivationError::InvalidActivationToken);
         }
 
@@ -560,16 +597,26 @@ impl PreparedSandbox {
 
         let (change, released) = match claimed {
             Ok(claimed) => claimed,
-            Err(err) => return Err(ActivationError::from_closed_gate(err.from)),
+            Err(err) => {
+                // Lost the claim to another party, which is the same fact from
+                // the caller's side as finding the gate already closed.
+                self.report_activation(ActivationOutcome::RefusedGateClosed { state: err.from });
+                return Err(ActivationError::from_closed_gate(err.from));
+            }
         };
         // Reported after the write, not before: a sink is consumer code and
         // must never run inside the lock that the gate's single-use guarantee
-        // depends on.
+        // depends on. The fact first, then the transition it caused — the same
+        // order every other pair in this module uses.
+        self.report_activation(ActivationOutcome::Accepted);
         self.report(change);
 
         if let Err(errno) = released {
             return Err(self.fail_activation(SupervisorStage::Release, errno));
         }
+        // The release write landed inside the claim above; this is the report
+        // of it, not the doing of it.
+        self.events.emit(LifecycleEventKind::Released);
 
         let record = match self.status.as_mut() {
             Some(status) => read_status_record(status),
@@ -581,6 +628,7 @@ impl PreparedSandbox {
             // window just before it, which is why the observation handed on
             // here is the ambiguous one. `wait` resolves it.
             Ok(None) => {
+                self.events.emit(LifecycleEventKind::ExecObserved);
                 self.transition(LifecycleOp::ExecObserved)
                     .map_err(|err| ActivationError::GateUnavailable { state: err.from })?;
                 self.close_gate();
@@ -594,7 +642,7 @@ impl PreparedSandbox {
                     self.process_group,
                     self.shared.state(),
                     ActivationObservation::ExecOrKilledPreExec,
-                    self.event_sink.clone(),
+                    Arc::clone(&self.events),
                     self.session.clone(),
                 ))
             }
@@ -630,13 +678,16 @@ impl PreparedSandbox {
         let outcome = self.observe_gate_ending();
         let reaped = reap(self.identity.pid())?;
         self.child_owned = false;
+        let ended = outcome.unwrap_or(reaped);
+        self.events
+            .emit(LifecycleEventKind::StopObserved { outcome: ended });
         self.transition(LifecycleOp::StopObserved)
             .map_err(|err| StopError::NotStoppable { state: err.from })?;
         self.status = None;
         self.zeroize_secrets();
 
         let exit = SandboxExit::new(
-            outcome.unwrap_or(reaped),
+            ended,
             ActivationObservation::NotActivated,
             self.identity.clone(),
         );
@@ -678,6 +729,11 @@ impl PreparedSandbox {
         };
         let (verification, change) =
             verify_and_record(&self.shared, &self.identity, self.process_group, death)?;
+        // Every verdict is reported, not only a proof of absence: "something is
+        // still there" is exactly as much a fact as "nothing is".
+        self.events.emit(LifecycleEventKind::CleanupVerdict {
+            verdict: verification.clone(),
+        });
         if let Some(change) = change {
             self.report(change);
         }
@@ -703,6 +759,7 @@ impl PreparedSandbox {
     /// returns `Ok`, no interleaving can still reach the release write.
     fn begin_stop(&mut self) -> Result<LifecycleState, TransitionError> {
         let change = self.shared.begin_stop()?;
+        self.events.emit(LifecycleEventKind::StopRequested);
         self.report(change);
         Ok(change.to)
     }
@@ -721,16 +778,22 @@ impl PreparedSandbox {
     /// [`super::SessionStore::recover`] reconciles a loaded record against the
     /// live system instead of believing it.
     fn report(&self, change: Transition) {
-        if let Some(sink) = &self.event_sink {
-            sink.emit(&LifecycleEvent::StateChanged {
-                from: change.from,
-                to: change.to,
-                observation: Observation::DirectlyObserved,
-            });
-        }
+        self.events.emit(LifecycleEventKind::StateChanged {
+            from: change.from,
+            to: change.to,
+        });
         if let Some(session) = &self.session {
             session.persist(change.to, self.recorded_activation());
         }
+    }
+
+    /// Report what an activation attempt did.
+    ///
+    /// One event per attempt, emitted at the point the outcome is known and
+    /// carrying no token material — see [`ActivationOutcome`].
+    fn report_activation(&self, outcome: ActivationOutcome) {
+        self.events
+            .emit(LifecycleEventKind::ActivationAttempted { outcome });
     }
 
     /// Write the run's end to the durable record, if there is one.
@@ -758,6 +821,12 @@ impl PreparedSandbox {
         };
         match classify_prepare_record(record) {
             Ok(()) => {
+                // Two facts from one record, and deliberately so: the trusted
+                // child writes it *after* the sandbox is applied and *while*
+                // waiting at the gate, so the record's arrival is a direct
+                // observation of both.
+                self.events.emit(LifecycleEventKind::SandboxApplied);
+                self.events.emit(LifecycleEventKind::GateReady);
                 self.transition(LifecycleOp::PrepareSucceeded)?;
                 Ok(())
             }
@@ -790,6 +859,10 @@ impl PreparedSandbox {
             if may_write && let Some(message) = message {
                 let _ = gate.write_all(&message);
             }
+            // Reported only when a live gate was actually closed here, so a
+            // second abort — a stop followed by a drop, say — is not a second
+            // event about the same gate.
+            self.events.emit(LifecycleEventKind::GateAborted);
         }
     }
 
@@ -825,6 +898,10 @@ impl PreparedSandbox {
         } else {
             ExitOutcome::PreExecFailure { stage, errno }
         };
+        // The child's own record is how its death was observed here, so the
+        // fact is reported before the transition it causes.
+        self.events
+            .emit(LifecycleEventKind::ChildExited { outcome });
         let _ = self.transition(LifecycleOp::PrepareFailed);
         let exit = SandboxExit::new(
             outcome,
@@ -843,11 +920,11 @@ impl PreparedSandbox {
     /// The child told us where it stopped, so this is one of the cases where
     /// "the program never ran" is a fact rather than a guess.
     fn fail_pre_exec(&mut self, stage: PreExecStage, errno: i32) -> ActivationError {
+        let outcome = ExitOutcome::PreExecFailure { stage, errno };
+        self.events
+            .emit(LifecycleEventKind::ChildExited { outcome });
         let _ = self.transition(LifecycleOp::ActivateFailed);
-        self.finish_failed(
-            Some(ExitOutcome::PreExecFailure { stage, errno }),
-            ActivationObservation::NotActivated,
-        );
+        self.finish_failed(Some(outcome), ActivationObservation::NotActivated);
         ActivationError::PreExecFailed { stage, errno }
     }
 
@@ -857,6 +934,8 @@ impl PreparedSandbox {
     /// as `execve` — so the child is killed rather than waited for, and the
     /// activation question is left open.
     fn fail_activation(&mut self, stage: SupervisorStage, errno: i32) -> ActivationError {
+        self.events
+            .emit(LifecycleEventKind::SupervisorFailure { stage, errno });
         let _ = self.transition(LifecycleOp::ActivateFailed);
         let observation = match stage {
             // The release never landed, so the child never left the gate.
@@ -908,9 +987,12 @@ impl PreparedSandbox {
             let recorded = self.observe_gate_ending();
             if let Ok(reaped) = reap(self.identity.pid()) {
                 self.child_owned = false;
+                let ended = recorded.unwrap_or(reaped);
+                self.events
+                    .emit(LifecycleEventKind::StopObserved { outcome: ended });
                 let _ = self.transition(LifecycleOp::StopObserved);
                 self.last_exit = Some(SandboxExit::new(
-                    recorded.unwrap_or(reaped),
+                    ended,
                     ActivationObservation::NotActivated,
                     self.identity.clone(),
                 ));

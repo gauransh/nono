@@ -21,9 +21,9 @@
 
 use nono::lifecycle::{
     AbsenceBasis, ActivationError, ActivationObservation, CleanupError, CleanupVerification,
-    EventSink, ExitOutcome, GateConfig, LifecycleEvent, LifecycleState, PreExecStage, PrepareError,
-    PreparedSandbox, RecoveryDecision, SandboxPlan, SessionRecord, SessionStore, StopError,
-    SurvivorEvidence, ValidatedPlan,
+    EventSink, ExitOutcome, GateConfig, LifecycleEvent, LifecycleEventKind, LifecycleState,
+    Observation, PreExecStage, PrepareError, PreparedSandbox, ProcessIdentity, RecoveryDecision,
+    SandboxPlan, SessionRecord, SessionStore, StopError, SurvivorEvidence, ValidatedPlan,
 };
 use nono::{AccessMode, CapabilitySet};
 use std::path::Path;
@@ -668,37 +668,130 @@ fn two_overlapping_prepares_do_not_capture_each_others_channels() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. The consumer's event sink sees the whole run.
+// 14. The consumer's event sink sees the whole run, in the whole vocabulary.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn the_event_sink_observes_every_state_change_including_the_exit() {
-    #[derive(Default)]
-    struct RecordingSink {
-        seen: Mutex<Vec<(LifecycleState, LifecycleState)>>,
-    }
+/// A sink that keeps every event, for the sequence assertions below.
+#[derive(Default)]
+struct RecordingSink {
+    seen: Mutex<Vec<LifecycleEvent>>,
+}
 
-    impl EventSink for RecordingSink {
-        fn emit(&self, event: &LifecycleEvent) {
-            let LifecycleEvent::StateChanged { from, to, .. } = event;
-            if let Ok(mut seen) = self.seen.lock() {
-                seen.push((*from, *to));
-            }
+impl EventSink for RecordingSink {
+    fn emit(&self, event: &LifecycleEvent) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(event.clone());
         }
     }
+}
 
-    let dir = temp_dir();
-    let sink = Arc::new(RecordingSink::default());
-    let plan = SandboxPlan::new("/bin/echo")
-        .arg("watched")
-        .capabilities(capabilities(dir.path()))
+impl RecordingSink {
+    fn recorded(&self) -> Vec<LifecycleEvent> {
+        match self.seen.lock() {
+            Ok(seen) => seen.clone(),
+            Err(err) => panic!("the sink's records must be readable: {err}"),
+        }
+    }
+}
+
+/// A watched plan for `program args…`, writable only inside `dir`.
+fn watched_plan(
+    dir: &Path,
+    program: &str,
+    args: &[&str],
+    sink: &Arc<RecordingSink>,
+) -> ValidatedPlan {
+    let plan = SandboxPlan::new(program)
+        .args(args.iter().copied())
+        .capabilities(capabilities(dir))
         .event_sink(sink.clone() as Arc<dyn EventSink>);
-    let plan = match plan.validate() {
+    match plan.validate() {
         Ok(plan) => plan,
         Err(err) => panic!("test plan must validate: {err}"),
-    };
+    }
+}
 
-    let (mut held, handle) = prepared(plan);
+/// The event kinds, in order, reduced to something an assertion can read.
+fn shapes(events: &[LifecycleEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| match event.what() {
+            LifecycleEventKind::StateChanged { from, to } => format!("state_changed:{from}->{to}"),
+            LifecycleEventKind::PrepareStarted => "prepare_started".to_string(),
+            LifecycleEventKind::SandboxApplied => "sandbox_applied".to_string(),
+            LifecycleEventKind::GateReady => "gate_ready".to_string(),
+            LifecycleEventKind::ActivationAttempted { outcome } => {
+                format!("activation_attempted:{outcome:?}")
+            }
+            LifecycleEventKind::Released => "released".to_string(),
+            LifecycleEventKind::ExecObserved => "exec_observed".to_string(),
+            LifecycleEventKind::ChildExited { outcome } => format!("child_exited:{outcome:?}"),
+            LifecycleEventKind::StopRequested => "stop_requested".to_string(),
+            LifecycleEventKind::StopObserved { .. } => "stop_observed".to_string(),
+            LifecycleEventKind::GateAborted => "gate_aborted".to_string(),
+            LifecycleEventKind::SupervisorFailure { stage, errno } => {
+                format!("supervisor_failure:{stage}:{errno}")
+            }
+            LifecycleEventKind::CleanupVerdict { verdict } => {
+                format!("cleanup_verdict:{verdict}")
+            }
+            LifecycleEventKind::RecordPersisted { schema_version } => {
+                format!("record_persisted:{schema_version}")
+            }
+        })
+        .collect()
+}
+
+/// The envelope invariants every run's stream must satisfy.
+fn assert_envelope_is_sound(events: &[LifecycleEvent], session_id: uuid::Uuid, pid: i32) {
+    let mut expected_seq = 0_u64;
+    let mut previous_time = None;
+    for event in events {
+        // Strictly increasing *and* gapless: a gap would mean an event was
+        // allocated a number and then never handed over, which is the one thing
+        // the counter's placement immediately before the sink call rules out.
+        assert_eq!(
+            event.seq(),
+            expected_seq,
+            "seq must count this run's events from zero without gaps: {:?}",
+            shapes(events)
+        );
+        expected_seq = expected_seq.saturating_add(1);
+
+        // Advisory, not an ordering key — but a stream whose wall clock ran
+        // backwards inside one run would mean the clock was read somewhere
+        // other than at the observation.
+        if let Some(previous) = previous_time {
+            assert!(
+                event.observed_at() >= previous,
+                "observed_at must not run backwards within a run"
+            );
+        }
+        previous_time = Some(event.observed_at());
+
+        assert_eq!(event.session_id(), Some(session_id));
+        assert_eq!(event.generation(), 1);
+        assert_eq!(event.observation(), Observation::DirectlyObserved);
+        // Only the pre-fork event has no child to name.
+        match event.what() {
+            LifecycleEventKind::PrepareStarted => assert_eq!(event.identity(), None),
+            _ => assert_eq!(
+                event.identity().map(ProcessIdentity::pid),
+                Some(pid),
+                "every event after the fork names the child"
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_event_sink_observes_the_whole_vocabulary_of_a_happy_run() {
+    let dir = temp_dir();
+    let sink = Arc::new(RecordingSink::default());
+    let (mut held, handle) = prepared(watched_plan(dir.path(), "/bin/echo", &["watched"], &sink));
+    let session_id = held.session_id();
+    let pid = held.identity().pid();
+
     let mut running = match held.activate(&handle) {
         Ok(running) => running,
         Err(err) => panic!("activation must succeed: {err}"),
@@ -706,22 +799,134 @@ fn the_event_sink_observes_every_state_change_including_the_exit() {
     if let Err(err) = running.wait() {
         panic!("wait must observe the exit: {err}");
     }
+    match running.verify_cleanup() {
+        Ok(verdict) => assert!(verdict.is_confirmed_absent(), "{verdict:?}"),
+        Err(err) => panic!("cleanup verification must be legal after an exit: {err}"),
+    }
 
-    let seen = match sink.seen.lock() {
-        Ok(seen) => seen.clone(),
-        Err(err) => panic!("the sink's records must be readable: {err}"),
-    };
-    // The last transition is emitted by the activated handle, not the prepared
-    // one: a sink that stopped hearing about the run at the handoff would go
-    // quiet exactly when the program was doing something.
+    let seen = sink.recorded();
+    // The whole run, in order. Two properties are load-bearing here: the fact
+    // always precedes the state change it caused, and the last events come from
+    // the *activated* handle — a sink that stopped hearing about the run at the
+    // handoff would go quiet exactly when the program was doing something.
     assert_eq!(
-        seen,
+        shapes(&seen),
         vec![
-            (LifecycleState::Preparing, LifecycleState::Prepared),
-            (LifecycleState::Prepared, LifecycleState::Activating),
-            (LifecycleState::Activating, LifecycleState::Running),
-            (LifecycleState::Running, LifecycleState::Exited),
+            "prepare_started",
+            "sandbox_applied",
+            "gate_ready",
+            "state_changed:preparing->prepared",
+            "activation_attempted:Accepted",
+            "state_changed:prepared->activating",
+            "released",
+            "exec_observed",
+            "state_changed:activating->running",
+            "child_exited:Exited { code: 0 }",
+            "state_changed:running->exited",
+            "cleanup_verdict:confirmed_absent",
+            "state_changed:exited->cleanup_verified",
         ]
+    );
+    assert_envelope_is_sound(&seen, session_id, pid);
+}
+
+// ---------------------------------------------------------------------------
+// 14b. The same, for a run that is stopped rather than allowed to finish.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_event_sink_observes_a_stopped_run_as_a_stop_not_an_exit() {
+    let dir = temp_dir();
+    let sink = Arc::new(RecordingSink::default());
+    let (mut held, handle) = prepared(watched_plan(dir.path(), "/bin/sleep", &["30"], &sink));
+    let session_id = held.session_id();
+    let pid = held.identity().pid();
+
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => panic!("activation must succeed: {err}"),
+    };
+    match running.stop() {
+        Ok(exit) => assert_eq!(
+            exit.outcome(),
+            ExitOutcome::Signaled {
+                signal: libc::SIGKILL
+            }
+        ),
+        Err(err) => panic!("stop must observe the death: {err}"),
+    }
+    match running.verify_cleanup() {
+        Ok(verdict) => assert!(verdict.is_confirmed_absent(), "{verdict:?}"),
+        Err(err) => panic!("cleanup verification must be legal after a stop: {err}"),
+    }
+
+    let seen = sink.recorded();
+    // A stop reports `stop_requested` / `stop_observed`, never `child_exited`:
+    // the two are different facts about the same death, and collapsing them
+    // would lose which one the consumer asked for.
+    assert_eq!(
+        shapes(&seen),
+        vec![
+            "prepare_started",
+            "sandbox_applied",
+            "gate_ready",
+            "state_changed:preparing->prepared",
+            "activation_attempted:Accepted",
+            "state_changed:prepared->activating",
+            "released",
+            "exec_observed",
+            "state_changed:activating->running",
+            "stop_requested",
+            "state_changed:running->stopping",
+            "stop_observed",
+            "state_changed:stopping->stopped",
+            "cleanup_verdict:confirmed_absent",
+            "state_changed:stopped->cleanup_verified",
+        ]
+    );
+    assert_envelope_is_sound(&seen, session_id, pid);
+}
+
+// ---------------------------------------------------------------------------
+// 14c. A refused activation is reported, and carries nothing that could
+//      release a child.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_refused_activation_is_reported_without_any_token_material() {
+    let dir = temp_dir();
+    let sink = Arc::new(RecordingSink::default());
+    let (mut held, _handle) = prepared(watched_plan(dir.path(), "/bin/echo", &["refused"], &sink));
+
+    // A real handle, from a real second run: the token in it is genuine, and
+    // this is the path where a careless implementation would report it.
+    let other = temp_dir();
+    let (_second, foreign) = prepared(plan(other.path(), "/bin/echo", &["other"]));
+    assert!(
+        held.activate(&foreign).is_err(),
+        "a foreign handle must be refused"
+    );
+
+    let seen = sink.recorded();
+    let attempts: Vec<&LifecycleEvent> = seen
+        .iter()
+        .filter(|event| matches!(event.what(), LifecycleEventKind::ActivationAttempted { .. }))
+        .collect();
+    assert_eq!(attempts.len(), 1, "one attempt, one event");
+    assert_eq!(
+        shapes(&seen).last().map(String::as_str),
+        Some("activation_attempted:RefusedWrongSession")
+    );
+
+    // Serialized, because that is the form a consumer forwards or logs.
+    let json = match serde_json::to_string(attempts[0]) {
+        Ok(json) => json,
+        Err(err) => panic!("an event must serialize: {err}"),
+    };
+    assert_eq!(
+        json.matches("token").count(),
+        0,
+        "no field of a refusal may name the token: {json}"
     );
 }
 
