@@ -422,6 +422,15 @@ mod tests {
 
     #[test]
     fn shell_dry_run_rejects_block_net_with_upstream_proxy() {
+        // `run_shell` resolves the nono state root from `$HOME`/`$XDG_STATE_HOME`,
+        // so hold ENV_LOCK to keep a concurrent env-mutating test from swapping
+        // in a temp HOME (on macOS that lands under /private/var and collides
+        // with the system-read group, failing sandbox init before the check
+        // under test runs).
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let args = ShellArgs {
             sandbox: SandboxArgs {
                 dry_run: true,

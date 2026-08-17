@@ -30,7 +30,7 @@ fail=0
 # --------------------------------------------------------------------------
 
 alias_lines=$(
-  grep -RnE 'alias = "' crates/ 2>/dev/null \
+  grep -RnE 'alias = "' crates 2>/dev/null \
     | grep -vE ':[[:space:]]*(//|#!)' \
     | grep -vE 'crates/nono-cli/tests/lint_scripts_negative_paths\.rs:' \
     || true
@@ -97,7 +97,7 @@ done <<< "$alias_lines"
 # kept for user-facing back-compat with no scheduled removal).
 # --------------------------------------------------------------------------
 
-markers=$(grep -RnE '^[[:space:]]*///[[:space:]]*ALIAS\(' crates/ 2>/dev/null \
+markers=$(grep -RnE '^[[:space:]]*///[[:space:]]*ALIAS\(' crates 2>/dev/null \
   | grep -vE 'crates/nono-cli/tests/lint_scripts_negative_paths\.rs:' \
   || true)
 
@@ -123,7 +123,7 @@ approved='(main\.rs|app_runtime\.rs|profile/mod\.rs|cli\.rs)'
 # `crate::deprecated_(schema|policy)::...` access that isn't behind a
 # `use`. Strip self-refs inside the deprecated modules themselves.
 unapproved=$(
-  grep -RnE 'crate::deprecated_(schema|policy)::' crates/ 2>/dev/null \
+  grep -RnE 'crate::deprecated_(schema|policy)::' crates 2>/dev/null \
     | grep -vE ":[[:space:]]*//" \
     | grep -vE "deprecated_(schema|policy)\.rs:" \
     | grep -vE 'crates/nono-cli/tests/lint_scripts_negative_paths\.rs:' \

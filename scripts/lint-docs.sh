@@ -98,7 +98,7 @@ temporary_allow=(
 allow_pattern=$(IFS='|'; echo "${permanent_allow[*]}|${temporary_allow[*]}")
 
 hits=$(
-  grep -RnE "$forbidden" crates/ docs/ tests/ qa-profiles/ README.md 2>/dev/null \
+  grep -RnE "$forbidden" crates docs tests qa-profiles README.md 2>/dev/null \
     | grep -vE "$allow_pattern" \
     || true
 )

@@ -1049,6 +1049,13 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
     #[test]
     fn git_read_toplevel_returns_absolute_path_in_regular_repo() {
         use std::process::Command;
+
+        // Spawning real `git` resolves it through `$PATH`; hold ENV_LOCK so the
+        // stub-`git` tests below cannot swap PATH out from under the spawn.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).expect("mkdir repo");
@@ -1075,6 +1082,13 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
     #[test]
     fn git_read_toplevel_returns_worktree_root_in_linked_worktree() {
         use std::process::Command;
+
+        // Spawning real `git` resolves it through `$PATH`; hold ENV_LOCK so the
+        // stub-`git` tests below cannot swap PATH out from under the spawn.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).expect("mkdir repo");
@@ -1136,6 +1150,13 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
     #[test]
     fn git_read_toplevel_parent_returns_parent_of_repo_root() {
         use std::process::Command;
+
+        // Spawning real `git` resolves it through `$PATH`; hold ENV_LOCK so the
+        // stub-`git` tests below cannot swap PATH out from under the spawn.
+        let _env_lock = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).expect("mkdir repo");
