@@ -794,3 +794,227 @@ fn shell_quote(path: &Path) -> String {
     let text = string_of(path);
     format!("'{}'", text.replace('\'', "'\\''"))
 }
+
+// ===========================================================================
+// diag(modes): TEMPORARY DIAGNOSTIC — DELETE WITH THE FIX.
+//
+// Why: `read_contents_granted_reads_and_ungranted_is_denied` fails only on the
+// GitHub macos-latest runner (Darwin 26, macOS 26) and passes on Darwin 23.
+// The runner's gate log already shows the child printing
+// `cat: stdout: Operation not permitted` — an error about the *inherited
+// stdout*, not about the subject file. This test settles which call it is and
+// whether the subject read itself works, from the failing host.
+//
+// It ends in a panic on purpose: libtest only prints a test's captured output
+// when the test fails.
+// ===========================================================================
+
+/// Run a program *outside* any sandbox and report everything it said.
+fn diag_host_command(program: &str, args: &[&str]) -> String {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => format!(
+            "status={:?} stdout={:?} stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(err) => format!("(spawn failed: {err})"),
+    }
+}
+
+/// What a standard stream really is: its path (if it has one) and its vnode.
+fn diag_fd(fd: std::os::unix::io::RawFd) -> String {
+    let mut buf = [0_u8; 1024];
+    // SAFETY: temporary diagnostic. `buf` is a live PATH_MAX-sized buffer,
+    // which is what F_GETPATH writes into, and `fd` is a standard stream.
+    let got = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr().cast::<libc::c_char>()) };
+    let path = if got == 0 {
+        let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).to_string()
+    } else {
+        format!("(F_GETPATH failed: {})", std::io::Error::last_os_error())
+    };
+    // SAFETY: temporary diagnostic. `stat` is a live, zeroed `libc::stat` and
+    // `fd` is a standard stream.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let rc = unsafe { libc::fstat(fd, &raw mut stat) };
+    let kind = if rc == 0 {
+        format!(
+            "st_mode=0o{:o} st_blksize={}",
+            stat.st_mode, stat.st_blksize
+        )
+    } else {
+        format!("(fstat failed: {})", std::io::Error::last_os_error())
+    };
+    format!("fd {fd}: path={path} {kind}")
+}
+
+/// The path behind a descriptor, when it has one.
+fn diag_fd_path(fd: std::os::unix::io::RawFd) -> Option<std::path::PathBuf> {
+    let mut buf = [0_u8; 1024];
+    // SAFETY: as in `diag_fd`.
+    let got = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr().cast::<libc::c_char>()) };
+    if got != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    let text = String::from_utf8_lossy(&buf[..end]).to_string();
+    let path = std::path::PathBuf::from(text);
+    if path.is_file() { Some(path) } else { None }
+}
+
+/// Run one sandboxed probe and print its outcome under `label`.
+fn diag_run(label: &str, caps: CapabilitySet, program: &str, args: &[&str]) {
+    let plan = SandboxPlan::new(program)
+        .args(args.iter().copied())
+        .capabilities(caps);
+    let outcome = match plan.validate() {
+        Ok(plan) => format!("{:?}", run_exit(plan).outcome()),
+        Err(err) => format!("(validate refused: {err})"),
+    };
+    println!("diag[{label}]: {program} {args:?} -> {outcome}");
+}
+
+#[test]
+fn diag_read_contents_on_this_host() {
+    println!(
+        "diag: sw_vers  {}",
+        diag_host_command("/usr/bin/sw_vers", &[])
+    );
+    println!(
+        "diag: uname -a {}",
+        diag_host_command("/usr/bin/uname", &["-a"])
+    );
+    for fd in [0, 1, 2] {
+        println!("diag: {}", diag_fd(fd));
+    }
+
+    let dir = temp_dir();
+    let file = dir.path().join("subject");
+    write_file(&file, "contents\n");
+    let arg = string_of(&file);
+    let canonical = match std::fs::canonicalize(&file) {
+        Ok(path) => string_of(&path),
+        Err(err) => format!("(canonicalize failed: {err})"),
+    };
+    println!("diag: subject literal   {arg}");
+    println!("diag: subject canonical {canonical}");
+
+    let read = FsModeSet::of(&[FsMode::ReadContents, FsMode::ReadMetadata]);
+
+    // 1. The failing probe, reproduced.
+    diag_run(
+        "cat-baseline",
+        caps_with(dir.path(), read),
+        "/bin/cat",
+        &[&arg],
+    );
+
+    // 2. The canonical spelling of the same file, in case the literal /var
+    //    spelling is what the newer kernel objects to.
+    diag_run(
+        "cat-canonical-arg",
+        caps_with(dir.path(), read),
+        "/bin/cat",
+        &[&canonical],
+    );
+
+    // 3. Readers that do not touch stdout the way cat(1) does. `cmp -s` reads
+    //    both files' bytes and prints nothing at all; `wc -l` must read every
+    //    byte to count lines.
+    diag_run(
+        "cmp-silent",
+        caps_with(dir.path(), read),
+        "/usr/bin/cmp",
+        &["-s", &arg, &arg],
+    );
+    diag_run(
+        "wc-lines",
+        caps_with(dir.path(), read),
+        "/usr/bin/wc",
+        &["-l", &arg],
+    );
+
+    // 4. cat again, with the *inherited stdout's own path* granted, one mode at
+    //    a time. Whichever of these turns the exit into 0 names the operation
+    //    macOS 26 is checking that Darwin 23 is not.
+    match diag_fd_path(1) {
+        Some(stdout_path) => {
+            println!("diag: stdout path = {}", stdout_path.display());
+            for (label, modes) in [
+                ("stdout-metadata", FsModeSet::of(&[FsMode::ReadMetadata])),
+                ("stdout-write", FsModeSet::of(&[FsMode::Write])),
+                (
+                    "stdout-read-write",
+                    FsModeSet::of(&[FsMode::ReadContents, FsMode::ReadMetadata, FsMode::Write]),
+                ),
+            ] {
+                let caps = match caps_with(dir.path(), read).allow_file_modes(&stdout_path, modes) {
+                    Ok(caps) => caps,
+                    Err(err) => {
+                        println!("diag[cat+{label}]: (grant refused: {err})");
+                        continue;
+                    }
+                };
+                diag_run(&format!("cat+{label}"), caps, "/bin/cat", &[&arg]);
+            }
+        }
+        None => println!("diag: stdout has no path (pipe or tty); skipped the stdout grants"),
+    }
+
+    // 5. The same read from a subject that is not under /var/folders, in case
+    //    the per-user temp confinement is what differs.
+    let repo_temp = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag-modes-tmp");
+    if let Err(err) = std::fs::create_dir_all(&repo_temp) {
+        println!("diag: repo-local subject unavailable: {err}");
+    } else {
+        let repo_file = repo_temp.join("subject");
+        write_file(&repo_file, "contents\n");
+        let repo_arg = string_of(&repo_file);
+        diag_run(
+            "cat-repo-local",
+            caps_with(&repo_temp, read),
+            "/bin/cat",
+            &[&repo_arg],
+        );
+        let _ = std::fs::remove_dir_all(&repo_temp);
+    }
+
+    // 6. What the kernel itself logged. The predicate is the one nono-cli's
+    //    sandbox_log.rs uses.
+    match std::process::Command::new("/usr/bin/log")
+        .args([
+            "show",
+            "--last",
+            "2m",
+            "--style",
+            "compact",
+            "--predicate",
+            "((processID == 0) AND (senderImagePath CONTAINS \"/Sandbox\")) OR \
+             (process == \"sandboxd\") OR (subsystem == \"com.apple.sandbox.reporting\")",
+        ])
+        .output()
+    {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let interesting: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("deny") || line.contains("Sandbox"))
+                .collect();
+            println!(
+                "diag: log show status={:?} lines={} matched={} stderr={:?}",
+                out.status.code(),
+                text.lines().count(),
+                interesting.len(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            for line in interesting.iter().rev().take(40) {
+                println!("diag: log {line}");
+            }
+        }
+        Err(err) => println!("diag: log show unavailable: {err}"),
+    }
+
+    panic!("diag(modes): temporary diagnostic — read the captured output above");
+}
