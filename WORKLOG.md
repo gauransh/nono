@@ -1358,9 +1358,10 @@ macOS 26 evaluates `file-read-metadata` for an `fstat(2)` of a descriptor the co
 merely **inherited**. macOS 14 does not evaluate it at all — verified on the host by handing
 the profile an explicit `(deny file-read-metadata (literal "<stdout's path>"))` and watching
 `cat` succeed anyway. Writes to that descriptor are unchecked on both (`wc` wrote its count
-through it on the runner, and granting `write` on the path changed nothing). Programs that
-tolerate a failed `fstat` of stdout — `echo`, `ls`, `stat`, `wc` — never noticed; `cat` treats
-it as fatal, so it died with an error about stdout while holding a perfectly good read.
+through it on the runner, and granting `write` on the path changed nothing). Most programs do not
+care: `echo`, `ls`, `stat` and `wc` ran green through the same descriptor, and `/bin/sh` is
+logged taking the identical denial and carrying on. `cat` treats it as fatal, so it died with
+an error about stdout while holding a perfectly good read.
 
 ### The fix, and why it is the honest one
 

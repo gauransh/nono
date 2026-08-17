@@ -119,8 +119,10 @@ granting `write` on the path changed nothing on the runner, while the same run w
 Consequence for callers: a sandboxed child that treats a failed `fstat` of its own stdout as
 fatal fails on macOS 26 with an error naming *stdout*, whatever it was asked to read.
 `cat(1)` is such a program — `raw_cat` sizes its copy buffer from `fstat(fileno(stdout))` and
-calls `err(1, "stdout")` on failure — while `echo`, `ls`, `stat` and `wc` tolerate the same
-denial. Nothing about the mode mapping is involved: this is the profile naming no rule for a
+calls `err(1, "stdout")` on failure. Most do not: `echo`, `ls`, `stat` and `wc` all ran green
+in the same gate on the same descriptor, and `/bin/sh` is logged taking the very same denial
+(`deny(1) file-read-metadata …/gate-logs/…`) and carrying on to exit 0.
+Nothing about the mode mapping is involved: this is the profile naming no rule for a
 descriptor the launcher opened, and the coarse `AccessMode` path emits no such rule either
 (inferred from the same emitter, not observed live).
 
