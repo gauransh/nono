@@ -82,14 +82,17 @@
 //! ```
 
 mod cleanup;
+mod detached;
 mod events;
 mod exit;
 mod gate;
 mod identity;
 mod plan;
 mod prepare;
+mod protocol;
 mod session_store;
 mod state;
+mod supervisor;
 mod support;
 
 // The shared core is crate-internal in every ordinary build. Under `--cfg
@@ -105,7 +108,11 @@ pub use cleanup::{
     AbsenceBasis, CleanupError, CleanupVerification, IndeterminateReason, SurvivorEvidence,
     UnsupportedReason,
 };
-pub use events::{ActivationOutcome, EventSink, LifecycleEvent, LifecycleEventKind, Observation};
+pub use detached::{CONTROL_TIMEOUT, DetachedError, DetachedSession, MAX_CONTROL_WAIT};
+pub use events::{
+    ActivationOutcome, DETACHED_EVENT_RING_CAPACITY, EventSink, LifecycleEvent, LifecycleEventKind,
+    Observation,
+};
 pub use exit::{
     ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
     ReapError, SandboxExit, SupervisorStage,
@@ -117,11 +124,17 @@ pub use plan::{
     ValidatedPlan,
 };
 pub use prepare::{PrepareError, PreparedSandbox};
+pub use protocol::{
+    CONTROL_PROTOCOL_VERSION, ControlRefusal, ControlReply, ControlRequest, FrameError,
+    MAX_CONTROL_FRAME_BYTES, SessionStatus, WaitOutcome,
+};
 pub use session_store::{
-    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, RecoveredSession, RecoveryDecision, SessionRecord,
-    SessionStore, SessionStoreError, SessionSummary, Sessions, reconcile,
+    CURRENT_SCHEMA_VERSION, MAX_RECORD_BYTES, OLDEST_SUPPORTED_SCHEMA_VERSION, RecoveredSession,
+    RecoveryDecision, SessionRecord, SessionStore, SessionStoreError, SessionSummary, Sessions,
+    SupervisorPresence, reconcile,
 };
 pub use state::{LifecycleOp, LifecycleState, TransitionError};
+pub use supervisor::supervisor_entry;
 pub use support::{
     Capability, CleanupFacts, DarkSpot, DarkSpotEntry, Determination, EventFamily, EventFidelity,
     EventObservationSupport, HostFacts, IdentityFacts, KernelFacts, LandlockFacts, LandlockRight,
@@ -173,6 +186,10 @@ pub enum LifecycleError {
     /// be trusted.
     #[error(transparent)]
     Session(#[from] SessionStoreError),
+
+    /// Talking to a detached supervisor failed, or there was none to talk to.
+    #[error(transparent)]
+    Detached(#[from] DetachedError),
 }
 
 impl From<PlanError> for NonoError {
@@ -220,6 +237,12 @@ impl From<CleanupError> for NonoError {
 impl From<SessionStoreError> for NonoError {
     fn from(err: SessionStoreError) -> Self {
         Self::Lifecycle(LifecycleError::Session(err))
+    }
+}
+
+impl From<DetachedError> for NonoError {
+    fn from(err: DetachedError) -> Self {
+        Self::Lifecycle(LifecycleError::Detached(err))
     }
 }
 

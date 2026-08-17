@@ -779,22 +779,42 @@ impl SupportReport {
                 },
             ),
             detached_supervisor: Capability::plain(
-                SupportStatus::Unavailable,
-                Determination::Declared,
-                SupportReason::NotImplemented {
-                    slice: "R09 slice B (detached supervisor): dropping a handle today kills \
-                            and reaps the run, and a run that outlives its supervisor is only \
-                            recoverable, never supported"
+                SupportStatus::Available,
+                // Not `ProbedLive`, and the distinction is the whole point:
+                // establishing this by probe would mean launching a supervisor,
+                // which forks twice, execs, binds a socket, and writes a
+                // durable record. A support report has to be cheap enough to
+                // call, so what it reports is the mechanism and its
+                // precondition.
+                Determination::PlatformApi,
+                SupportReason::PlatformApiLinked {
+                    api: "fork(2) + execve(2) of std::env::current_exe(), setsid(2), and a \
+                          unix(7) control socket in the session store"
+                        .to_string(),
+                    why_not_probed: "PRECONDITION: the embedder must call \
+                                     nono::lifecycle::supervisor_entry() as the first statement \
+                                     of main(). The supervisor is this binary re-executed, and \
+                                     it becomes a supervisor only because that call recognises \
+                                     a private environment marker; a library cannot install the \
+                                     hook on its embedder's behalf. Whether this binary has it \
+                                     cannot be established without launching a supervisor, so \
+                                     it is not probed. A detached prepare against a binary \
+                                     without the hook fails closed at the readiness deadline \
+                                     with PrepareError::SupervisorUnresponsive, which names the \
+                                     function. See docs/adr/0002-detached-supervisor.md"
                         .to_string(),
                 },
             ),
             attach: Capability::plain(
-                SupportStatus::Unavailable,
+                SupportStatus::Partial,
                 Determination::Declared,
                 SupportReason::NotImplemented {
-                    slice: "R09 slice B (attach): SessionStore::recover reports presence and \
-                            absence, and a recovered process is not this process's child, so \
-                            its exit is not observable"
+                    slice: "R09 slice C (terminal attach): control attach is implemented — \
+                            SessionStore::attach_control and RecoveredSession::attach reach a \
+                            detached run's socket and drive it, so exit facts survive a caller \
+                            restart. What is not implemented is attaching to a run's terminal: \
+                            a headless detached run's standard streams are /dev/null and there \
+                            is no PTY to reattach to"
                         .to_string(),
                 },
             ),
@@ -1746,22 +1766,42 @@ mod tests {
                 },
             ),
             detached_supervisor: Capability::plain(
-                SupportStatus::Unavailable,
-                Determination::Declared,
-                SupportReason::NotImplemented {
-                    slice: "R09 slice B (detached supervisor): dropping a handle today kills \
-                            and reaps the run, and a run that outlives its supervisor is only \
-                            recoverable, never supported"
+                SupportStatus::Available,
+                // Not `ProbedLive`, and the distinction is the whole point:
+                // establishing this by probe would mean launching a supervisor,
+                // which forks twice, execs, binds a socket, and writes a
+                // durable record. A support report has to be cheap enough to
+                // call, so what it reports is the mechanism and its
+                // precondition.
+                Determination::PlatformApi,
+                SupportReason::PlatformApiLinked {
+                    api: "fork(2) + execve(2) of std::env::current_exe(), setsid(2), and a \
+                          unix(7) control socket in the session store"
+                        .to_string(),
+                    why_not_probed: "PRECONDITION: the embedder must call \
+                                     nono::lifecycle::supervisor_entry() as the first statement \
+                                     of main(). The supervisor is this binary re-executed, and \
+                                     it becomes a supervisor only because that call recognises \
+                                     a private environment marker; a library cannot install the \
+                                     hook on its embedder's behalf. Whether this binary has it \
+                                     cannot be established without launching a supervisor, so \
+                                     it is not probed. A detached prepare against a binary \
+                                     without the hook fails closed at the readiness deadline \
+                                     with PrepareError::SupervisorUnresponsive, which names the \
+                                     function. See docs/adr/0002-detached-supervisor.md"
                         .to_string(),
                 },
             ),
             attach: Capability::plain(
-                SupportStatus::Unavailable,
+                SupportStatus::Partial,
                 Determination::Declared,
                 SupportReason::NotImplemented {
-                    slice: "R09 slice B (attach): SessionStore::recover reports presence and \
-                            absence, and a recovered process is not this process's child, so \
-                            its exit is not observable"
+                    slice: "R09 slice C (terminal attach): control attach is implemented — \
+                            SessionStore::attach_control and RecoveredSession::attach reach a \
+                            detached run's socket and drive it, so exit facts survive a caller \
+                            restart. What is not implemented is attaching to a run's terminal: \
+                            a headless detached run's standard streams are /dev/null and there \
+                            is no PTY to reattach to"
                         .to_string(),
                 },
             ),
@@ -1941,17 +1981,56 @@ mod tests {
     }
 
     #[test]
-    fn detached_supervision_and_attach_are_honestly_unavailable() {
+    fn detached_supervision_reports_its_mechanism_and_its_precondition() {
+        // The one capability whose honest answer needs *two* facts: it is built
+        // and it is conditional. A probe would have to launch a supervisor —
+        // two forks, an exec, a bound socket, a durable record — so what is
+        // reported is the mechanism, at `PlatformApi`, with the precondition
+        // spelled out where a reader looking at machine-readable output will
+        // find it.
         let report = SupportReport::gather();
-        for capability in [report.detached_supervisor(), report.attach()] {
-            assert_eq!(capability.status(), SupportStatus::Unavailable);
-            assert_eq!(capability.determination(), Determination::Declared);
-            assert!(
-                matches!(capability.reason(), SupportReason::NotImplemented { .. }),
-                "an unbuilt capability must name the work that would build it: {:?}",
-                capability.reason()
+        let detached = report.detached_supervisor();
+        assert_eq!(detached.status(), SupportStatus::Available);
+        assert_eq!(detached.determination(), Determination::PlatformApi);
+        let SupportReason::PlatformApiLinked {
+            api,
+            why_not_probed,
+        } = detached.reason()
+        else {
+            panic!(
+                "detached supervision rests on a linked platform API: {:?}",
+                detached.reason()
             );
-        }
+        };
+        assert!(api.contains("execve"), "{api}");
+        assert!(
+            why_not_probed.contains("supervisor_entry()"),
+            "the precondition must name the hook an embedder has to install: {why_not_probed}"
+        );
+        assert!(
+            why_not_probed.contains("SupervisorUnresponsive"),
+            "and the typed failure a missing hook produces: {why_not_probed}"
+        );
+    }
+
+    #[test]
+    fn terminal_attach_is_still_honestly_incomplete() {
+        // Control attach landed; terminal attach did not. Reporting the pair as
+        // one `available` would tell a consumer it can reattach to a run's
+        // output, which it cannot: a headless detached run's streams are
+        // /dev/null.
+        let report = SupportReport::gather();
+        let attach = report.attach();
+        assert_eq!(attach.status(), SupportStatus::Partial);
+        assert_eq!(attach.determination(), Determination::Declared);
+        let SupportReason::NotImplemented { slice } = attach.reason() else {
+            panic!(
+                "a partial capability must name the work that would finish it: {:?}",
+                attach.reason()
+            );
+        };
+        assert!(slice.contains("attach_control"), "{slice}");
+        assert!(slice.contains("PTY"), "{slice}");
     }
 
     #[test]

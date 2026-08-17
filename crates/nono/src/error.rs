@@ -261,10 +261,13 @@ impl NonoError {
             }
             // The durable session store is a directory and a set of files;
             // every way it can refuse is a statement about that storage, which
-            // is what `IoError` names.
-            Self::Lifecycle(crate::lifecycle::LifecycleError::Session(_)) => {
-                NonoDiagnosticCode::IoError
-            }
+            // is what `IoError` names. A detached supervisor's control socket
+            // is the same kind of thing: a name in that directory and a
+            // conversation over it.
+            Self::Lifecycle(
+                crate::lifecycle::LifecycleError::Session(_)
+                | crate::lifecycle::LifecycleError::Detached(_),
+            ) => NonoDiagnosticCode::IoError,
             Self::Lifecycle(
                 crate::lifecycle::LifecycleError::Transition(_)
                 | crate::lifecycle::LifecycleError::Activation(_)

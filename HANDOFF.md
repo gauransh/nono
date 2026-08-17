@@ -132,14 +132,84 @@ frozen-contract state of THIS repository only.
   kernel-denial variant to synthesize one into.
 
 - Schema documents, each with a golden JSON example locked by a snapshot test
-  that reads the document itself: `docs/lifecycle/session-record-v1.md`,
-  `docs/lifecycle/support-report-v1.md`,
-  `docs/lifecycle/lifecycle-event-v1.md`.
+  that reads the document itself: `docs/lifecycle/session-record-v2.md` (what
+  this build writes), `docs/lifecycle/session-record-v1.md` (what it still
+  reads — the document doubles as the compatibility test's fixture),
+  `docs/lifecycle/support-report-v1.md`, `docs/lifecycle/lifecycle-event-v1.md`.
 
-- Still being added: detached supervisor (exit facts across a restart,
-  re-prepare with an incremented generation), attach/detach/resize,
-  interactive (PTY) sessions — each reported as `not_implemented` by
-  `SupportReport` rather than left to inference (ADR-0001 §6).
+- Landed (iteration 8): **R09 slice B, the detached supervisor.** A run that
+  outlives the process that started it, with its exit facts still directly
+  observed. See `docs/adr/0002-detached-supervisor.md`.
+
+  **This one needs a line of code from you.** Add, as the *first statement* of
+  your `main`:
+
+  ```rust
+  fn main() {
+      nono::lifecycle::supervisor_entry();
+      // ... your program, unchanged ...
+  }
+  ```
+
+  It returns immediately and does nothing in every ordinary run. It matters
+  only because a library has no binary of its own to re-execute and cannot
+  fork a long-running supervisor out of a threaded caller: the supervisor
+  *is* your binary, re-executed, and that call is how it recognises itself.
+  Without it, `SessionStore::prepare_detached` fails at its readiness deadline
+  with `PrepareError::SupervisorUnresponsive`, whose message names this
+  function. "First statement" is a real requirement, not a style note: the
+  call removes a private marker from the environment, which is sound only
+  while the process is single-threaded.
+
+  New API:
+
+  | Item | What it is |
+  |---|---|
+  | `lifecycle::supervisor_entry()` | The entry hook above. |
+  | `SessionStore::prepare_detached(plan)` | `-> (DetachedSession, ActivationHandle)`. Requires `plan.detached(true)`; refuses otherwise (`PrepareError::DetachedNotRequested`). |
+  | `SessionStore::attach_control(session_id)` | Connect to a live supervisor by id. |
+  | `SessionStore::control_socket_path(session_id)` | Where that socket is. |
+  | `RecoveredSession::attach()` / `::supervisor()` | Connect to the supervisor a recovery just proved alive. |
+  | `DetachedSession::{activate, wait, stop, status, verify_cleanup, detach, supervisor, opened_in}` | The run, over the socket. |
+  | `WaitOutcome::{Exit(SandboxExit), StillRunning}` | A bounded wait's two honest answers. |
+  | `SessionStatus::{state, record, events, exit}` | What `status()` returns. |
+  | `RecoveryDecision::Attachable` | New variant: the record's supervisor answered its identity probe. |
+  | `SupervisorPresence::{NeverDetached, Alive, Gone}` | New third input to `reconcile`. |
+  | `ControlRequest` / `ControlReply` / `ControlRefusal` / `FrameError` | Protocol v1, exported so a consumer can match refusals. |
+  | `ActivationHandle::{from_parts, token}` | The token is now readable and rebuildable, because a detached run is activated by whichever process holds it — see the warning below. |
+  | `DetachedError`, `LifecycleError::Detached` | The new failure aggregate. |
+  | `DETACHED_EVENT_RING_CAPACITY`, `CONTROL_TIMEOUT`, `MAX_CONTROL_WAIT`, `MAX_CONTROL_FRAME_BYTES`, `CONTROL_PROTOCOL_VERSION`, `OLDEST_SUPPORTED_SCHEMA_VERSION` | Documented bounds. |
+
+  Four consumer-visible consequences, none of them hidden:
+
+  1. **A headless detached run's standard streams are `/dev/null`.** A
+     supervisor that held its launcher's terminal or pipes would keep them
+     open after the launcher exited, which is the thing "detached" is for.
+     Giving output back is what the PTY of slice C is for.
+  2. **Dropping a `DetachedSession` does not end the run** — it closes a
+     socket. That is the opposite of `PreparedSandbox` and `ActivatedSandbox`,
+     and `detach()` exists so the intent can be said out loud.
+  3. **`ActivationHandle::token()` is now public.** It has to be: the process
+     that activates a detached run is very often not the one that prepared it,
+     and the library cannot transport the bytes for you. They are a start
+     button for a held child — the library never puts them in argv, an
+     environment, a log, a `Debug`, or a record, and where you put them is
+     your decision.
+  4. **The session record is schema v2.** v1 records still load (upgraded in
+     memory: no supervisor, no exit facts, empty event ring) and are written
+     back as v2. A record from a version neither of those is still refused.
+
+  Events while detached are **not deliverable live** — `EventSink` is
+  caller-side and a detached supervisor has no caller. It keeps the last
+  `DETACHED_EVENT_RING_CAPACITY` (32) events in the record instead, oldest
+  dropped, and `DetachedSession::status().events()` is how you read them. A
+  consumer that needs every event stays connected.
+
+- Still being added: attach to a detached run's *terminal* (slice C:
+  PTY ownership, attach/detach/resize framing on the same socket), interactive
+  (PTY) sessions, and re-prepare with an incremented generation — each reported
+  by `SupportReport` (`attach` is now `partial`, not `unavailable`) rather than
+  left to inference (ADR-0001 §6).
 
 ## Toolchain and platform requirements
 
@@ -173,7 +243,14 @@ frozen-contract state of THIS repository only.
 | removal detection for the F8 guards | adding one `bool` field to `CleanupFacts` fails both no-bare-boolean tests *and* the golden-example test, naming the JSON pointer `/cleanup_verification/facts/probes_work`; adding a `token_digest` field to an `ActivationOutcome` variant fails the token-material test with the offending JSON; giving `ActivatedSandbox` its own emitter instead of sharing the prepared one restarts `seq` at 0 mid-run and fails both live sequence tests (`left: 0, right: 9`); changing one field of one golden example in `docs/lifecycle/*.md` fails that document's snapshot test |
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F8) | 7 loom models pass, unchanged — F8 adds no shared-state machinery, and the one lock it touches (`SessionHandle`'s record mutex) is now released *before* the sink is called |
 | `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1; re-run green after F8 |
-| `cargo clippy --workspace --all-targets` | clean |
+| `cargo test --workspace --no-fail-fast` (after F9 + review #2, iteration 8) | 3674 passed / 0 failed / 2 ignored, 34 suites |
+| `cargo test -p nono lifecycle` (after F9 + review #2) | 218 unit (181 unchanged + 37 new: 13 `protocol`, 13 `supervisor`, 3 `detached`, 8 `session_store` for schema v2 + `SupervisorPresence`, plus 2 reshaped `support` tests and 1 new `prepare` refusal test) |
+| `cargo test -p nono --test lifecycle_detached` (new, `harness = false`) | 15 passed / 0 failed / 1 ignored; clean on 3 consecutive runs, no leaked supervisor processes and no leftover store directories |
+| `cargo test -p nono --test lifecycle_live` (after F9) | 25 passed, unmodified; clean on 3 consecutive runs |
+| removal detection for the F9 guards | hello version check deleted → the wrong-version client is greeted instead of refused (`left: Hello{protocol: 1, …}`); frame-length bound deleted → the supervisor reads a body that never arrives and the oversize test fails with "the supervisor must answer"; stale-socket unlink deleted from `recover` → "recovery must remove the stale socket it just proved dead"; hello-first guard deleted → a `Status` sent before any hello is served; **peer-uid consult** deleted (either the `peer_uid` call or the whole `accept_decision` consult) → `the_live_accept_path_consults_the_peer_credential` fails with "a connection from another uid must not become the client", and hardcoding `Serve` additionally fails the busy-refusal test |
+| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F9) | 7 loom models pass, unchanged — F9 adds no shared-state machinery inside a process (the supervisor loop is single-threaded by construction), and the one signature change (`reconcile` gaining `SupervisorPresence`) is a pure argument the models pass `NeverDetached` for |
+| `cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
+| `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
 | `cargo fmt --all -- --check` | clean |
 
 Full gate for every iteration: `make ci` equivalent (clippy -D warnings -D
@@ -186,7 +263,7 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
   command_runtime dry-run test (+ F1b: same for 3 flaky tool-sandbox git
   tests). Details: NONO_UPSTREAM_DELTA.md.
 - F2 (fork-only docs): SOURCE_LOCK.json, baseline docs, ADR-0001, this file.
-- F3-F8 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
+- F3-F9 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
   slice in NONO_UPSTREAM_DELTA.md with its disposition and deletion condition.
 
 ## Remaining external blockers
@@ -210,7 +287,13 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
 3. Product semantics (CrystalOS/HCP/Cedar/Leash policy, activation
    authorization meaning, event forwarding) stay in leash-rs; the fork provides
    only generic mechanics (BLOCKED_ROWS R15 guard).
-4. The full lifecycle contract and its guarantees will be documented in
+4. **Add `nono::lifecycle::supervisor_entry();` as the first statement of
+   `main`.** One line, a no-op in every ordinary run, and the precondition for
+   detached sessions (R09). Without it `SessionStore::prepare_detached` fails
+   closed at its readiness deadline with an error that names the call. It must
+   be *first*: it removes a private environment marker, which is sound only
+   while the process is single-threaded. See ADR-0002.
+5. The full lifecycle contract and its guarantees will be documented in
    docs/adr/ + API docs as rows land; BLOCKED_ROWS.json is the authoritative
    per-row status.
 

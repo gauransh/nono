@@ -95,5 +95,16 @@ jsonschema = "0.48"
 [target.'cfg(nono_loom)'.dependencies]
 loom = "0.7"
 
+# The detached-supervisor live tests. `harness = false` because these tests can
+# only run in a binary that installs the entry hook: a detached prepare
+# re-executes `current_exe()` and expects it to become a supervisor, which it
+# does only if `nono::lifecycle::supervisor_entry()` is called at the top of
+# `main`. libtest owns `main` and offers no pre-main hook, so this target brings
+# its own — which is also what makes the true caller-death test possible, since
+# the same binary can re-run itself as a launcher that exits.
+[[test]]
+name = "lifecycle_detached"
+harness = false
+
 [lints]
 workspace = true

@@ -169,14 +169,104 @@ pub enum PrepareError {
 
     /// The plan asks for something this slice does not implement.
     ///
-    /// Refused rather than quietly ignored. A caller who asked for a PTY, a
-    /// detached run, or a memory ceiling and silently received none of them
-    /// would be relying on a guarantee that is not there — which is exactly
-    /// the failure mode the whole module exists to avoid.
+    /// Refused rather than quietly ignored. A caller who asked for a PTY or a
+    /// memory ceiling and silently received neither would be relying on a
+    /// guarantee that is not there — which is exactly the failure mode the
+    /// whole module exists to avoid.
     #[error("plan feature not supported by this lifecycle: {feature}")]
     UnsupportedPlanFeature {
         /// The feature that was asked for.
         feature: &'static str,
+    },
+
+    /// A detached plan reached a path that cannot supervise one.
+    ///
+    /// Detachment is not a flag this path can honour: a run that outlives its
+    /// caller needs a *process* that outlives the caller, which is what
+    /// [`super::SessionStore::prepare_detached`] launches. Both the storeless
+    /// [`PreparedSandbox::prepare`] and the attached
+    /// [`super::SessionStore::prepare`] refuse rather than running the plan
+    /// undetached and letting the caller believe otherwise.
+    #[error(
+        "a detached run needs a supervisor process; use SessionStore::prepare_detached, and \
+         call nono::lifecycle::supervisor_entry() at the top of main()"
+    )]
+    DetachedNeedsSupervisor,
+
+    /// The detaching entry point was called with a plan that did not ask to be
+    /// detached.
+    ///
+    /// The symmetric half of [`Self::DetachedNeedsSupervisor`]: detachment has
+    /// to be asked for in the plan *and* reached through the method that
+    /// implements it, so neither the flag nor the call site can silently mean
+    /// something the other does not.
+    #[error("SessionStore::prepare_detached needs a plan built with .detached(true)")]
+    DetachedNotRequested,
+
+    /// This process's own executable could not be resolved, so there is no
+    /// image to re-execute as a supervisor.
+    ///
+    /// Canonicalized at prepare time rather than trusted: `argv[0]` is whatever
+    /// the launcher chose, and a relative or since-replaced path would launch
+    /// something else entirely.
+    #[error("this executable could not be resolved for re-execution: errno {errno}")]
+    SupervisorImageUnreadable {
+        /// Platform error number from the resolution.
+        errno: i32,
+    },
+
+    /// The supervisor's control socket could not be created.
+    #[error("control socket {path} could not be created: errno {errno}")]
+    ControlSocket {
+        /// The socket path that was refused.
+        path: PathBuf,
+        /// Platform error number.
+        errno: i32,
+    },
+
+    /// The store directory's path leaves no room for a control socket name.
+    ///
+    /// A Unix socket address is a fixed-size buffer — 104 bytes on macOS, 108
+    /// on Linux — and the session store's path plus `<session>.sock` has to fit
+    /// in it. Refused with both numbers rather than truncated, because a
+    /// truncated socket path is a socket at a *different* address.
+    #[error("control socket path for the store {path} needs {needed} bytes (limit {limit})")]
+    ControlSocketPathTooLong {
+        /// The store directory the socket would live in.
+        path: PathBuf,
+        /// The length the full socket path would have had, with its NUL.
+        needed: usize,
+        /// What the platform's `sockaddr_un` can hold.
+        limit: usize,
+    },
+
+    /// The supervisor never reported that it was ready.
+    ///
+    /// The overwhelmingly likely cause is the one this message names: the
+    /// embedder's `main` does not call [`supervisor_entry`], so the re-executed
+    /// image ran the embedder's own program instead of the supervisor loop and
+    /// never wrote the readiness handshake. See ADR-0002.
+    ///
+    /// [`supervisor_entry`]: super::supervisor_entry
+    #[error(
+        "the re-executed supervisor {image} did not report readiness within {waited:?}; the \
+         usual cause is that nono::lifecycle::supervisor_entry() is not called at the top of \
+         this binary's main()"
+    )]
+    SupervisorUnresponsive {
+        /// The image that was re-executed.
+        image: PathBuf,
+        /// How long the handshake was waited for.
+        waited: Duration,
+    },
+
+    /// The supervisor process died, or its handshake could not be read.
+    #[error("the supervisor handshake failed at stage {stage}: errno {errno}")]
+    SupervisorHandshake {
+        /// Where the handshake stopped.
+        stage: &'static str,
+        /// Platform error number, or 0 where the failure was not an OS error.
+        errno: i32,
     },
 
     /// The platform sandbox policy could not be built from the plan's
@@ -294,6 +384,39 @@ pub struct PreparedSandbox {
     session: Option<Arc<SessionHandle>>,
 }
 
+/// A child forked by a launcher and inherited across an `execve`.
+///
+/// Everything [`PreparedSandbox::adopt`] needs that the exec destroyed: the two
+/// channel ends, the gate's secret pair, and the facts about the child that
+/// were established before this image existed. The secrets travel through the
+/// launcher's private bootstrap pipe rather than the environment or the command
+/// line — an environment is readable from `/proc` by the same uid and a command
+/// line is readable by anyone — and the buffer they arrive in is zeroized as
+/// soon as it is parsed.
+pub(super) struct AdoptedChild {
+    /// The session the launcher chose, which also names the record and the
+    /// control socket.
+    pub(super) session_id: Uuid,
+    /// Which preparation of that session this is.
+    pub(super) generation: u64,
+    /// The child, as the launcher captured it at fork.
+    pub(super) identity: ProcessIdentity,
+    /// The group the child leads, which is its own pid.
+    pub(super) process_group: i32,
+    /// The gate's write end. Sole remaining writer, so closing it is what makes
+    /// a dead supervisor visible to the held child.
+    pub(super) gate: PipeWriter,
+    /// The status descriptor's read end.
+    pub(super) status: PipeReader,
+    /// The release/abort pair the child was forked with.
+    pub(super) secrets: GateSecrets,
+    /// The gate's configured lifetime, from the plan.
+    pub(super) expiry: Option<Duration>,
+    /// The emitter this run reports through, already carrying the supervisor's
+    /// own ring sink.
+    pub(super) events: Arc<EventEmitter>,
+}
+
 impl PreparedSandbox {
     /// Fork a child, sandbox it, and hold it at the gate.
     ///
@@ -312,7 +435,7 @@ impl PreparedSandbox {
     /// every case no child is left behind.
     #[must_use = "a prepared child is held until it is activated, stopped, or dropped"]
     pub fn prepare(plan: ValidatedPlan) -> Result<(Self, ActivationHandle), PrepareError> {
-        refuse_unsupported(&plan)?;
+        refuse_unsupported(&plan, false)?;
         let program = resolve_program(plan.program())?;
         let image = ExecImage::build(&program, &plan)?;
         let sandbox = PlatformSandbox::build(&plan)?;
@@ -436,6 +559,86 @@ impl PreparedSandbox {
         }
     }
 
+    /// Take ownership of a child that another process forked, and finish
+    /// preparing it here.
+    ///
+    /// The detached path splits `prepare` across an `execve`, and this is its
+    /// far half. The launcher builds the exec image and the platform policy,
+    /// forks an intermediate that forks the customer child and then re-executes
+    /// this binary as a supervisor; what crosses the exec is the *child* (still
+    /// this process's child, because `execve` changes the image and not the
+    /// process) and its two channel descriptors. Everything from the gate-ready
+    /// record onwards happens here, through exactly the code the attached path
+    /// uses.
+    ///
+    /// The token is drawn *here*, on this side of the exec, and handed back to
+    /// the launcher over the private handshake channel. That is stronger than
+    /// the attached path, not weaker: the customer child was forked before this
+    /// process existed in its supervisor form, so the token never existed in
+    /// the child's address space at any point, not even between fork and exec.
+    ///
+    /// # Errors
+    ///
+    /// [`PrepareError::ChildFailed`] if the adopted child reported a pre-gate
+    /// failure or died without reaching the gate, and
+    /// [`PrepareError::TokenGeneration`] if the token could not be drawn. In
+    /// both cases the child is killed and reaped by the returned value's drop.
+    pub(super) fn adopt(adopted: AdoptedChild) -> Result<(Self, ActivationHandle), PrepareError> {
+        let AdoptedChild {
+            session_id,
+            generation,
+            identity,
+            process_group,
+            gate,
+            status,
+            secrets,
+            expiry,
+            events,
+        } = adopted;
+
+        events.set_identity(identity.clone());
+        // Reconstructed, not witnessed: the fork this run started with happened
+        // in the launcher, before this image existed. Labelling it as directly
+        // observed would be this module's own vocabulary lying about which
+        // process saw what.
+        events.emit_with(
+            LifecycleEventKind::PrepareStarted,
+            super::events::Observation::Reconstructed,
+        );
+
+        let state = LifecycleState::Planning.apply(LifecycleOp::BeginPrepare)?;
+        let mut prepared = Self {
+            session_id,
+            generation,
+            identity,
+            process_group,
+            shared: SharedLifecycle::new(state),
+            gate: Some(gate),
+            status: Some(status),
+            // Replaced immediately below; a digest of all zeros matches no
+            // token anyone can present, so the gate is shut for the moment it
+            // holds this value.
+            token_digest: [0_u8; TOKEN_DIGEST_BYTES],
+            secrets: Some(secrets),
+            expiry,
+            prepared_at: Instant::now(),
+            child_owned: true,
+            last_exit: None,
+            events,
+            session: None,
+        };
+
+        let mut token = Zeroizing::new([0_u8; ACTIVATION_TOKEN_BYTES]);
+        getrandom::fill(token.as_mut()).map_err(|_| PrepareError::TokenGeneration)?;
+        prepared.token_digest = token_digest(&token);
+
+        prepared.observe_prepare()?;
+        Ok((
+            prepared,
+            ActivationHandle::new(session_id, generation, *token),
+        ))
+    }
+
     /// The session this prepared child belongs to.
     #[must_use]
     pub fn session_id(&self) -> Uuid {
@@ -467,6 +670,18 @@ impl PreparedSandbox {
     /// The process group the child leads, which is its own pid.
     pub(crate) fn process_group(&self) -> i32 {
         self.process_group
+    }
+
+    /// The status descriptor's number, while the run still has one.
+    ///
+    /// The detached supervisor polls it: before activation, a child that dies
+    /// at the gate announces itself by writing a record or by closing that
+    /// descriptor, and a supervisor with nothing else to watch would otherwise
+    /// only find out at the next control operation. `None` once the run has
+    /// been activated or has ended, at which point the descriptor is gone and
+    /// `SIGCHLD` is the only report there is.
+    pub(super) fn status_fd(&self) -> Option<RawFd> {
+        self.status.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     /// This run's emitter, for the durable record to report its own writes
@@ -1062,22 +1277,30 @@ impl Drop for PreparedSandbox {
     }
 }
 
-/// Refuse a plan whose promises this slice cannot keep.
+/// Refuse a plan whose promises this path cannot keep.
 ///
-/// A PTY, a detached run, and resource ceilings are each a separate mechanism
-/// that arrives in a later slice. Until then, asking for one is an error
-/// rather than a no-op: silently running headless, attached, and unlimited
-/// would leave a caller believing in confinement that was never applied.
-fn refuse_unsupported(plan: &ValidatedPlan) -> Result<(), PrepareError> {
+/// A PTY and resource ceilings are each a separate mechanism that arrives in a
+/// later slice. Until then, asking for one is an error rather than a no-op:
+/// silently running headless and unlimited would leave a caller believing in
+/// confinement that was never applied.
+///
+/// Detachment is judged differently, because it is now implemented: `detached`
+/// names *who owns the run*, and only the supervisor launch of
+/// [`super::SessionStore::prepare_detached`] can own one that outlives the
+/// caller. `supervised` is true on exactly that path — it is set by the code
+/// that has already forked a supervisor to hold the child — and false on the
+/// two paths that would otherwise run a detached plan attached.
+pub(super) fn refuse_unsupported(
+    plan: &ValidatedPlan,
+    supervised: bool,
+) -> Result<(), PrepareError> {
     if plan.session_mode() != SessionMode::Headless {
         return Err(PrepareError::UnsupportedPlanFeature {
             feature: "interactive session (PTY)",
         });
     }
-    if plan.is_detached() {
-        return Err(PrepareError::UnsupportedPlanFeature {
-            feature: "detached run",
-        });
+    if plan.is_detached() && !supervised {
+        return Err(PrepareError::DetachedNeedsSupervisor);
     }
     if plan.resource_limits() != ResourceLimits::default() {
         return Err(PrepareError::UnsupportedPlanFeature {
@@ -1093,7 +1316,7 @@ fn refuse_unsupported(plan: &ValidatedPlan) -> Result<(), PrepareError> {
 /// replaced or removed between here and `execve`. It exists to give the caller
 /// a clear error before a child is forked; the binding fact is still the exec
 /// record the child writes.
-fn resolve_program(program: &str) -> Result<PathBuf, PrepareError> {
+pub(super) fn resolve_program(program: &str) -> Result<PathBuf, PrepareError> {
     let path = Path::new(program);
     if !path.is_absolute() {
         return Err(PrepareError::ProgramNotAbsolute {
@@ -1115,7 +1338,7 @@ fn resolve_program(program: &str) -> Result<PathBuf, PrepareError> {
     Ok(path.to_path_buf())
 }
 
-fn channel_error(err: std::io::Error) -> PrepareError {
+pub(super) fn channel_error(err: std::io::Error) -> PrepareError {
     PrepareError::ChannelSetup {
         errno: err.raw_os_error().unwrap_or(0),
     }
@@ -1128,7 +1351,7 @@ fn channel_error(err: std::io::Error) -> PrepareError {
 /// descriptor 0 would be inherited by the customer's program as its stdin and
 /// would be invisible to the child's close-everything sweep, so both ends are
 /// moved up front.
-fn open_channel() -> Result<(PipeReader, PipeWriter), PrepareError> {
+pub(super) fn open_channel() -> Result<(PipeReader, PipeWriter), PrepareError> {
     let (reader, writer) = std::io::pipe().map_err(channel_error)?;
     let reader = PipeReader::from(above_standard_streams(OwnedFd::from(reader))?);
     let writer = PipeWriter::from(above_standard_streams(OwnedFd::from(writer))?);
@@ -1140,7 +1363,7 @@ fn open_channel() -> Result<(PipeReader, PipeWriter), PrepareError> {
 ///
 /// The duplicate is created close-on-exec in the same syscall, so there is no
 /// window where an inheritable copy exists.
-fn above_standard_streams(fd: OwnedFd) -> Result<OwnedFd, PrepareError> {
+pub(super) fn above_standard_streams(fd: OwnedFd) -> Result<OwnedFd, PrepareError> {
     if fd.as_raw_fd() >= 3 {
         return Ok(fd);
     }
@@ -1162,15 +1385,15 @@ fn above_standard_streams(fd: OwnedFd) -> Result<OwnedFd, PrepareError> {
 /// The plan's program, argv, environment, and working directory as C buffers.
 ///
 /// Built entirely in the parent: after the fork the child only reads pointers.
-struct ExecImage {
-    program: CString,
-    working_dir: Option<CString>,
-    argv: Vec<CString>,
-    envp: Vec<CString>,
+pub(super) struct ExecImage {
+    pub(super) program: CString,
+    pub(super) working_dir: Option<CString>,
+    pub(super) argv: Vec<CString>,
+    pub(super) envp: Vec<CString>,
 }
 
 impl ExecImage {
-    fn build(program: &Path, plan: &ValidatedPlan) -> Result<Self, PrepareError> {
+    pub(super) fn build(program: &Path, plan: &ValidatedPlan) -> Result<Self, PrepareError> {
         use std::os::unix::ffi::OsStrExt;
 
         let nul = |_| PrepareError::ProgramUnusable {
@@ -1217,7 +1440,7 @@ impl ExecImage {
     ///
     /// Allocated here, in the parent; the pointers address the `CString` heap
     /// buffers this value owns, so both must outlive the fork.
-    fn pointers(&self) -> (Vec<*const c_char>, Vec<*const c_char>) {
+    pub(super) fn pointers(&self) -> (Vec<*const c_char>, Vec<*const c_char>) {
         let argv = self
             .argv
             .iter()
@@ -1235,19 +1458,19 @@ impl ExecImage {
 }
 
 /// Everything the child needs, as values it can use without allocating.
-struct ChildContext<'a> {
-    gate_read: RawFd,
-    gate_write: RawFd,
-    status_read: RawFd,
-    status_write: RawFd,
-    program: *const c_char,
-    argv: *const *const c_char,
-    envp: *const *const c_char,
+pub(super) struct ChildContext<'a> {
+    pub(super) gate_read: RawFd,
+    pub(super) gate_write: RawFd,
+    pub(super) status_read: RawFd,
+    pub(super) status_write: RawFd,
+    pub(super) program: *const c_char,
+    pub(super) argv: *const *const c_char,
+    pub(super) envp: *const *const c_char,
     /// Null when the plan set no working directory.
-    working_dir: *const c_char,
-    sandbox: &'a PlatformSandbox,
+    pub(super) working_dir: *const c_char,
+    pub(super) sandbox: &'a PlatformSandbox,
     /// The only two messages this child will act on.
-    secrets: &'a GateSecrets,
+    pub(super) secrets: &'a GateSecrets,
 }
 
 /// The whole of the child's life before `execve`.
@@ -1255,7 +1478,7 @@ struct ChildContext<'a> {
 /// Runs only async-signal-safe syscalls over buffers the parent built, never
 /// returns, and never unwinds. The single exception is the macOS sandbox apply
 /// — see [`PlatformSandbox::apply_in_child`].
-fn child_main(context: &ChildContext<'_>) -> ! {
+pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
     // The parent's ends. Closing the gate's write end here is what lets the
     // child notice a dead supervisor: with no writer left, `read` returns 0.
     // SAFETY: both are descriptors this process owns, closed exactly once.
@@ -1294,7 +1517,8 @@ fn child_main(context: &ChildContext<'_>) -> ! {
     // A failure here is not reportable and not fatal: the sweep is
     // best-effort per descriptor, and the ones that matter are the ones the
     // parent knows about.
-    close_inherited_descriptors(context.gate_read, context.status_write);
+    let mut keep = [context.gate_read, context.status_write];
+    close_inherited_descriptors(&mut keep);
 
     // Confined, holding nothing spare, and about to wait. This record is what
     // turns the parent's `prepare` into an observation instead of an
@@ -1367,33 +1591,51 @@ fn child_main(context: &ChildContext<'_>) -> ! {
     child_fail(context.status_write, PreExecStage::Exec, last_errno())
 }
 
-/// Close every descriptor this process inherited except the two channel ends
-/// and the standard streams.
+/// Close every descriptor this process inherited except the named keepers and
+/// the standard streams.
 ///
-/// Runs in the forked child, so it is syscalls only: no allocation, no
-/// iterator over `/proc` or `/dev/fd`, nothing that could take a lock the fork
-/// left held.
+/// Runs in a forked child, so it is syscalls only: no allocation, no iterator
+/// over `/proc` or `/dev/fd`, nothing that could take a lock the fork left
+/// held. `keep` is sorted in place with an insertion sort over a caller-owned
+/// stack array — integer comparisons and swaps only, no allocation — because
+/// the Linux fast path below closes the *gaps* between keepers and needs them
+/// in order.
 ///
-/// Both keepers are guaranteed to be at or above 3 by [`open_channel`], so the
-/// sweep starts there and 0/1/2 are never touched — a customer's program still
-/// gets the stdin, stdout, and stderr its embedder set up.
-fn close_inherited_descriptors(keep_first: RawFd, keep_second: RawFd) {
-    let (lower, upper) = if keep_first <= keep_second {
-        (keep_first, keep_second)
-    } else {
-        (keep_second, keep_first)
-    };
+/// The customer child keeps its two channel ends; the intermediate that becomes
+/// a detached supervisor keeps rather more — its gate and status ends, the
+/// bound control socket, and its handshake and bootstrap descriptors — and that
+/// is the whole reason this takes a set rather than a pair.
+///
+/// Every keeper is guaranteed to be at or above 3 by [`open_channel`] and
+/// [`above_standard_streams`], so the sweep starts there and 0/1/2 are never
+/// touched — a customer's program still gets the stdin, stdout, and stderr its
+/// launcher set up for it.
+pub(super) fn close_inherited_descriptors(keep: &mut [RawFd]) {
+    // Insertion sort: the sets here are two to six descriptors long, and the
+    // alternative — `sort_unstable`, which is a pattern-defeating quicksort —
+    // is more machinery than a forked child should run.
+    let mut index: usize = 1;
+    while index < keep.len() {
+        let mut position = index;
+        while position > 0 && keep.get(position.saturating_sub(1)) > keep.get(position) {
+            keep.swap(position.saturating_sub(1), position);
+            position = position.saturating_sub(1);
+        }
+        index = index.saturating_add(1);
+    }
 
     #[cfg(target_os = "linux")]
     {
-        // Three ranges: below the first keeper, between the keepers, and
-        // above the second. `close_range` closes each in one syscall, so the
-        // cost does not scale with the descriptor limit. `RawFd::MAX` is the
-        // whole space — a descriptor is an `int`, so nothing can sit above it.
-        if close_range(3, lower.saturating_sub(1))
-            && close_range(lower.saturating_add(1), upper.saturating_sub(1))
-            && close_range(upper.saturating_add(1), RawFd::MAX)
-        {
+        // One `close_range` per gap between keepers, so the cost does not scale
+        // with the descriptor limit. `RawFd::MAX` is the whole space — a
+        // descriptor is an `int`, so nothing can sit above it.
+        let mut first: RawFd = 3;
+        let mut swept = true;
+        for keeper in keep.iter() {
+            swept = swept && close_range(first, keeper.saturating_sub(1));
+            first = keeper.saturating_add(1);
+        }
+        if swept && close_range(first, RawFd::MAX) {
             return;
         }
         // Pre-5.9 kernels have no `close_range`; fall through to the loop.
@@ -1402,7 +1644,13 @@ fn close_inherited_descriptors(keep_first: RawFd, keep_second: RawFd) {
     let limit = descriptor_limit();
     let mut fd: RawFd = 3;
     while fd < limit {
-        if fd != lower && fd != upper {
+        // A linear scan of a handful of keepers, deliberately: a set would
+        // allocate, and this runs between `fork` and `execve`.
+        let mut keeping = false;
+        for keeper in keep.iter() {
+            keeping = keeping || *keeper == fd;
+        }
+        if !keeping {
             // SAFETY: closing a descriptor this process does not own returns
             // EBADF and changes nothing. `close` is async-signal-safe.
             unsafe { libc::close(fd) };
@@ -1459,7 +1707,7 @@ fn child_fail(status_write: RawFd, stage: PreExecStage, errno: i32) -> ! {
 ///
 /// Fixed size and stack-allocated so the child never needs an allocator, and
 /// small enough that a pipe write of the whole record is atomic.
-fn write_record(status_write: RawFd, tag: u8, errno: i32) -> bool {
+pub(super) fn write_record(status_write: RawFd, tag: u8, errno: i32) -> bool {
     let mut record = [0_u8; STATUS_RECORD_LEN];
     record[0] = tag;
     record[1..].copy_from_slice(&errno.to_le_bytes());
@@ -1493,7 +1741,7 @@ fn write_record(status_write: RawFd, tag: u8, errno: i32) -> bool {
 /// `Error::last_os_error` reads the thread's `errno` and wraps it in a
 /// pointer-sized value; nothing is allocated, which is what makes it usable on
 /// the child's path.
-fn last_errno() -> i32 {
+pub(super) fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
@@ -1569,18 +1817,18 @@ fn refuse_unsupported_fallback(
 
 /// The platform policy, fully built in the parent.
 #[cfg(target_os = "linux")]
-struct PlatformSandbox {
+pub(super) struct PlatformSandbox {
     prepared: crate::sandbox::PreparedLandlockSandbox,
 }
 
 /// The platform policy, fully built in the parent.
 #[cfg(target_os = "macos")]
-struct PlatformSandbox {
+pub(super) struct PlatformSandbox {
     profile: CString,
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-struct PlatformSandbox;
+pub(super) struct PlatformSandbox;
 
 impl PlatformSandbox {
     /// Build the policy from the plan's capabilities.
@@ -1589,7 +1837,7 @@ impl PlatformSandbox {
     /// in the parent, so that the child's apply is a fixed sequence of
     /// syscalls with a typed error.
     #[cfg(target_os = "linux")]
-    fn build(plan: &ValidatedPlan) -> Result<Self, PrepareError> {
+    pub(super) fn build(plan: &ValidatedPlan) -> Result<Self, PrepareError> {
         use crate::sandbox::{Sandbox, SeccompNetFallback, SeccompOpts};
 
         let abi = Sandbox::detect_abi().map_err(|err| PrepareError::SandboxSpec {
@@ -1609,7 +1857,7 @@ impl PlatformSandbox {
 
     /// Build the policy from the plan's capabilities.
     #[cfg(target_os = "macos")]
-    fn build(plan: &ValidatedPlan) -> Result<Self, PrepareError> {
+    pub(super) fn build(plan: &ValidatedPlan) -> Result<Self, PrepareError> {
         let profile =
             crate::sandbox::generate_seatbelt_profile(plan.capabilities()).map_err(|err| {
                 PrepareError::SandboxSpec {
@@ -1624,7 +1872,7 @@ impl PlatformSandbox {
 
     /// Build the policy from the plan's capabilities.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn build(_plan: &ValidatedPlan) -> Result<Self, PrepareError> {
+    pub(super) fn build(_plan: &ValidatedPlan) -> Result<Self, PrepareError> {
         Err(PrepareError::SandboxSpec {
             reason: format!("no sandbox mechanism on {}", std::env::consts::OS),
         })
@@ -1635,7 +1883,7 @@ impl PlatformSandbox {
     /// Allocation-free on Linux: the ruleset descriptors and rule vectors were
     /// built in the parent and are applied with raw syscalls.
     #[cfg(target_os = "linux")]
-    fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
+    pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
         // The Landlock sub-stage (create/add-rule/restrict) is not carried in
         // the fixed-size record; the errno is.
         self.prepared
@@ -1656,7 +1904,7 @@ impl PlatformSandbox {
     /// The `errno` reported is `sandbox_init`'s return value, which is not an
     /// `errno(3)` code on this platform.
     #[cfg(target_os = "macos")]
-    fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
+    pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
         // SAFETY: the profile is a NUL-terminated C string owned by the parent
         // and still mapped here. The call is made once, in a freshly forked
         // child that has run nothing else.
@@ -1670,7 +1918,7 @@ impl PlatformSandbox {
 
     /// Apply the policy to the calling (child) process.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
+    pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
         // Unreachable: `build` refuses on this platform, so no child exists.
         Err((PreExecStage::SandboxApply, libc::ENOSYS))
     }
@@ -1809,20 +2057,15 @@ mod tests {
 
         let interactive =
             sealed(SandboxPlan::new("/bin/echo").session_mode(SessionMode::Interactive));
-        assert_eq!(
-            refuse_unsupported(&interactive).err(),
-            Some(PrepareError::UnsupportedPlanFeature {
-                feature: "interactive session (PTY)"
-            })
-        );
-
-        let detached = sealed(SandboxPlan::new("/bin/echo").detached(true));
-        assert_eq!(
-            refuse_unsupported(&detached).err(),
-            Some(PrepareError::UnsupportedPlanFeature {
-                feature: "detached run"
-            })
-        );
+        for supervised in [false, true] {
+            assert_eq!(
+                refuse_unsupported(&interactive, supervised).err(),
+                Some(PrepareError::UnsupportedPlanFeature {
+                    feature: "interactive session (PTY)"
+                }),
+                "a PTY is refused on every path, including the supervisor's"
+            );
+        }
 
         let limited = sealed(
             SandboxPlan::new("/bin/echo").resource_limits(ResourceLimits {
@@ -1831,7 +2074,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            refuse_unsupported(&limited).err(),
+            refuse_unsupported(&limited, false).err(),
             Some(PrepareError::UnsupportedPlanFeature {
                 feature: "resource limits"
             })
@@ -1839,8 +2082,32 @@ mod tests {
 
         // The defaults this slice does implement are accepted.
         assert_eq!(
-            refuse_unsupported(&sealed(SandboxPlan::new("/bin/echo"))),
+            refuse_unsupported(&sealed(SandboxPlan::new("/bin/echo")), false),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn a_detached_plan_is_refused_by_every_path_that_cannot_supervise_one() {
+        // The refusal is about *ownership*, not about the feature being
+        // missing: a detached run needs a process that outlives the caller, and
+        // the two paths below have none. The supervisor's own path — which has
+        // already forked one — accepts the same plan.
+        let detached = sealed(SandboxPlan::new("/bin/echo").detached(true));
+        assert_eq!(
+            refuse_unsupported(&detached, false).err(),
+            Some(PrepareError::DetachedNeedsSupervisor)
+        );
+        assert_eq!(refuse_unsupported(&detached, true), Ok(()));
+
+        // And the public storeless entry point refuses before it forks
+        // anything, so a caller who set the flag never gets an attached run
+        // silently.
+        let refused =
+            PreparedSandbox::prepare(sealed(SandboxPlan::new("/bin/echo").detached(true)));
+        assert!(
+            matches!(refused, Err(PrepareError::DetachedNeedsSupervisor)),
+            "expected a typed refusal, got {refused:?}"
         );
     }
 

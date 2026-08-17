@@ -1,11 +1,20 @@
 # Session record, schema version 1
 
-The durable record `nono::lifecycle::SessionStore` writes for one session, one
+> **Superseded by [`session-record-v2.md`](session-record-v2.md).** This build
+> still *reads* version 1 and never writes it. A v1 record loads through its own
+> shape and is upgraded in memory — no supervisor, no exit facts, no event ring,
+> because nothing that wrote a v1 record had any. This document is therefore
+> both the historical schema and the fixture that proves it still loads: the
+> golden example below is parsed by a compatibility test in
+> `crates/nono/src/lifecycle/session_store.rs`.
+
+The durable record `nono::lifecycle::SessionStore` wrote for one session, one
 file per session at `<store>/<session-id>.json`, mode `0600`.
 
 Source of truth: `crates/nono/src/lifecycle/session_store.rs`
-(`SessionRecord`). The golden example below is locked by a test in that file —
-if the type changes without the doc, that test fails and names this path.
+(`SessionRecordV1`). The golden example below is locked by a test in that file —
+if the compatibility shape changes without the doc, that test fails and names
+this path.
 
 ## What a record is for, and what it is not
 
@@ -25,15 +34,16 @@ Two properties a consumer must build on:
    transition it describes, outside the lifecycle lock. `SessionStore::recover`
    reconciles a loaded record against the live system rather than believing it;
    a consumer must not treat `state` as a statement about the present.
-2. **A record from another schema version is refused, not interpreted.** The
-   version is read on its own before the rest of the shape, so a newer writer
-   is never read field by field.
+2. **A record from an unimplemented schema version is refused, not
+   interpreted.** The version is read on its own before the rest of the shape,
+   so a writer this build does not know is never read field by field. A version
+   it *does* know gets that version's shape, `deny_unknown_fields` and all.
 
 ## Fields
 
 | Field | Type | Nullable | Meaning |
 |---|---|---|---|
-| `schema_version` | `u32` | no | The schema this record was written by. Version 1 is the first; any other value — higher *or* lower — is `SessionStoreError::UnsupportedSchemaVersion`. |
+| `schema_version` | `u32` | no | The schema this record was written by. `1` here; a version this build has never implemented is `SessionStoreError::UnsupportedSchemaVersion`. |
 | `session_id` | UUID (v7 string) | no | The session's id, which is also its file name. A record whose id disagrees with its file name is `SessionCorrupt`. |
 | `generation` | `u64` | no | Which preparation of this session the record describes. Always `1` today: sessions are one-shot UUIDs and nothing re-prepares into an existing slot. The field exists because the flow that increments it would otherwise have to change the shape. |
 | `identity` | object | no | The recorded process, with the facts a reissued pid cannot forge. See below. |

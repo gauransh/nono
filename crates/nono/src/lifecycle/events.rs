@@ -51,8 +51,9 @@ use super::exit::{ExitOutcome, SupervisorStage};
 use super::identity::ProcessIdentity;
 use super::state::LifecycleState;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -273,6 +274,35 @@ impl LifecycleEvent {
     pub fn what(&self) -> &LifecycleEventKind {
         &self.what
     }
+
+    /// Build an event from parts, for tests that need a fixed one.
+    ///
+    /// Test-only and deliberately not public: outside tests an event is always
+    /// *emitted*, with its sequence number allocated by the run's own counter
+    /// and its clock read at the moment of observation, so that nothing can
+    /// claim a position or a time it did not have. The durable record's golden
+    /// example needs a value that does not move, which is the one case that
+    /// cannot come from an emitter.
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        session_id: Option<Uuid>,
+        generation: u64,
+        seq: u64,
+        observed_at: SystemTime,
+        identity: Option<ProcessIdentity>,
+        observation: Observation,
+        what: LifecycleEventKind,
+    ) -> Self {
+        Self {
+            session_id,
+            generation,
+            seq,
+            observed_at,
+            identity,
+            observation,
+            what,
+        }
+    }
 }
 
 /// Consumer-supplied event receiver.
@@ -356,6 +386,83 @@ impl EventEmitter {
             what,
         };
         sink.emit(&event);
+    }
+}
+
+/// How many events a detached supervisor keeps for a caller that is not there.
+///
+/// Bounded because the ring is written into the durable session record on every
+/// transition, and a record that grew with the run would eventually exceed
+/// [`super::MAX_RECORD_BYTES`] and stop being written at all. Thirty-two is
+/// comfortably more than the longest run this vocabulary can produce end to end
+/// (prepare through cleanup verification is under twenty), so in practice a
+/// completed detached run keeps all of its events; a run that is activated,
+/// stopped, and verified repeatedly is what drops the oldest.
+pub const DETACHED_EVENT_RING_CAPACITY: usize = 32;
+
+/// The sink a detached supervisor gives itself, because it has no caller to
+/// give it one.
+///
+/// [`EventSink`] is caller-side by design: the consumer implements it and
+/// decides what an event means. A detached supervisor has no consumer in the
+/// process — that is what "detached" means — so events observed while nobody is
+/// connected **cannot be delivered live**, and this library does not pretend
+/// otherwise. What it does instead is keep the last
+/// [`DETACHED_EVENT_RING_CAPACITY`] of them in the session record, so a caller
+/// that reconnects can read what happened while it was away.
+///
+/// The fidelity of that is stated rather than implied: the ring is bounded and
+/// drops its oldest entry, so a long-running session's early events are gone.
+/// A consumer that needs every event needs to stay connected.
+pub(crate) struct EventRing {
+    events: Mutex<VecDeque<LifecycleEvent>>,
+}
+
+impl EventRing {
+    /// An empty ring at [`DETACHED_EVENT_RING_CAPACITY`].
+    pub(crate) fn new() -> Self {
+        Self {
+            events: Mutex::new(VecDeque::with_capacity(DETACHED_EVENT_RING_CAPACITY)),
+        }
+    }
+
+    /// The ring's contents, oldest first.
+    ///
+    /// Copied out rather than borrowed: the caller is the durable record write,
+    /// which must not hold this lock while it does filesystem I/O.
+    pub(crate) fn snapshot(&self) -> Vec<LifecycleEvent> {
+        self.locked().iter().cloned().collect()
+    }
+
+    /// Take the ring lock, recovering from a poisoned one.
+    ///
+    /// Same reasoning as everywhere else in this module: the ring is a plain
+    /// value that is always left consistent, and refusing to hand it back would
+    /// turn one panic into a supervisor that can no longer record anything.
+    fn locked(&self) -> std::sync::MutexGuard<'_, VecDeque<LifecycleEvent>> {
+        match self.events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl EventSink for EventRing {
+    fn emit(&self, event: &LifecycleEvent) {
+        let mut guard = self.locked();
+        if guard.len() >= DETACHED_EVENT_RING_CAPACITY {
+            guard.pop_front();
+        }
+        guard.push_back(event.clone());
+    }
+}
+
+impl std::fmt::Debug for EventRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventRing")
+            .field("len", &self.locked().len())
+            .field("capacity", &DETACHED_EVENT_RING_CAPACITY)
+            .finish()
     }
 }
 

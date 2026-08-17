@@ -33,7 +33,7 @@ use loom::thread;
 use nono::lifecycle::sync_core::{SharedLifecycle, Transition};
 use nono::lifecycle::{
     AbsenceBasis, CleanupVerification, LifecycleOp as Op, LifecycleState as S, RecoveryDecision,
-    SurvivorEvidence, TransitionError, reconcile,
+    SupervisorPresence, SurvivorEvidence, TransitionError, reconcile,
 };
 
 /// What one racing thread came back with.
@@ -410,7 +410,7 @@ fn a_recovery_and_a_cleanup_never_both_confirm_the_same_absence() {
             let shared = Arc::clone(&shared);
             thread::spawn(move || {
                 let observed = shared.state();
-                let decision = reconcile(observed, &absent());
+                let decision = reconcile(observed, &absent(), SupervisorPresence::NeverDetached);
                 // A recovery that finds the cleanup already proven records
                 // nothing. That is the whole of "never adopt after cleanup" on
                 // the write side.
@@ -486,7 +486,10 @@ fn a_recovery_never_adopts_a_run_whose_cleanup_was_already_proven() {
                 // that is a survivor worth reporting; after it, the same
                 // observation can only be a number the kernel handed to
                 // somebody else.
-                (observed, reconcile(observed, &present()))
+                (
+                    observed,
+                    reconcile(observed, &present(), SupervisorPresence::NeverDetached),
+                )
             })
         };
 

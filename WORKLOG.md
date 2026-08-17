@@ -318,3 +318,172 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
   Linux arm of `gather_network_filtering`) is written-unverified behind the R07
   Docker blocker. The macOS branches and all platform-independent machinery are
   live-verified on this host.
+
+## 2026-08-17 — Iteration 8: R09 slice B detached supervisor (delta F9)
+
+- Landed `docs/adr/0002-detached-supervisor.md` as the binding design and built
+  it: `crates/nono/src/lifecycle/{supervisor,protocol,detached}.rs` plus schema
+  v2 in `session_store.rs` and the adoption half of `prepare.rs`.
+- **The shape of the thing, and why.** A library cannot re-exec "the nono
+  binary" — it has none — and cannot fork a *long-running* supervisor out of a
+  threaded caller: after `fork` only async-signal-safe calls are defined, and
+  on macOS the Objective-C runtime aborts a forked child that touches it.
+  ADR-0001's gate child survives fork only because it is syscall-only until
+  `execve`. So the supervisor is **this binary re-executed**, and the embedder
+  opts in with `nono::lifecycle::supervisor_entry()` as the first statement of
+  `main`. That is one line of cooperation and it is stated in the API docs, the
+  support report, HANDOFF, and the typed error a missing hook produces.
+- **Two forks, and each is load-bearing for a different reason.** The second
+  one is what makes a supervisor possible: `execve` replaces an image and not a
+  process, so a customer child forked *before* the exec is still the child of
+  the same pid afterwards, and `waitpid` reaches it. That single fact is why a
+  detached run's exit facts are directly observed rather than inferred, and it
+  is also why **nothing about the plan crosses the exec** — the policy, the
+  argv and the environment are built and used on the launcher's side, so a
+  `CapabilitySet` never has to be serialized and re-trusted.
+  The first fork was added because a test found the hole: the supervisor was
+  the launcher's own child, so a launcher that outlived it collected a zombie
+  it cannot be expected to reap, and test (g) could not even observe the
+  supervisor's death (`kill(pid, 0)` succeeds on a zombie). The launcher now
+  forks an intermediate that forks the supervisor, names it on the handshake,
+  and exits; the launcher reaps *that*, in a wait it knows will return.
+- **The token got stronger, not weaker.** On the attached path the token is
+  drawn after the fork so it never reaches the child; here it is drawn *in the
+  supervisor, after the exec*, so it never exists in the customer child's
+  address space at all. It comes back to the launcher on the private handshake.
+  The gate's release/abort pair has to go the other way — the child was forked
+  holding it — so it travels on a private bootstrap pipe and both sides zeroize
+  the buffer it arrived in.
+- **The bind race was removed rather than narrowed.** The launcher binds and
+  listens before the fork and passes the *listening descriptor* through the
+  exec, so "the supervisor reported ready" implies a socket that has been
+  listening since before the supervisor existed. The alternative — the
+  supervisor binds and the launcher retries a connect — has no upper bound and
+  no way to tell "not yet" from "never".
+- **Protocol v1** is length-prefixed frames with the 64 KiB bound checked *from
+  the prefix, before a byte of body is read or allocated*; hello first in both
+  directions; refusals that carry the module's own typed results rather than
+  strings (which is why `ActivationError` and `StopError` gained serde);
+  peer-uid checked at accept by reusing `supervisor::socket::peer_credentials`
+  rather than writing a second one. Every read and write on both sides is
+  `poll`-deadline-bounded, which closes ADR-0001's unbounded-read residual for
+  this path.
+- **Honest about events.** `EventSink` is caller-side by design, so a
+  supervisor with no caller has nowhere to deliver to. Nothing was invented to
+  paper over that: the supervisor keeps a bounded ring of 32 events in the
+  record, oldest dropped, and says so in the constant, the schema doc, and the
+  client module. A consumer that needs every event stays connected.
+- **Honest about the record.** Schema v2 adds `supervisor`, `exit` and
+  `events`. v1 compatibility is explicit rather than lenient: the version probe
+  chooses between two `deny_unknown_fields` shapes, a v1 record is parsed as v1
+  and upgraded *in memory* (absence reported, never invented), the file is not
+  touched until something writes it, and a version neither shape implements is
+  still refused. `docs/lifecycle/session-record-v1.md` is now both the
+  historical schema and the compatibility test's fixture.
+- **Honest about recovery.** `reconcile` gained a third pure input,
+  `SupervisorPresence`, and a `RecoveryDecision::Attachable` that outranks every
+  child probe but *not* `AlreadyVerified` — a proven cleanup stays terminal. An
+  attachable record is deliberately **not** moved to `Failed`: the live
+  supervisor owns it, and overwriting it from a stale copy would be the
+  two-writers hazard the store exists to avoid.
+- **Stated limits, not omissions.** A headless detached run's standard streams
+  are `/dev/null` — a supervisor holding its launcher's pipes is precisely what
+  detachment is for, and giving output back is slice C's PTY. Gate expiry stays
+  lazily evaluated at the next control operation, exactly as on the attached
+  path, so an abandoned never-activated detached session holds its supervisor
+  until that next operation notices the deadline.
+- **Tests.** A new `harness = false` target, `tests/lifecycle_detached.rs`,
+  whose own `main` installs the entry hook — libtest owns `main` and offers no
+  pre-main hook. The same `main` is what makes the R09 core proof possible: the
+  binary re-runs *itself* as a launcher that prepares a detached session, prints
+  the session id and token, and exits, after which a process that forked nothing
+  involved recovers, attaches, activates and waits.
+- Gates: 213 unit (181 + 32); `--test lifecycle_detached` 15 passed / 1 ignored
+  x3, with no leaked supervisor processes and no leftover store directories;
+  `--test lifecycle_live` 25 passed x3, unmodified; loom 7/7 unchanged;
+  workspace 3669/0/2 across 34 suites; strict clippy clean (also under
+  `nono_loom`); fmt clean; both lint scripts exit 0; no new dependency.
+- Removal detection (each restored to green afterwards): deleting the hello
+  version check greets a wrong-version client instead of refusing it
+  (`left: Hello{protocol: 1, …}`); deleting the frame-length bound makes the
+  supervisor read a body that never arrives, and the oversize test fails with
+  "the supervisor must answer"; deleting the stale-socket unlink from `recover`
+  fails with "recovery must remove the stale socket it just proved dead";
+  deleting the hello-first guard serves a `Status` sent before any hello.
+- One API addition beyond the slice's own surface, and it is deliberate:
+  `ActivationHandle::{token, from_parts}` are now public. A detached run is
+  activated by whichever process holds the token, which is very often not the
+  one that prepared it, and the library cannot transport the bytes on a
+  caller's behalf. The docs say plainly that they are a start button and that
+  where they go is the caller's decision — and that the ready-made answer for
+  the detached path needs no decision at all, because `prepare_detached`
+  already returns a connected session that carries the token over its own
+  uid-checked socket.
+- Not verified, and named as such: the Linux `close_range` arm of the extended
+  descriptor sweep is the only new platform-specific code and, like every other
+  Linux path in this module, has not been executed on a Linux kernel by this
+  stream (R07).
+
+### Iteration 8 (cont.): adversarial review #2 — approve-with-fixes, all seven applied
+
+The reviewer confirmed the core invariants clean (descriptor trace, sole
+`gate_write` holder, frame bounds, ring token-material guard, v2 load bounds)
+and raised seven items. All applied before commit.
+
+1. **(MEDIUM) The peer-uid guard was not removal-detectable.** The honest
+   version of the problem: only the *pure* `accept_decision` table had tests, so
+   deleting the `peer_uid` call — or hardcoding `AcceptDecision::Serve` — left
+   the whole suite green. A guard nothing can break is a guard nobody is
+   keeping. The accept path is now the free function `accept_or_refuse`, the
+   credential source has a `#[cfg(test)]` thread-local injection seam (compiled
+   out of every release build, so no runtime path can make a real connection's
+   credential anything but the kernel's answer), and three tests drive the
+   *live* path with a real listener and a real connection: foreign uid closed
+   with nothing written, own uid served, busy refused in words. Both removals
+   now fail, transcripts in the report.
+2. **(MEDIUM) The token's socket hop was not zeroized.** `write_frame`'s
+   serialization buffer, its assembled frame, `read_frame`'s body, the readiness
+   frame, and the `Activate` token copy on both sides all dropped un-wiped.
+   Fixed unconditionally rather than on the paths that "can" carry a token: a
+   branch deciding which frame is secret is a branch that can be got wrong, and
+   the existing `GateSecrets` discipline is unconditional for the same reason.
+3. The request read is bounded by a new `REQUEST_DEADLINE` (2 s) rather than the
+   10 s reply allowance. A request is a few hundred bytes the client wrote in
+   one call; a peer that sends three of them and stops was otherwise holding the
+   one thread that also accepts connections and watches the child, for the full
+   allowance, on every cycle. Replies keep the longer bound because a reply can
+   legitimately follow a `wait`.
+4. Close-on-exec is re-armed on all five inherited descriptors as soon as the
+   supervisor has them. The intermediate had to clear the flag to pass them
+   through the exec and the customer child was forked before that, so nothing is
+   left that needs to inherit any of them — and slice C's PTY path will exec.
+5. The `SIGCHLD` self-pipe is installed *before* the readiness write, so
+   `HANDSHAKE_READY` means fully ready rather than nearly. Otherwise a child
+   that died immediately after activation was noticed only by the 250 ms
+   backstop, in a window a caller had already been told was serving.
+6. The handshake no longer assumes `SPAWNED` arrives before `READY`. Two
+   unsynchronized writers share that pipe: the supervisor is forked *before* the
+   intermediate writes its record, so in principle it can exec, adopt and report
+   first. In practice the intermediate wins every time — which is exactly what
+   made the assumption dangerous, since the failure would be a typed error on a
+   race that reproduces never. `await_handshake` now tolerates either order and
+   is bounded by a record count as well as a deadline.
+7. `MAX_CONTROL_FRAME_BYTES` is now `MAX_RECORD_BYTES` + a 4 KiB envelope
+   allowance (69632). The two were equal, and a status reply is a record *inside*
+   a `SessionStatus` inside a tagged `ControlReply` — so a record that was
+   perfectly legal to write could have been refused on the wire, with the
+   failure landing on the reply rather than on the write that caused it. The
+   inequality is held by a module-level `const _: () = assert!(…)`, so a build
+   that broke it would not compile, and the "always fits" comment now states the
+   arithmetic instead of asserting the conclusion.
+- Gates after: 218 unit (213 + 5 new: 3 live-accept, 1 request-bound, 1
+  frame-bound arithmetic); `--test lifecycle_detached` 15 passed x3;
+  `--test lifecycle_live` 25 passed x3; loom 7/7; workspace 3674/0/2 across 34
+  suites; strict clippy clean (also under `nono_loom`); fmt clean; both lint
+  scripts exit 0; doctests 11.
+- Removal detection for finding 1 (both restored to green afterwards): replacing
+  `peer_uid(stream.as_raw_fd())` with `Some(own_uid())` fails
+  `the_live_accept_path_consults_the_peer_credential` with "a connection from
+  another uid must not become the client"; replacing the whole
+  `accept_decision(…)` consult with a hardcoded `AcceptDecision::Serve` fails
+  that test *and* `the_live_accept_path_refuses_a_second_client_in_words`.

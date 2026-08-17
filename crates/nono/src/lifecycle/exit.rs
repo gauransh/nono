@@ -471,6 +471,41 @@ impl ActivatedSandbox {
             return Ok(exit.clone());
         }
         let outcome = reap(self.identity.pid())?;
+        Ok(self.record_child_exit(outcome))
+    }
+
+    /// Ask whether the program has ended, without waiting for it to.
+    ///
+    /// The same observation as [`Self::wait`] and with the same bookkeeping —
+    /// the activation question is sharpened, the event is emitted, the record is
+    /// written — but through `WNOHANG`, so a run that is still going answers
+    /// `None` instead of parking the caller.
+    ///
+    /// Exists because the detached supervisor has one thread and several things
+    /// to watch: a blocking `waitpid` there would stop it serving its control
+    /// socket for as long as the customer's program chose to run. A stop or
+    /// continue report is *not* a death, so it answers `None` too.
+    ///
+    /// # Errors
+    ///
+    /// [`ReapError`] when `waitpid` itself fails, in which case nothing was
+    /// observed and nothing is recorded.
+    pub(crate) fn try_wait(&mut self) -> Result<Option<SandboxExit>, ReapError> {
+        if let Some(exit) = &self.reaped {
+            return Ok(Some(exit.clone()));
+        }
+        let Some(outcome) = try_reap(self.identity.pid())? else {
+            return Ok(None);
+        };
+        Ok(Some(self.record_child_exit(outcome)))
+    }
+
+    /// Shared tail of the two waits: sharpen, report, transition, cache.
+    ///
+    /// A normal exit resolves the activation question, because only a child
+    /// that reached `execve` can exit normally without having written a status
+    /// record first.
+    fn record_child_exit(&mut self, outcome: ExitOutcome) -> SandboxExit {
         if matches!(outcome, ExitOutcome::Exited { .. }) {
             self.activation = ActivationObservation::Observed;
         }
@@ -478,10 +513,10 @@ impl ActivatedSandbox {
             .emit(LifecycleEventKind::ChildExited { outcome });
         let exit = SandboxExit::new(outcome, self.activation, self.identity.clone());
         // The state machine refuses a second ChildExited, which is why the
-        // cached read above returns before reaching this line.
+        // cached reads above return before reaching this line.
         self.transition(LifecycleOp::ChildExited);
         self.reaped = Some(exit.clone());
-        Ok(exit)
+        exit
     }
 
     /// End the run now, and wait until the death is observed.
@@ -662,6 +697,39 @@ pub(crate) fn reap(pid: i32) -> Result<ExitOutcome, ReapError> {
             // Stopped, continued, and ptrace reports are not deaths; keep
             // waiting for one.
             Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(errno) => {
+                return Err(ReapError {
+                    pid,
+                    errno: errno as i32,
+                });
+            }
+        }
+    }
+}
+
+/// Ask whether `pid` has been reaped, without waiting for it.
+///
+/// `Ok(None)` means the process is still there — either running, or stopped and
+/// continued, neither of which is a death. `WNOHANG` makes this safe to call
+/// from a poll loop that must not park.
+pub(crate) fn try_reap(pid: i32) -> Result<Option<ExitOutcome>, ReapError> {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::Pid;
+
+    let target = Pid::from_raw(pid);
+    loop {
+        match waitpid(target, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(_, code)) => return Ok(Some(ExitOutcome::Exited { code })),
+            Ok(WaitStatus::Signaled(_, signal, _)) => {
+                return Ok(Some(ExitOutcome::Signaled {
+                    signal: signal as i32,
+                }));
+            }
+            // `StillAlive` is what `WNOHANG` answers with when there is nothing
+            // to reap; stop, continue, and ptrace reports are not deaths
+            // either, and neither is worth blocking for.
+            Ok(_) => return Ok(None),
             Err(nix::errno::Errno::EINTR) => {}
             Err(errno) => {
                 return Err(ReapError {

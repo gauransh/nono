@@ -39,6 +39,7 @@
 
 use super::exit::{PreExecStage, SupervisorStage};
 use super::state::LifecycleState;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -76,6 +77,21 @@ impl GateSecrets {
         getrandom::fill(&mut release)?;
         getrandom::fill(&mut abort)?;
         Ok(Self { release, abort })
+    }
+
+    /// Rebuild the pair a child was forked with, on the far side of an
+    /// `execve`.
+    ///
+    /// The detached supervisor's one legitimate use: the customer child already
+    /// holds these two messages, so a supervisor that drew fresh ones could
+    /// only ever make it refuse. The bytes reach that supervisor on a private
+    /// pipe and the buffer they arrive in is zeroized as soon as this has
+    /// copied them.
+    pub(crate) fn from_parts(
+        release: [u8; GATE_MESSAGE_BYTES],
+        abort: [u8; GATE_MESSAGE_BYTES],
+    ) -> Self {
+        Self { release, abort }
     }
 
     pub(crate) fn release(&self) -> &[u8; GATE_MESSAGE_BYTES] {
@@ -164,7 +180,41 @@ impl ActivationHandle {
         self.generation
     }
 
-    pub(crate) fn token(&self) -> &[u8; ACTIVATION_TOKEN_BYTES] {
+    /// Rebuild a handle from parts that crossed a process boundary.
+    ///
+    /// Needed because a detached run is activated by *whichever process holds
+    /// the token*, which is very often not the one that prepared it: that is
+    /// the whole point of a session that survives its caller. The library
+    /// cannot transport the token — it does not know where the caller's other
+    /// process is — so the caller does, and this is how the bytes become a
+    /// handle again at the far end.
+    ///
+    /// Constructing one proves nothing. The gate checks the session, the
+    /// generation, its own state, its expiry, and the token's digest, and a
+    /// handle built from wrong bytes fails the last of those exactly as a
+    /// forged one always has.
+    #[must_use]
+    pub fn from_parts(
+        session_id: Uuid,
+        generation: u64,
+        token: [u8; ACTIVATION_TOKEN_BYTES],
+    ) -> Self {
+        Self::new(session_id, generation, token)
+    }
+
+    /// The token bytes, for a caller that has to move them somewhere.
+    ///
+    /// Exposed for the same reason [`Self::from_parts`] is, and with the same
+    /// warning attached: these bytes are a start button for a held child. The
+    /// library never places them in argv, an environment, a log, a `Debug`
+    /// rendering, or a session record. Where a caller puts them, and what
+    /// protects them there, is the caller's decision — and for the detached
+    /// path there is a ready-made answer that needs no decision at all, because
+    /// [`super::SessionStore::prepare_detached`] already returns a connected
+    /// [`super::DetachedSession`] that will carry the token over its own
+    /// uid-checked private socket.
+    #[must_use]
+    pub fn token(&self) -> &[u8; ACTIVATION_TOKEN_BYTES] {
         &self.token
     }
 }
@@ -218,7 +268,12 @@ pub(crate) fn ct_eq(left: &[u8], right: &[u8]) -> bool {
 ///
 /// The messages name no secret — not the token, not the digest, not a byte of
 /// either.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+///
+/// Serializable because a detached supervisor refuses activations on the far
+/// side of a socket: the client must receive the *same* typed refusal it would
+/// have got in-process, not a rendered string it has to parse back.
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "activation_error", rename_all = "snake_case")]
 pub enum ActivationError {
     /// The handle belongs to a different session.
     #[error("activation handle is for session {supplied}, not {expected}")]
@@ -299,7 +354,12 @@ impl ActivationError {
 }
 
 /// Everything a pre-activation stop can be refused for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+///
+/// Serializable for the same reason [`ActivationError`] is: a stop asked for
+/// over a detached supervisor's control socket must be refused with the typed
+/// answer, not a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "stop_error", rename_all = "snake_case")]
 pub enum StopError {
     /// A stop is not legal from this state — the run already ended, or was
     /// already stopped.

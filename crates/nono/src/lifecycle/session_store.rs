@@ -106,13 +106,17 @@ use super::cleanup::{
     AbsenceBasis, CleanupError, CleanupVerification, DeathObservation, IndeterminateReason,
     SurvivorEvidence, UnsupportedReason, probe_identity, verify_and_record,
 };
-use super::events::{EventEmitter, LifecycleEventKind};
-use super::exit::{ActivationObservation, kill_group, kill_pid};
+use super::detached::{DetachedError, DetachedSession};
+use super::events::{
+    DETACHED_EVENT_RING_CAPACITY, EventEmitter, EventRing, LifecycleEvent, LifecycleEventKind,
+};
+use super::exit::{ActivationObservation, SandboxExit, kill_group, kill_pid};
 use super::gate::{ActivationHandle, StopError};
 use super::identity::ProcessIdentity;
 use super::plan::{MAX_PLAN_METADATA_BYTES, ValidatedPlan};
-use super::prepare::PreparedSandbox;
+use super::prepare::{PrepareError, PreparedSandbox};
 use super::state::{LifecycleOp, LifecycleState};
+use super::supervisor;
 use super::sync_core::SharedLifecycle;
 use nix::dir::Dir;
 use nix::fcntl::{OFlag, open, openat, renameat};
@@ -128,12 +132,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// The schema version this build writes, and the only one it reads.
+/// The schema version this build writes.
 ///
-/// Version 1 is the first: there is no older layout to migrate from, so a
-/// record claiming any other version — higher *or* lower — is refused rather
-/// than interpreted.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// Version 2 added the three fields a detached supervisor needs: the
+/// supervisor's own [`ProcessIdentity`], the run's [`SandboxExit`], and the
+/// bounded ring of [`LifecycleEvent`]s observed while no caller was connected.
+/// A record claiming a version this build has never heard of — anything above
+/// this number — is still refused rather than interpreted.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+
+/// The oldest schema version this build can still read.
+///
+/// Version 1 records are loaded through their own shape and upgraded in memory:
+/// they carry no supervisor, no exit facts, and no event ring, because nothing
+/// that wrote them had any. The upgrade is explicit rather than a lenient parse
+/// — the record types are `deny_unknown_fields` in both directions, so a v1
+/// record cannot be read as a v2 one or the other way round, and a version
+/// nobody implemented cannot slip through as "close enough".
+///
+/// A loaded v1 record is written back as v2 at its next update. That is the
+/// only migration: it happens on write, never on read, so a store that is only
+/// read is never modified.
+pub const OLDEST_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// Largest record this store will write or read, in bytes.
 ///
@@ -370,6 +390,87 @@ pub struct SessionRecord {
     updated_unix_millis: Option<u64>,
     /// The caller's opaque bytes, copied from the plan and never interpreted.
     metadata: Vec<u8>,
+    /// The process supervising this run, when one exists.
+    ///
+    /// `None` for an attached run: the supervisor is the calling process, and a
+    /// record that named it would be claiming that the *caller* can be probed
+    /// for liveness after the caller is gone, which is circular. `Some` only
+    /// for a detached run, where the supervisor is a separate process whose
+    /// identity is exactly what tells a later reader whether the control socket
+    /// beside this record is live or stale.
+    ///
+    /// Schema v2. Absent from v1 records, which predate detachment.
+    supervisor: Option<ProcessIdentity>,
+    /// How the run ended, once its end was observed.
+    ///
+    /// The point of a detached supervisor: `waitpid` happens in a process that
+    /// is still there when the customer's program exits, so the exit facts are
+    /// *witnessed* and then written here. A caller that reconnects an hour
+    /// later reads a fact rather than an inference. `None` until the end is
+    /// observed, and never filled in from a probe — an absent process is not an
+    /// exit code.
+    ///
+    /// Schema v2.
+    exit: Option<SandboxExit>,
+    /// The last events this run produced, oldest first.
+    ///
+    /// Bounded at [`DETACHED_EVENT_RING_CAPACITY`][cap] and oldest-dropped.
+    /// Written only by a detached supervisor, which has no caller-side
+    /// [`EventSink`][sink] to deliver to; an attached run's events go to the
+    /// caller's own sink live and are not duplicated here.
+    ///
+    /// Schema v2.
+    ///
+    /// [cap]: super::DETACHED_EVENT_RING_CAPACITY
+    /// [sink]: super::EventSink
+    events: Vec<LifecycleEvent>,
+}
+
+/// A schema-v1 record, exactly as version 1 wrote it.
+///
+/// Kept as its own shape rather than made lenient on the live type, so that
+/// "what version 1 looked like" stays a checkable fact instead of a comment.
+/// `deny_unknown_fields` in both directions is what makes the two versions
+/// distinguishable at all: without it a v2 record would parse as a v1 one with
+/// its new fields silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRecordV1 {
+    schema_version: u32,
+    session_id: Uuid,
+    generation: u64,
+    identity: ProcessIdentity,
+    process_group: i32,
+    state: LifecycleState,
+    activation: Option<ActivationObservation>,
+    created_unix_millis: Option<u64>,
+    updated_unix_millis: Option<u64>,
+    metadata: Vec<u8>,
+}
+
+impl From<SessionRecordV1> for SessionRecord {
+    fn from(old: SessionRecordV1) -> Self {
+        Self {
+            // Upgraded in memory. The file on disk is untouched until something
+            // writes it, and what it writes then is a v2 record.
+            schema_version: CURRENT_SCHEMA_VERSION,
+            session_id: old.session_id,
+            generation: old.generation,
+            identity: old.identity,
+            process_group: old.process_group,
+            state: old.state,
+            activation: old.activation,
+            created_unix_millis: old.created_unix_millis,
+            updated_unix_millis: old.updated_unix_millis,
+            metadata: old.metadata,
+            // Nothing that wrote a v1 record had a detached supervisor, could
+            // witness an exit after a restart, or kept an event ring. The
+            // absence is reported as absence and never invented.
+            supervisor: None,
+            exit: None,
+            events: Vec::new(),
+        }
+    }
 }
 
 impl SessionRecord {
@@ -394,7 +495,20 @@ impl SessionRecord {
             created_unix_millis: now,
             updated_unix_millis: now,
             metadata,
+            supervisor: None,
+            exit: None,
+            events: Vec::new(),
         }
+    }
+
+    /// Name the process supervising this run.
+    ///
+    /// Set once, by the detached supervisor itself, before the record's first
+    /// write: the identity is the supervisor's own, captured in the supervisor,
+    /// so it is a fact about a process that exists rather than a claim the
+    /// launcher makes about one it has just forked.
+    pub(crate) fn set_supervisor(&mut self, supervisor: ProcessIdentity) {
+        self.supervisor = Some(supervisor);
     }
 
     /// The schema version this record carries.
@@ -460,11 +574,55 @@ impl SessionRecord {
         &self.metadata
     }
 
+    /// The process supervising this run, if it is a detached one.
+    ///
+    /// The identity, not merely the pid: whether the socket beside this record
+    /// is live or stale is decided by
+    /// [`ProcessIdentity::is_same_process`][same], and a bare pid can be
+    /// reissued to anything.
+    ///
+    /// [same]: super::ProcessIdentity::is_same_process
+    #[must_use]
+    pub fn supervisor(&self) -> Option<&ProcessIdentity> {
+        self.supervisor.as_ref()
+    }
+
+    /// How the run ended, if its end was witnessed and written here.
+    ///
+    /// Only a detached supervisor fills this in, because only a detached
+    /// supervisor is still alive to `waitpid` when the customer's program ends.
+    #[must_use]
+    pub fn exit(&self) -> Option<&SandboxExit> {
+        self.exit.as_ref()
+    }
+
+    /// The events kept for a caller that was not connected, oldest first.
+    ///
+    /// Bounded and oldest-dropped; empty for an attached run and for every v1
+    /// record. See [`DETACHED_EVENT_RING_CAPACITY`][cap].
+    ///
+    /// [cap]: super::DETACHED_EVENT_RING_CAPACITY
+    #[must_use]
+    pub fn events(&self) -> &[LifecycleEvent] {
+        &self.events
+    }
+
     /// Move the record to a newly observed state.
     fn observe(&mut self, state: LifecycleState, activation: Option<ActivationObservation>) {
         self.state = state;
         if activation.is_some() {
             self.activation = activation;
+        }
+        self.updated_unix_millis = now_unix_millis();
+    }
+
+    /// Record the run's end.
+    ///
+    /// Written once and never overwritten: a run ends once, and a second write
+    /// could only ever come from a second observation of the same death.
+    fn observe_exit(&mut self, exit: SandboxExit) {
+        if self.exit.is_none() {
+            self.exit = Some(exit);
         }
         self.updated_unix_millis = now_unix_millis();
     }
@@ -489,6 +647,15 @@ impl SessionRecord {
                 why: format!(
                     "metadata is {} bytes (max {MAX_PLAN_METADATA_BYTES})",
                     self.metadata.len()
+                ),
+            });
+        }
+        if self.events.len() > DETACHED_EVENT_RING_CAPACITY {
+            return Err(SessionStoreError::SessionCorrupt {
+                path: path.to_path_buf(),
+                why: format!(
+                    "event ring holds {} events (max {DETACHED_EVENT_RING_CAPACITY})",
+                    self.events.len()
                 ),
             });
         }
@@ -536,6 +703,28 @@ impl SessionSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum RecoveryDecision {
+    /// A detached supervisor is still running and can be talked to.
+    ///
+    /// The one decision that offers an *action* rather than an observation,
+    /// because it is the one case where the run is still being watched by
+    /// something that can answer questions about it. Reached only when the
+    /// record names a supervisor and that supervisor's whole identity — pid,
+    /// start time, boot — still matches; a reissued pid answers
+    /// [`SupervisorPresence::Gone`] and falls through to the rows below.
+    ///
+    /// Ranked below [`Self::AlreadyVerified`] and above everything else: a
+    /// proven cleanup is terminal and may not be reopened, but for every other
+    /// state a live supervisor owns its own record, and a reader that overruled
+    /// it from a stale copy of that record would be the two-writers problem
+    /// this module exists to avoid.
+    ///
+    /// Carries no evidence of its own because the evidence is
+    /// [`SupervisorPresence::Alive`], which the caller supplied; the identity
+    /// that answered the probe is on the record
+    /// ([`SessionRecord::supervisor`]) and on the recovered session
+    /// ([`RecoveredSession::supervisor`]).
+    Attachable,
+
     /// The record already said cleanup was proven. Nothing is adopted and
     /// nothing is re-verified, whatever a probe of the long-since-reissued pid
     /// says now.
@@ -571,11 +760,64 @@ pub enum RecoveryDecision {
     },
 }
 
+/// Whether the process supervising a recorded run is still that process.
+///
+/// Three-valued rather than a `bool`, because "this record never had a
+/// supervisor" and "this record had one and it is gone" are different facts
+/// with different consequences: the first is an attached run whose caller went
+/// away, the second is a detached run whose supervisor died and left a stale
+/// socket behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorPresence {
+    /// The record names no supervisor: the run was never detached.
+    NeverDetached,
+    /// The recorded supervisor answered the identity probe.
+    Alive,
+    /// The record names a supervisor that is not the process running now.
+    Gone,
+}
+
+impl SupervisorPresence {
+    /// Probe a recorded supervisor identity, fail-closed.
+    ///
+    /// Everything ambiguous — an unreadable start time, a changed boot, a pid
+    /// that no longer exists — answers [`Self::Gone`], because
+    /// [`ProcessIdentity::is_same_process`] is itself fail-closed. Adopting a
+    /// socket on a "probably" would mean talking to whatever inherited the
+    /// number.
+    #[must_use]
+    pub fn of(supervisor: Option<&ProcessIdentity>) -> Self {
+        match supervisor {
+            None => Self::NeverDetached,
+            Some(identity) if identity.is_same_process() => Self::Alive,
+            Some(_) => Self::Gone,
+        }
+    }
+
+    /// The stable snake_case name, identical to the serde representation.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeverDetached => "never_detached",
+            Self::Alive => "alive",
+            Self::Gone => "gone",
+        }
+    }
+}
+
+impl std::fmt::Display for SupervisorPresence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl RecoveryDecision {
     /// The stable snake_case name, identical to the serde tag.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Attachable => "attachable",
             Self::AlreadyVerified => "already_verified",
             Self::ProcessGone { .. } => "process_gone",
             Self::StillRunning { .. } => "still_running",
@@ -588,6 +830,12 @@ impl RecoveryDecision {
     #[must_use]
     pub fn is_process_gone(&self) -> bool {
         matches!(self, Self::ProcessGone { .. })
+    }
+
+    /// Whether a live supervisor can be connected to.
+    #[must_use]
+    pub fn is_attachable(&self) -> bool {
+        matches!(self, Self::Attachable)
     }
 
     /// Whether this decision adopts a live process.
@@ -614,15 +862,33 @@ impl std::fmt::Display for RecoveryDecision {
 /// the race between a recovery and a concurrent cleanup be modelled
 /// exhaustively (`tests/loom_lifecycle.rs`) rather than argued about.
 ///
-/// The single rule that is not a straight translation of the verdict is the
-/// first: a record already in [`LifecycleState::CleanupVerified`] answers
+/// Two rules are not straight translations of the verdict, and they are checked
+/// in this order.
+///
+/// A live supervisor wins outright: [`SupervisorPresence::Alive`] answers
+/// [`RecoveryDecision::Attachable`] whatever the record says and whatever the
+/// child probe found, because a process that is still watching the run is a
+/// better authority on it than a copy of a record it is still writing.
+///
+/// Then, for every record with no live supervisor, one already in
+/// [`LifecycleState::CleanupVerified`] answers
 /// [`RecoveryDecision::AlreadyVerified`] whatever the probe found. A pid that
 /// was proven absent and has since been reissued would otherwise look like a
 /// survivor to adopt.
 #[must_use]
-pub fn reconcile(state: LifecycleState, verdict: &CleanupVerification) -> RecoveryDecision {
+pub fn reconcile(
+    state: LifecycleState,
+    verdict: &CleanupVerification,
+    supervisor: SupervisorPresence,
+) -> RecoveryDecision {
     if state == LifecycleState::CleanupVerified {
+        // Checked before the supervisor, so a session whose cleanup was proven
+        // is never re-adopted even if a supervisor is somehow still up: the
+        // proof is terminal and nothing may reopen it.
         return RecoveryDecision::AlreadyVerified;
+    }
+    if supervisor == SupervisorPresence::Alive {
+        return RecoveryDecision::Attachable;
     }
     match verdict {
         CleanupVerification::ConfirmedAbsent { basis } => {
@@ -733,6 +999,13 @@ impl SessionStore {
         &self,
         plan: ValidatedPlan,
     ) -> Result<(PreparedSandbox, ActivationHandle), LifecycleError> {
+        // Refused here rather than run attached: this path returns a
+        // `PreparedSandbox` whose drop kills and reaps the child, which is the
+        // exact opposite of what a detached plan asked for. The typed refusal
+        // names the method that does implement it.
+        if plan.is_detached() {
+            return Err(PrepareError::DetachedNeedsSupervisor.into());
+        }
         let metadata = plan.metadata().to_vec();
         let (mut prepared, handle) = PreparedSandbox::prepare(plan)?;
         let record = SessionRecord::new(
@@ -751,12 +1024,97 @@ impl SessionStore {
         events.emit(LifecycleEventKind::RecordPersisted {
             schema_version: record.schema_version,
         });
-        prepared.attach_session(Arc::new(SessionHandle {
-            store: Arc::clone(&self.inner),
-            record: Mutex::new(record),
-            events: Some(events),
-        }));
+        prepared.attach_session(Arc::new(SessionHandle::attached(
+            Arc::clone(&self.inner),
+            record,
+            Some(events),
+        )));
         Ok((prepared, handle))
+    }
+
+    /// Prepare a sandboxed child under a supervisor that outlives this caller.
+    ///
+    /// The run that comes back is owned by a *different process*: a
+    /// re-execution of this binary, in its own session, holding the child and
+    /// serving a control socket beside the record. This call returns once that
+    /// supervisor has reported — over a private handshake descriptor — that it
+    /// has adopted the child, seen it reach the gate, and written the record.
+    /// Dropping the returned [`DetachedSession`] closes a socket; it does not
+    /// end the run.
+    ///
+    /// # The one line of cooperation this needs
+    ///
+    /// The supervisor is *this binary*, re-executed. It becomes a supervisor
+    /// only because [`supervisor_entry`][entry] is called at the top of `main`
+    /// and recognises the private marker in its environment. A binary that does
+    /// not call it will run its own `main` instead, report nothing, and this
+    /// call will fail at the readiness deadline with
+    /// [`PrepareError::SupervisorUnresponsive`], which names the hook. That is
+    /// the price of fork-safety, and ADR-0002 states it in full.
+    ///
+    /// [entry]: super::supervisor_entry
+    ///
+    /// # Errors
+    ///
+    /// [`LifecycleError::Prepare`] if the image could not be resolved, the
+    /// control socket could not be bound, the fork or the exec failed, the
+    /// child failed before the gate, or the supervisor never reported ready;
+    /// [`LifecycleError::Session`] if the store itself refused. In every
+    /// failing case the socket file is removed and no supervisor is left
+    /// running.
+    pub fn prepare_detached(
+        &self,
+        plan: ValidatedPlan,
+    ) -> Result<(DetachedSession, ActivationHandle), LifecycleError> {
+        supervisor::launch(self, plan)
+    }
+
+    /// Connect to the supervisor of an already-detached session.
+    ///
+    /// The direct route for a caller that knows the session id — after its own
+    /// restart, say. [`Self::recover`] is the route for a caller that does not
+    /// yet know whether the supervisor is alive at all: it reads the record,
+    /// probes the recorded supervisor identity, and only then offers this.
+    ///
+    /// # Errors
+    ///
+    /// [`DetachedError::NoSupervisor`] if the record names no supervisor or
+    /// names one that is not the process running now, and the connection errors
+    /// otherwise. A record that cannot be read is
+    /// [`DetachedError::Session`].
+    pub fn attach_control(&self, session_id: Uuid) -> Result<DetachedSession, DetachedError> {
+        let record = self.inner.load(session_id)?;
+        let Some(supervisor) = record.supervisor().cloned() else {
+            return Err(DetachedError::NoSupervisor { session_id });
+        };
+        // The identity, not the pid: a supervisor that died and whose number
+        // was reissued must not be connected to. The socket connect below would
+        // fail anyway — nothing is listening on a dead process's socket — but
+        // failing *here* is the honest answer, because the reason is that the
+        // supervisor is gone rather than that a connection was refused.
+        if !supervisor.is_same_process() {
+            return Err(DetachedError::NoSupervisor { session_id });
+        }
+        DetachedSession::connect(
+            &self.inner.socket_path(session_id),
+            session_id,
+            record.generation(),
+            supervisor,
+        )
+    }
+
+    /// Where a session's control socket lives.
+    ///
+    /// Derived from the session id and nothing else, so the name can never
+    /// carry a separator or leave the store directory.
+    #[must_use]
+    pub fn control_socket_path(&self, session_id: Uuid) -> PathBuf {
+        self.inner.socket_path(session_id)
+    }
+
+    /// The store's shared interior, for the supervisor launch.
+    pub(super) fn inner(&self) -> &Arc<StoreInner> {
+        &self.inner
     }
 
     /// Every record in the store, one `Result` at a time.
@@ -807,22 +1165,41 @@ impl SessionStore {
     pub fn recover(&self, session_id: Uuid) -> Result<RecoveredSession, SessionStoreError> {
         let record = self.inner.load(session_id)?;
 
-        // The probe first, the decision second, and the state move third. The
-        // decision reads the state the *record* claimed, not the one the
-        // supervisor-lost move below produces, so "was this already verified"
-        // is answered about what was on disk.
+        // Three probes, in this order, because each one changes what the next
+        // one means. The supervisor first: a live supervisor is still watching
+        // the run, so nothing below may declare it lost. The child's identity
+        // second. The pure decision third.
+        let presence = SupervisorPresence::of(record.supervisor());
         let verdict = probe_identity(record.identity());
-        let decision = reconcile(record.state(), &verdict);
+        let decision = reconcile(record.state(), &verdict, presence);
+
+        // A supervisor that is named but gone leaves its socket file behind:
+        // the process died without unlinking, and a stale socket is a name that
+        // answers `ECONNREFUSED` forever. Removed here, where its staleness has
+        // just been *established* by an identity check rather than guessed at
+        // from a failed connect.
+        if presence == SupervisorPresence::Gone {
+            self.inner.remove_socket(session_id);
+        }
 
         let shared = SharedLifecycle::new(record.state());
-        let handle = Arc::new(SessionHandle {
-            store: Arc::clone(&self.inner),
-            record: Mutex::new(record),
-            // A recovered run has no sink: the supervisor that supplied one is
-            // gone, which is why we are here at all.
-            events: None,
-        });
-        if let Ok(change) = shared.mark(LifecycleOp::SupervisorLost) {
+        let attachable = decision.is_attachable();
+        let generation = record.generation();
+        let socket = self.inner.socket_path(session_id);
+        let supervisor = record.supervisor().cloned();
+        let handle = Arc::new(SessionHandle::attached(
+            Arc::clone(&self.inner),
+            record,
+            // A recovered run has no sink: this process is not the one that
+            // supplied it, and the supervisor that did — if there is one — is
+            // reached over the socket, not through a callback.
+            None,
+        ));
+        // Only when the run really has lost its watcher. A detached session
+        // whose supervisor answered the identity probe has *not*: moving it to
+        // `Failed` here would overwrite the live supervisor's own record with a
+        // claim that contradicts the process still writing it.
+        if !attachable && let Ok(change) = shared.mark(LifecycleOp::SupervisorLost) {
             handle.persist(change.to, None);
         }
 
@@ -831,6 +1208,9 @@ impl SessionStore {
             shared,
             decision,
             observed: verdict,
+            socket,
+            generation,
+            supervisor,
         })
     }
 }
@@ -888,6 +1268,15 @@ pub struct RecoveredSession {
     shared: SharedLifecycle,
     decision: RecoveryDecision,
     observed: CleanupVerification,
+    /// Where this session's control socket is, whether or not anything is
+    /// listening on it.
+    socket: PathBuf,
+    /// The generation the record named, for the hello a reconnection sends.
+    generation: u64,
+    /// The supervisor the record named, if it named one. Present even when the
+    /// probe said it was gone — "the record says pid 4242 supervised this" is a
+    /// fact worth reporting alongside "and it is not there any more".
+    supervisor: Option<ProcessIdentity>,
 }
 
 impl RecoveredSession {
@@ -895,6 +1284,40 @@ impl RecoveredSession {
     #[must_use]
     pub fn decision(&self) -> RecoveryDecision {
         self.decision
+    }
+
+    /// The supervisor the record named, if any.
+    ///
+    /// Reported whether it is alive or not; [`Self::decision`] is what says
+    /// which.
+    #[must_use]
+    pub fn supervisor(&self) -> Option<&ProcessIdentity> {
+        self.supervisor.as_ref()
+    }
+
+    /// Connect to the live supervisor this recovery found.
+    ///
+    /// The point of R09: a caller that restarted reaches a run it did not
+    /// start, activates it if it never was, waits for facts a process it never
+    /// forked observed, and stops it. Legal only when [`Self::decision`] is
+    /// [`RecoveryDecision::Attachable`] — every other decision describes a
+    /// session with nothing left to talk to, and those keep the signal-and-probe
+    /// interface below.
+    ///
+    /// # Errors
+    ///
+    /// [`DetachedError::NoSupervisor`] when the decision was anything else, and
+    /// the connection errors otherwise.
+    pub fn attach(&self) -> Result<DetachedSession, DetachedError> {
+        let record = self.handle.snapshot();
+        let (RecoveryDecision::Attachable, Some(supervisor)) =
+            (self.decision, self.supervisor.clone())
+        else {
+            return Err(DetachedError::NoSupervisor {
+                session_id: record.session_id,
+            });
+        };
+        DetachedSession::connect(&self.socket, record.session_id, self.generation, supervisor)
     }
 
     /// The probe verdict the decision was made from.
@@ -1046,9 +1469,84 @@ pub(crate) struct SessionHandle {
     /// by the fact that we are recovering, gone, and a recovery has no plan to
     /// take one from.
     events: Option<Arc<EventEmitter>>,
+    /// The bounded ring a detached supervisor keeps, when this is one.
+    ///
+    /// `None` for every attached run: its events go to the caller's own sink,
+    /// live, and copying them into the record as well would be a second
+    /// delivery of the same facts through a lossier channel. `Some` only for a
+    /// detached supervisor, which has no caller to deliver to at all.
+    ring: Option<Arc<EventRing>>,
 }
 
 impl SessionHandle {
+    /// Build a handle for a run whose events go to a caller's sink.
+    pub(super) fn attached(
+        store: Arc<StoreInner>,
+        record: SessionRecord,
+        events: Option<Arc<EventEmitter>>,
+    ) -> Self {
+        Self {
+            store,
+            record: Mutex::new(record),
+            events,
+            ring: None,
+        }
+    }
+
+    /// Build a handle for a detached supervisor, which keeps its own ring.
+    pub(super) fn detached(
+        store: Arc<StoreInner>,
+        record: SessionRecord,
+        events: Arc<EventEmitter>,
+        ring: Arc<EventRing>,
+    ) -> Self {
+        Self {
+            store,
+            record: Mutex::new(record),
+            events: Some(events),
+            ring: Some(ring),
+        }
+    }
+
+    /// Write the run's end into the record, with the state it left behind.
+    ///
+    /// The one write a detached supervisor makes that an attached run cannot:
+    /// exit facts survive here precisely because the process that `waitpid`ed
+    /// is still running when the customer's program ends.
+    pub(crate) fn persist_exit(&self, state: LifecycleState, exit: &SandboxExit) {
+        let persisted = {
+            let mut guard = self.locked();
+            guard.observe(state, Some(exit.activation()));
+            guard.observe_exit(exit.clone());
+            self.fill_ring(&mut guard);
+            match self.store.update(&guard) {
+                Ok(()) => Some(guard.schema_version),
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %guard.session_id,
+                        state = %state,
+                        error = %err,
+                        "session record could not be updated; the run's exit facts are not durable"
+                    );
+                    None
+                }
+            }
+        };
+        if let (Some(schema_version), Some(events)) = (persisted, self.events.as_ref()) {
+            events.emit(LifecycleEventKind::RecordPersisted { schema_version });
+        }
+    }
+
+    /// Copy the supervisor's event ring into the record about to be written.
+    ///
+    /// Under the record lock and never the other way round: the ring's own lock
+    /// is only ever taken from here and from an emit, so the order record →
+    /// ring is the only order that exists.
+    fn fill_ring(&self, record: &mut SessionRecord) {
+        if let Some(ring) = &self.ring {
+            record.events = ring.snapshot();
+        }
+    }
     /// Record an already-observed state change.
     ///
     /// Deliberately infallible from the caller's side, and deliberately called
@@ -1070,6 +1568,7 @@ impl SessionHandle {
         let persisted = {
             let mut guard = self.locked();
             guard.observe(state, activation);
+            self.fill_ring(&mut guard);
             match self.store.update(&guard) {
                 Ok(()) => Some(guard.schema_version),
                 Err(err) => {
@@ -1096,6 +1595,29 @@ impl SessionHandle {
         self.locked().clone()
     }
 
+    /// A copy of the record with the live event ring folded in.
+    ///
+    /// For a status reply, which must show the events observed since the last
+    /// write without *causing* a write: an `fsync`ed record per status request
+    /// would make asking a question a durability operation.
+    pub(crate) fn snapshot_with_ring(&self) -> SessionRecord {
+        let mut record = self.locked().clone();
+        self.fill_ring(&mut record);
+        record
+    }
+
+    /// Report a fact this handle observed, labelled as reconstructed.
+    ///
+    /// For the one thing a detached supervisor learns about rather than
+    /// witnesses: a child that ended at the gate while nobody was asking. The
+    /// fidelity label is the point — the supervisor found the descriptor
+    /// closed, it did not see the death.
+    pub(crate) fn emit_reconstructed(&self, what: LifecycleEventKind) {
+        if let Some(events) = &self.events {
+            events.emit_with(what, super::events::Observation::Reconstructed);
+        }
+    }
+
     /// Take the record lock, recovering from a poisoned one.
     ///
     /// Same reasoning as the shared lifecycle core: the record is a plain value
@@ -1110,7 +1632,7 @@ impl SessionHandle {
 }
 
 /// The open store directory, and every operation that touches it.
-struct StoreInner {
+pub(super) struct StoreInner {
     /// The directory, opened `O_DIRECTORY | O_NOFOLLOW` once. Every record
     /// operation is `openat`-relative to this, so the path is never re-walked.
     dir: OwnedFd,
@@ -1123,6 +1645,39 @@ impl StoreInner {
     /// The full path of a record, for error messages.
     fn record_path(&self, session_id: Uuid) -> PathBuf {
         self.path.join(record_name(session_id))
+    }
+
+    /// The full path of a session's control socket.
+    ///
+    /// Lives in the same `0700` directory as the record, so the directory's
+    /// permissions are the socket's first line of defence and the peer-uid
+    /// check at accept is the second.
+    pub(super) fn socket_path(&self, session_id: Uuid) -> PathBuf {
+        self.path.join(socket_name(session_id))
+    }
+
+    /// Remove a session's control socket, if it is there.
+    ///
+    /// Best effort and `unlinkat`-relative to the directory descriptor, like
+    /// every other name operation in this store: a socket that is already gone
+    /// is the state we wanted, and a failure to remove one leaves a name that
+    /// answers `ECONNREFUSED` rather than a name that answers wrongly.
+    pub(super) fn remove_socket(&self, session_id: Uuid) {
+        let name = socket_name(session_id);
+        if let Err(errno) = unlinkat(&self.dir, name.as_str(), UnlinkatFlags::NoRemoveDir)
+            && errno != nix::errno::Errno::ENOENT
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                errno = errno as i32,
+                "a stale control socket could not be removed"
+            );
+        }
+    }
+
+    /// Write the first version of a record, for the supervisor.
+    pub(super) fn create_record(&self, record: &SessionRecord) -> Result<(), SessionStoreError> {
+        self.create(record)
     }
 
     /// Write a record for the first time.
@@ -1339,15 +1894,23 @@ impl std::fmt::Debug for StoreInner {
 /// Parse a record, refusing an unknown schema before trusting the shape.
 ///
 /// Two passes on purpose. The version is read first, from a probe that ignores
-/// every other field, because a record written by a later schema may not have
-/// the fields this build expects — and reporting "corrupt" for a file that is
-/// merely newer would send a reader looking for a disk fault.
+/// every other field, because a record written by a different schema may not
+/// have the fields this build expects — and reporting "corrupt" for a file that
+/// is merely older or newer would send a reader looking for a disk fault.
+///
+/// The version then chooses the *shape*, and each shape is
+/// `deny_unknown_fields`. That is what makes the compatibility explicit rather
+/// than lenient: a v1 record is parsed as a v1 record and upgraded, a v2 record
+/// is parsed as a v2 record, and a record whose version and fields disagree is
+/// corrupt in either direction. A version this build has never implemented is
+/// [`SessionStoreError::UnsupportedSchemaVersion`], never a best-effort read of
+/// fields whose meaning may have changed.
 fn decode(
     bytes: &[u8],
     path: &Path,
     expected_id: Uuid,
 ) -> Result<SessionRecord, SessionStoreError> {
-    /// Just enough of a record to find out whether we may read the rest.
+    /// Just enough of a record to find out which shape to read it as.
     #[derive(Deserialize)]
     struct VersionProbe {
         schema_version: u32,
@@ -1358,19 +1921,24 @@ fn decode(
             path: path.to_path_buf(),
             why: format!("schema version is unreadable: {err}"),
         })?;
-    if probe.schema_version != CURRENT_SCHEMA_VERSION {
-        return Err(SessionStoreError::UnsupportedSchemaVersion {
-            path: path.to_path_buf(),
-            found: probe.schema_version,
-            supported: CURRENT_SCHEMA_VERSION,
-        });
-    }
 
-    let record: SessionRecord =
-        serde_json::from_slice(bytes).map_err(|err| SessionStoreError::SessionCorrupt {
-            path: path.to_path_buf(),
-            why: err.to_string(),
-        })?;
+    let corrupt = |err: serde_json::Error| SessionStoreError::SessionCorrupt {
+        path: path.to_path_buf(),
+        why: err.to_string(),
+    };
+    let record: SessionRecord = match probe.schema_version {
+        OLDEST_SUPPORTED_SCHEMA_VERSION => serde_json::from_slice::<SessionRecordV1>(bytes)
+            .map_err(corrupt)?
+            .into(),
+        CURRENT_SCHEMA_VERSION => serde_json::from_slice(bytes).map_err(corrupt)?,
+        found => {
+            return Err(SessionStoreError::UnsupportedSchemaVersion {
+                path: path.to_path_buf(),
+                found,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+    };
     record.validate(path, expected_id)?;
     Ok(record)
 }
@@ -1444,6 +2012,15 @@ fn record_name(session_id: Uuid) -> String {
     format!("{session_id}.json")
 }
 
+/// The file name a session's control socket lives under.
+///
+/// Derived from the UUID exactly as [`record_name`] is, and with a different
+/// suffix, so a socket is never mistaken for a record by
+/// [`StoreInner::record_ids`] and a record is never mistaken for a socket.
+fn socket_name(session_id: Uuid) -> String {
+    format!("{session_id}.sock")
+}
+
 /// The session a file name names, or `None` if it names no session.
 ///
 /// Round-trip checked: the parsed id must render back to exactly the name that
@@ -1509,25 +2086,37 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
-    /// The golden example locked by the schema doc.
-    const GOLDEN_DOC: &str = include_str!("../../../../docs/lifecycle/session-record-v1.md");
-    const GOLDEN_PATH: &str = "docs/lifecycle/session-record-v1.md";
+    /// The golden example locked by the schema doc this build writes.
+    const GOLDEN_DOC: &str = include_str!("../../../../docs/lifecycle/session-record-v2.md");
+    const GOLDEN_PATH: &str = "docs/lifecycle/session-record-v2.md";
+
+    /// The schema doc for the version this build still *reads*.
+    const V1_DOC: &str = include_str!("../../../../docs/lifecycle/session-record-v1.md");
+    const V1_PATH: &str = "docs/lifecycle/session-record-v1.md";
+
+    fn golden_id() -> Uuid {
+        match Uuid::parse_str("019512f0-0000-7000-8000-000000000001") {
+            Ok(id) => id,
+            Err(_) => Uuid::nil(),
+        }
+    }
+
+    fn golden_identity() -> ProcessIdentity {
+        ProcessIdentity::from_parts(
+            4242,
+            Some(1_755_000_000_000_000),
+            Some("1754990000.000000".to_string()),
+        )
+    }
 
     /// The record the schema doc shows: every field at a fixed value, so the
     /// example in the doc is a thing that can be checked rather than described.
     fn golden_record() -> SessionRecord {
         SessionRecord {
             schema_version: CURRENT_SCHEMA_VERSION,
-            session_id: match Uuid::parse_str("019512f0-0000-7000-8000-000000000001") {
-                Ok(id) => id,
-                Err(_) => Uuid::nil(),
-            },
+            session_id: golden_id(),
             generation: 1,
-            identity: ProcessIdentity::from_parts(
-                4242,
-                Some(1_755_000_000_000_000),
-                Some("1754990000.000000".to_string()),
-            ),
+            identity: golden_identity(),
             process_group: 4242,
             state: LifecycleState::Running,
             activation: Some(ActivationObservation::Observed),
@@ -1536,6 +2125,25 @@ mod tests {
             // Opaque to this library, and shown here as bytes for exactly that
             // reason: the store copies them and never reads them.
             metadata: b"demo".to_vec(),
+            supervisor: Some(ProcessIdentity::from_parts(
+                4241,
+                Some(1_754_999_999_000_000),
+                Some("1754990000.000000".to_string()),
+            )),
+            exit: Some(SandboxExit::new(
+                crate::lifecycle::ExitOutcome::Exited { code: 0 },
+                ActivationObservation::Observed,
+                golden_identity(),
+            )),
+            events: vec![LifecycleEvent::from_parts(
+                Some(golden_id()),
+                1,
+                4,
+                UNIX_EPOCH + Duration::from_millis(1_755_000_000_123),
+                Some(golden_identity()),
+                crate::lifecycle::Observation::DirectlyObserved,
+                LifecycleEventKind::ExecObserved,
+            )],
         }
     }
 
@@ -1551,6 +2159,101 @@ mod tests {
         let parsed: SessionRecord = serde_json::from_str(&serialized)?;
         assert_eq!(parsed, golden_record());
         Ok(())
+    }
+
+    #[test]
+    fn the_v1_golden_example_still_loads_through_the_compatibility_path()
+    -> Result<(), SessionStoreError> {
+        // The doc for the old schema is the test fixture for reading it. A
+        // record written by a build that predates detachment must keep loading,
+        // and must load as *absence* rather than as invented defaults: no
+        // supervisor, no exit facts, no event ring.
+        let bytes = crate::lifecycle::doc_golden_example(V1_DOC, V1_PATH);
+        let record = decode(bytes.as_bytes(), Path::new(V1_PATH), golden_id())?;
+
+        assert_eq!(record.identity(), &golden_identity());
+        assert_eq!(record.state(), LifecycleState::Running);
+        assert_eq!(record.metadata(), b"demo");
+        assert_eq!(record.supervisor(), None, "a v1 record supervised nothing");
+        assert_eq!(record.exit(), None, "a v1 record witnessed no exit");
+        assert!(record.events().is_empty(), "a v1 record kept no ring");
+        assert_eq!(
+            record.schema_version(),
+            CURRENT_SCHEMA_VERSION,
+            "a loaded v1 record is upgraded in memory and written back as v2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_v2_record_is_not_readable_as_a_v1_one_or_the_other_way_round() {
+        // What makes the compatibility explicit rather than lenient. If either
+        // shape accepted the other's fields, the version number would stop
+        // being the thing that decides how a record is read.
+        let v2 = match serde_json::to_string(&golden_record()) {
+            Ok(json) => json,
+            Err(err) => panic!("the golden record must serialize: {err}"),
+        };
+        assert!(
+            serde_json::from_str::<SessionRecordV1>(&v2).is_err(),
+            "v2 fields must not be silently dropped by the v1 shape"
+        );
+
+        let v1 = crate::lifecycle::doc_golden_example(V1_DOC, V1_PATH);
+        assert!(
+            serde_json::from_str::<SessionRecord>(&v1).is_err(),
+            "a v1 record must not parse as v2 with its new fields defaulted"
+        );
+    }
+
+    #[test]
+    fn a_schema_version_nobody_implemented_is_still_refused() {
+        let ahead = format!(
+            r#"{{"schema_version": {}, "session_id": "{}"}}"#,
+            CURRENT_SCHEMA_VERSION.saturating_add(1),
+            golden_id()
+        );
+        let outcome = decode(ahead.as_bytes(), Path::new("ahead.json"), golden_id());
+        assert!(
+            matches!(
+                outcome,
+                Err(SessionStoreError::UnsupportedSchemaVersion { found, supported, .. })
+                    if found == CURRENT_SCHEMA_VERSION.saturating_add(1)
+                        && supported == CURRENT_SCHEMA_VERSION
+            ),
+            "a future schema must be named, not guessed at: {outcome:?}"
+        );
+        // And a version below the oldest supported one, which no build wrote.
+        let behind = r#"{"schema_version": 0, "session_id": "x"}"#;
+        assert!(matches!(
+            decode(behind.as_bytes(), Path::new("behind.json"), golden_id()),
+            Err(SessionStoreError::UnsupportedSchemaVersion { found: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn the_event_ring_is_bounded_and_drops_its_oldest() {
+        let ring = Arc::new(EventRing::new());
+        let emitter = EventEmitter::new(
+            Some(Arc::clone(&ring) as Arc<dyn crate::lifecycle::EventSink>),
+            golden_id(),
+            1,
+        );
+        let overflow = DETACHED_EVENT_RING_CAPACITY.saturating_add(5);
+        for _ in 0..overflow {
+            emitter.emit(LifecycleEventKind::GateReady);
+        }
+        let kept = ring.snapshot();
+        assert_eq!(kept.len(), DETACHED_EVENT_RING_CAPACITY);
+        // Oldest dropped, newest kept: the last sequence number emitted must be
+        // the last one in the ring.
+        let last = kept.last().map(LifecycleEvent::seq);
+        assert_eq!(last, Some(overflow.saturating_sub(1) as u64));
+        let first = kept.first().map(LifecycleEvent::seq);
+        assert_eq!(
+            first,
+            Some(overflow.saturating_sub(DETACHED_EVENT_RING_CAPACITY) as u64)
+        );
     }
 
     /// A private directory to build stores under.
@@ -1638,12 +2341,120 @@ mod tests {
             },
         ];
         for verdict in &verdicts {
+            for presence in [
+                SupervisorPresence::NeverDetached,
+                SupervisorPresence::Alive,
+                SupervisorPresence::Gone,
+            ] {
+                assert_eq!(
+                    reconcile(LifecycleState::CleanupVerified, verdict, presence),
+                    RecoveryDecision::AlreadyVerified,
+                    "a verified record must not be reconsidered: {verdict:?} / {presence}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_supervisor_outranks_every_probe_of_the_child() {
+        // The supervisor is the process still watching the run. A recovery that
+        // read "still present" or "gone" off the *child* and acted on it would
+        // be a second writer for a record the supervisor is still updating.
+        let verdicts = [
+            CleanupVerification::StillPresent {
+                survivors: SurvivorEvidence::IdentityMatch { pid: 42 },
+            },
+            CleanupVerification::ConfirmedAbsent {
+                basis: AbsenceBasis::PidAbsent { pid: 42 },
+            },
+            CleanupVerification::Indeterminate {
+                reason: IndeterminateReason::PidProbeDenied { pid: 42 },
+            },
+        ];
+        for verdict in &verdicts {
+            for state in [
+                LifecycleState::Prepared,
+                LifecycleState::Running,
+                LifecycleState::Exited,
+                LifecycleState::Failed,
+            ] {
+                assert_eq!(
+                    reconcile(state, verdict, SupervisorPresence::Alive),
+                    RecoveryDecision::Attachable,
+                    "{state} / {verdict:?} must be attachable while the supervisor lives"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_supervisor_that_is_gone_falls_back_to_the_slice_a_table() {
+        // The whole point of separating "never detached" from "gone": a
+        // detached session whose supervisor died must be treated exactly like
+        // an attached one whose caller died, not adopted over a dead socket.
+        let verdict = CleanupVerification::ConfirmedAbsent {
+            basis: AbsenceBasis::PidAbsent { pid: 42 },
+        };
+        for presence in [SupervisorPresence::NeverDetached, SupervisorPresence::Gone] {
             assert_eq!(
-                reconcile(LifecycleState::CleanupVerified, verdict),
-                RecoveryDecision::AlreadyVerified,
-                "a verified record must not be reconsidered: {verdict:?}"
+                reconcile(LifecycleState::Running, &verdict, presence),
+                RecoveryDecision::ProcessGone {
+                    basis: AbsenceBasis::PidAbsent { pid: 42 }
+                },
+                "{presence} must not be attachable"
             );
         }
+    }
+
+    #[test]
+    fn supervisor_presence_is_fail_closed() {
+        assert_eq!(
+            SupervisorPresence::of(None),
+            SupervisorPresence::NeverDetached
+        );
+        // This very process, which certainly is itself.
+        let live = ProcessIdentity::capture(current_pid());
+        assert_eq!(
+            SupervisorPresence::of(Some(&live)),
+            SupervisorPresence::Alive
+        );
+        // A pid that cannot be probed, and one whose start time moved.
+        let absent = ProcessIdentity::from_parts(i32::MAX, Some(1), boot_id());
+        assert_eq!(
+            SupervisorPresence::of(Some(&absent)),
+            SupervisorPresence::Gone
+        );
+        let reissued = ProcessIdentity::from_parts(
+            current_pid(),
+            live.start_time().map(|value| value.wrapping_add(1)),
+            boot_id(),
+        );
+        assert_eq!(
+            SupervisorPresence::of(Some(&reissued)),
+            SupervisorPresence::Gone,
+            "a reissued pid must never be adopted as a live supervisor"
+        );
+        // And an identity the platform would not fully describe.
+        let unreadable = ProcessIdentity::from_parts(current_pid(), None, boot_id());
+        assert_eq!(
+            SupervisorPresence::of(Some(&unreadable)),
+            SupervisorPresence::Gone
+        );
+    }
+
+    #[test]
+    fn presence_names_are_stable_snake_case() -> Result<(), serde_json::Error> {
+        for presence in [
+            SupervisorPresence::NeverDetached,
+            SupervisorPresence::Alive,
+            SupervisorPresence::Gone,
+        ] {
+            let json = serde_json::to_string(&presence)?;
+            assert_eq!(json, format!("\"{}\"", presence.as_str()));
+            assert_eq!(serde_json::from_str::<SupervisorPresence>(&json)?, presence);
+            assert_eq!(presence.to_string(), presence.as_str());
+        }
+        Ok(())
     }
 
     #[test]
@@ -1654,7 +2465,8 @@ mod tests {
                 state,
                 &CleanupVerification::ConfirmedAbsent {
                     basis: AbsenceBasis::BootIdChanged
-                }
+                },
+                SupervisorPresence::NeverDetached
             ),
             RecoveryDecision::ProcessGone {
                 basis: AbsenceBasis::BootIdChanged
@@ -1665,7 +2477,8 @@ mod tests {
                 state,
                 &CleanupVerification::StillPresent {
                     survivors: SurvivorEvidence::IdentityMatch { pid: 7 }
-                }
+                },
+                SupervisorPresence::NeverDetached
             ),
             RecoveryDecision::StillRunning {
                 survivors: SurvivorEvidence::IdentityMatch { pid: 7 }
@@ -1676,7 +2489,8 @@ mod tests {
                 state,
                 &CleanupVerification::Indeterminate {
                     reason: IndeterminateReason::IdentityUnreadable { pid: 7 }
-                }
+                },
+                SupervisorPresence::NeverDetached
             ),
             RecoveryDecision::Unsettled {
                 reason: IndeterminateReason::IdentityUnreadable { pid: 7 }
@@ -1687,7 +2501,8 @@ mod tests {
                 state,
                 &CleanupVerification::Unsupported {
                     reason: UnsupportedReason::NoProcessProbe
-                }
+                },
+                SupervisorPresence::NeverDetached
             ),
             RecoveryDecision::Unsupported {
                 reason: UnsupportedReason::NoProcessProbe
