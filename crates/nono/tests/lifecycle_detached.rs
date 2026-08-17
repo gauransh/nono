@@ -23,10 +23,12 @@
 //! be reporting success in the least useful way available.
 
 use nono::lifecycle::{
-    ActivationError, ActivationHandle, ActivationObservation, CleanupVerification, ControlRefusal,
-    ControlReply, ControlRequest, DetachedError, ExitOutcome, LifecycleError, LifecycleState,
-    MAX_CONTROL_FRAME_BYTES, PrepareError, RecoveryDecision, SandboxPlan, SessionStore,
-    SupervisorPresence, ValidatedPlan, WaitOutcome,
+    ActivationError, ActivationHandle, ActivationObservation, AttachAck, AttachTag,
+    AttachedTerminal, CleanupVerification, ControlRefusal, ControlReply, ControlRequest,
+    DetachedError, ExitOutcome, LifecycleError, LifecycleState, MAX_ATTACH_PAYLOAD_BYTES,
+    MAX_CONTROL_FRAME_BYTES, PrepareError, RecoveryDecision, SCROLLBACK_CAPACITY_BYTES,
+    SandboxPlan, SessionMode, SessionStore, SupervisorPresence, TerminalEvent, ValidatedPlan,
+    WaitOutcome, WindowSize,
 };
 use nono::{AccessMode, CapabilitySet};
 use std::io::{Read, Write};
@@ -41,6 +43,14 @@ use uuid::Uuid;
 /// Test scaffolding, not library protocol: the library's own marker is
 /// `NONO_LIFECYCLE_SUPERVISOR` and is set only by the launcher inside `nono`.
 const LAUNCHER_FLAG: &str = "NONO_DETACHED_TEST_LAUNCHER";
+
+/// The same idea for the interactive caller-restart proof.
+///
+/// A separate flag rather than an argument, because the two launchers do
+/// different things: this one *activates* the run and detaches from its
+/// terminal, so what the next process inherits is a session already producing
+/// output.
+const PTY_LAUNCHER_FLAG: &str = "NONO_DETACHED_TEST_PTY_LAUNCHER";
 
 /// How long any test waits for a process or a fact before giving up.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -60,6 +70,10 @@ fn main() {
 
     if let Some(store) = std::env::var_os(LAUNCHER_FLAG) {
         run_as_launcher(Path::new(&store));
+        return;
+    }
+    if let Some(store) = std::env::var_os(PTY_LAUNCHER_FLAG) {
+        run_as_terminal_launcher(Path::new(&store));
         return;
     }
 
@@ -123,6 +137,55 @@ fn main() {
         (
             "the_event_ring_survives_a_disconnect",
             the_event_ring_survives_a_disconnect,
+        ),
+        // R09 slice C: the terminal.
+        (
+            "an_interactive_run_gets_a_real_terminal_at_the_size_the_viewer_asked_for",
+            an_interactive_run_gets_a_real_terminal_at_the_size_the_viewer_asked_for,
+        ),
+        (
+            "a_resize_reaches_the_run_as_a_signal",
+            a_resize_reaches_the_run_as_a_signal,
+        ),
+        (
+            "a_detach_and_reattach_is_the_same_session_with_its_output_resumed",
+            a_detach_and_reattach_is_the_same_session_with_its_output_resumed,
+        ),
+        (
+            "an_interactive_session_outlives_the_process_that_prepared_it",
+            an_interactive_session_outlives_the_process_that_prepared_it,
+        ),
+        (
+            "a_run_that_ended_while_detached_yields_its_tail_and_then_its_end",
+            a_run_that_ended_while_detached_yields_its_tail_and_then_its_end,
+        ),
+        (
+            "input_bytes_reach_the_terminal_verbatim_however_hostile",
+            input_bytes_reach_the_terminal_verbatim_however_hostile,
+        ),
+        (
+            "a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run",
+            a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run,
+        ),
+        (
+            "an_oversize_input_frame_ends_the_channel_not_the_run",
+            an_oversize_input_frame_ends_the_channel_not_the_run,
+        ),
+        (
+            "an_attach_occupies_the_one_client_slot",
+            an_attach_occupies_the_one_client_slot,
+        ),
+        (
+            "the_scrollback_ring_stays_bounded_and_says_what_it_dropped",
+            the_scrollback_ring_stays_bounded_and_says_what_it_dropped,
+        ),
+        (
+            "a_headless_run_refuses_an_attach_with_a_reason",
+            a_headless_run_refuses_an_attach_with_a_reason,
+        ),
+        (
+            "an_interactive_plan_is_refused_where_nothing_can_own_a_terminal",
+            an_interactive_plan_is_refused_where_nothing_can_own_a_terminal,
         ),
     ];
 
@@ -211,6 +274,55 @@ fn run_as_launcher(store_path: &Path) {
     // Dropped, not detached: a caller that crashes does not say goodbye, and
     // the run must survive that too.
     std::mem::forget(session);
+    std::process::exit(0);
+}
+
+/// This binary, acting as the doomed launcher of the interactive proof.
+///
+/// Prepares an interactive detached session, attaches, *activates*, detaches
+/// cleanly, prints the session id and exits. What the next process inherits is
+/// a run that is already producing output on a terminal nobody is watching.
+fn run_as_terminal_launcher(store_path: &Path) {
+    let store = match SessionStore::open(store_path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("pty launcher: store: {err}");
+            std::process::exit(2);
+        }
+    };
+    let plan = interactive_plan(store_path, "/bin/sh", &["-c", COUNTER_SCRIPT]);
+    let (session, handle) = match store.prepare_detached(plan) {
+        Ok(pair) => pair,
+        Err(err) => {
+            eprintln!("pty launcher: prepare_detached: {err}");
+            std::process::exit(3);
+        }
+    };
+    let id = session.session_id();
+    let mut terminal = match session.attach(WindowSize::new(24, 80)) {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            eprintln!("pty launcher: attach: {err}");
+            std::process::exit(4);
+        }
+    };
+    if let Err(err) = terminal.activate(&handle) {
+        eprintln!("pty launcher: activate: {err}");
+        std::process::exit(5);
+    }
+    // Detached deliberately and completely — terminal first, then the control
+    // connection — so the supervisor's one client slot is free before this
+    // process is gone and the next one does not have to wait for a close to be
+    // noticed.
+    match terminal.detach() {
+        Ok(session) => session.detach(),
+        Err(err) => {
+            eprintln!("pty launcher: detach: {err}");
+            std::process::exit(6);
+        }
+    }
+    println!("{id}");
+    let _ = std::io::stdout().flush();
     std::process::exit(0);
 }
 
@@ -315,6 +427,112 @@ fn detached_true(
         Ok(pair) => pair,
         Err(err) => panic!("detached prepare must succeed: {err}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal fixtures.
+// ---------------------------------------------------------------------------
+
+/// A shell that prints a numbered tick ten times a second, forever enough.
+///
+/// An explicit `/bin/sh -c` is deliberate: what is under test is a *terminal*,
+/// and the programs that need one are shells. The library still never invokes a
+/// shell on its own — this plan names `/bin/sh` the way a caller would.
+const COUNTER_SCRIPT: &str =
+    "i=0; while [ $i -lt 600 ]; do echo tick$i; i=$((i+1)); sleep 0.1; done";
+
+fn interactive_plan(writable: &Path, program: &str, args: &[&str]) -> ValidatedPlan {
+    let plan = SandboxPlan::new(program)
+        .args(args.iter().copied())
+        .detached(true)
+        .session_mode(SessionMode::Interactive)
+        .capabilities(capabilities(writable));
+    match plan.validate() {
+        Ok(plan) => plan,
+        Err(err) => panic!("interactive plan must validate: {err}"),
+    }
+}
+
+/// Prepare an interactive run, attach at `window`, and release it.
+fn interactive_attached(
+    store: &SessionStore,
+    writable: &Path,
+    program: &str,
+    args: &[&str],
+    window: WindowSize,
+) -> AttachedTerminal {
+    let (session, handle) = match store.prepare_detached(interactive_plan(writable, program, args))
+    {
+        Ok(pair) => pair,
+        Err(err) => panic!("interactive detached prepare must succeed: {err}"),
+    };
+    let mut terminal = match session.attach(window) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("attach must succeed: {err}"),
+    };
+    // Attached *before* activation on purpose: the window size has to reach the
+    // terminal before the customer's program starts, or a program that reads
+    // its size at startup reads the zeroes a fresh PTY carries.
+    match terminal.activate(&handle) {
+        Ok(state) => assert_eq!(state, LifecycleState::Running),
+        Err(err) => panic!("activation while attached must succeed: {err}"),
+    }
+    terminal
+}
+
+/// Everything the terminal said, until `needle` appears in it.
+fn read_until(terminal: &mut AttachedTerminal, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let event = match terminal.read_event(deadline) {
+            Ok(event) => event,
+            Err(err) => panic!("the terminal must answer: {err}"),
+        };
+        match event {
+            TerminalEvent::Output(bytes) => seen.extend_from_slice(&bytes),
+            TerminalEvent::Ended(end) => {
+                let text = String::from_utf8_lossy(&seen).into_owned();
+                if text.contains(needle) {
+                    return text;
+                }
+                panic!(
+                    "the run ended in {} before {needle:?}: {text:?}",
+                    end.state()
+                );
+            }
+            TerminalEvent::Pong => {}
+            TerminalEvent::Idle => {
+                let text = String::from_utf8_lossy(&seen).into_owned();
+                panic!("{needle:?} never arrived; the terminal said {text:?}");
+            }
+        }
+        let text = String::from_utf8_lossy(&seen);
+        if text.contains(needle) {
+            return text.into_owned();
+        }
+    }
+}
+
+/// Exactly `count` bytes of output, however many frames they arrive in.
+fn read_bytes(terminal: &mut AttachedTerminal, count: usize, timeout: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    while seen.len() < count {
+        let event = match terminal.read_event(deadline) {
+            Ok(event) => event,
+            Err(err) => panic!("the terminal must answer: {err}"),
+        };
+        match event {
+            TerminalEvent::Output(bytes) => seen.extend_from_slice(&bytes),
+            TerminalEvent::Pong => {}
+            other => panic!(
+                "expected {count} bytes, got {other:?} after {} bytes",
+                seen.len()
+            ),
+        }
+    }
+    seen
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -475,11 +693,76 @@ impl RawClient {
         matches!(self.stream.read(&mut scratch), Ok(0))
     }
 
+    /// Whether the supervisor closes, once whatever it had already sent is
+    /// read past.
+    ///
+    /// A terminal channel is not silent: a run that is talking has output on
+    /// the wire, and a close that arrives behind it is still a close. Reading
+    /// past that is not papering over anything — it is the difference between
+    /// "the peer closed" and "the peer had already said something".
+    fn closes_after_draining(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        if self
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .is_err()
+        {
+            return false;
+        }
+        loop {
+            let mut scratch = [0_u8; 4096];
+            match self.stream.read(&mut scratch) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                // A read timeout: nothing more has arrived *yet*. Keep waiting
+                // until the caller's own deadline rather than concluding.
+                Err(_) if Instant::now() < deadline => {}
+                Err(_) => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
     fn hello(session_id: Uuid, generation: u64, protocol: u32) -> ControlRequest {
         ControlRequest::Hello {
             protocol,
             session_id,
             generation,
+        }
+    }
+
+    /// Greet, then switch this connection into terminal framing.
+    fn attach(&mut self, session_id: Uuid, window: WindowSize) -> AttachAck {
+        self.send(&Self::hello(session_id, 1, 1));
+        match self.read_reply() {
+            ControlReply::Hello { .. } => {}
+            other => panic!("the hello must be accepted, got {other:?}"),
+        }
+        self.send(&ControlRequest::Attach { window });
+        match self.read_reply() {
+            ControlReply::AttachAck { ack } => *ack,
+            other => panic!("the attach must be accepted, got {other:?}"),
+        }
+    }
+
+    /// A terminal frame with a tag and a length this test chose.
+    fn send_attach_frame(&mut self, tag: u8, payload: &[u8]) {
+        let mut frame = vec![tag];
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(payload);
+        if let Err(err) = self.stream.write_all(&frame) {
+            panic!("a terminal frame must be writable: {err}");
+        }
+    }
+
+    /// A terminal frame header whose length prefix lies, with no body behind it.
+    fn send_attach_prefix(&mut self, tag: u8, announced: u32) {
+        let mut header = vec![tag];
+        header.extend_from_slice(&announced.to_le_bytes());
+        if let Err(err) = self.stream.write_all(&header) {
+            panic!("a terminal frame header must be writable: {err}");
         }
     }
 }
@@ -1072,4 +1355,627 @@ fn the_event_ring_survives_a_disconnect() {
         "the child's death must be in the ring"
     );
     reconnected.detach();
+}
+
+// ---------------------------------------------------------------------------
+// R09 slice C (a): a real terminal, at the size the viewer asked for.
+// ---------------------------------------------------------------------------
+
+fn an_interactive_run_gets_a_real_terminal_at_the_size_the_viewer_asked_for() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    // `stty size` answers only from a real terminal: on anything else it fails
+    // with "Not a tty". So the assertion below is simultaneously a proof that
+    // the child has a controlling terminal and that the window size the client
+    // asked for at attach reached it before the program started.
+    let mut terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &["-c", "stty size; printf marker; read line; echo got:$line"],
+        WindowSize::new(40, 100),
+    );
+
+    let seen = read_until(&mut terminal, "marker", PATIENCE);
+    assert!(
+        seen.contains("40 100"),
+        "the run must see the window size the viewer asked for, saw {seen:?}"
+    );
+
+    if let Err(err) = terminal.write_input(b"hello\n") {
+        panic!("input must reach the terminal: {err}");
+    }
+    let answered = read_until(&mut terminal, "got:hello", PATIENCE);
+    assert!(answered.contains("got:hello"), "{answered:?}");
+
+    let session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// (b) A resize, and the signal it becomes.
+// ---------------------------------------------------------------------------
+
+fn a_resize_reaches_the_run_as_a_signal() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    // The trap is the proof. `TIOCSWINSZ` is documented to signal `SIGWINCH` to
+    // the terminal's foreground process group when the size *changes*; a
+    // platform that stopped doing it, or a resize that never reached the
+    // master, would leave the second `stty size` unprinted.
+    let mut terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &["-c", "trap 'stty size' WINCH; stty size; sleep 5"],
+        WindowSize::new(40, 100),
+    );
+
+    let first = read_until(&mut terminal, "40 100", PATIENCE);
+    assert!(first.contains("40 100"), "{first:?}");
+
+    if let Err(err) = terminal.resize(50, 120) {
+        panic!("a resize must reach the supervisor: {err}");
+    }
+    let second = read_until(&mut terminal, "50 120", PATIENCE);
+    assert!(
+        second.contains("50 120"),
+        "the run must be signalled about the new size, saw {second:?}"
+    );
+
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    if let Err(err) = session.stop() {
+        panic!("the sleeping run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// (c) Detach, wait, reattach: the same session, still talking.
+// ---------------------------------------------------------------------------
+
+fn a_detach_and_reattach_is_the_same_session_with_its_output_resumed() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let mut terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &["-c", COUNTER_SCRIPT],
+        WindowSize::new(24, 80),
+    );
+    let session_id = terminal.session_id();
+    let supervisor = terminal.supervisor().pid();
+    read_until(&mut terminal, "tick0", PATIENCE);
+
+    let session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    assert_eq!(session.session_id(), session_id);
+    session.detach();
+
+    // Half a second with nobody watching. The run does not stop and the
+    // supervisor does not exit; the output goes to the bounded ring.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let reconnected = match store.attach_control(session_id) {
+        Ok(session) => session,
+        Err(err) => panic!("reattaching to the control socket must succeed: {err}"),
+    };
+    assert_eq!(
+        reconnected.supervisor().pid(),
+        supervisor,
+        "a reattach must reach the same supervisor process"
+    );
+    let mut resumed = match reconnected.attach(WindowSize::new(24, 80)) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("reattach must succeed: {err}"),
+    };
+    assert_eq!(
+        resumed.session_id(),
+        session_id,
+        "the session is the same one"
+    );
+    assert_eq!(
+        resumed.ack().state(),
+        LifecycleState::Running,
+        "the run must still be running"
+    );
+    assert!(
+        resumed.ack().buffered() > 0,
+        "the ring must have kept what the run said while nobody was attached"
+    );
+    assert_eq!(
+        resumed.ack().dropped(),
+        0,
+        "half a second of ticks is nothing next to a 256 KiB ring"
+    );
+
+    // The scrollback is there, and then the run carries on saying more.
+    let backlog = read_until(&mut resumed, "tick1", PATIENCE);
+    assert!(backlog.contains("tick1"), "{backlog:?}");
+    let later = read_until(&mut resumed, "tick12", PATIENCE);
+    assert!(
+        later.contains("tick12"),
+        "output must resume, not merely replay: {later:?}"
+    );
+
+    let mut session = match resumed.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    if let Err(err) = session.stop() {
+        panic!("the run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// (d) The caller dies; the terminal does not.
+// ---------------------------------------------------------------------------
+
+fn an_interactive_session_outlives_the_process_that_prepared_it() {
+    let store_dir = TempStore::new();
+
+    let launcher = match Command::new(match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => panic!("the test binary must know its own path: {err}"),
+    })
+    .env(PTY_LAUNCHER_FLAG, store_dir.path())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()
+    {
+        Ok(output) => output,
+        Err(err) => panic!("the launcher must run: {err}"),
+    };
+    assert!(
+        launcher.status.success(),
+        "launcher failed: {}",
+        String::from_utf8_lossy(&launcher.stderr)
+    );
+    let printed = String::from_utf8_lossy(&launcher.stdout).trim().to_string();
+    let session_id = match Uuid::parse_str(&printed) {
+        Ok(id) => id,
+        Err(err) => panic!("the launcher must print a uuid, got {printed:?}: {err}"),
+    };
+
+    // A store opened fresh, in a process that has never seen this session and
+    // never forked anything involved in it.
+    let store = store_dir.open();
+    let recovered = match store.recover(session_id) {
+        Ok(recovered) => recovered,
+        Err(err) => panic!("recovery must read the record: {err}"),
+    };
+    assert_eq!(
+        recovered.decision(),
+        RecoveryDecision::Attachable,
+        "a live supervisor must be attachable"
+    );
+    let session = match recovered.attach() {
+        Ok(session) => session,
+        Err(err) => panic!("attach must succeed: {err}"),
+    };
+    let mut terminal = match session.attach(WindowSize::new(30, 90)) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("attaching to the terminal must succeed: {err}"),
+    };
+    assert_eq!(terminal.ack().state(), LifecycleState::Running);
+
+    // The run has been talking to a terminal nobody held since before this
+    // process started, and it is still talking now.
+    let seen = read_until(&mut terminal, "tick", PATIENCE);
+    assert!(seen.contains("tick"), "{seen:?}");
+    let later = read_until(&mut terminal, "tick", PATIENCE);
+    assert!(later.contains("tick"), "output must keep coming: {later:?}");
+
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    if let Err(err) = session.stop() {
+        panic!("the run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// (e) The run finishes while nobody is watching.
+// ---------------------------------------------------------------------------
+
+fn a_run_that_ended_while_detached_yields_its_tail_and_then_its_end() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        // The pause is what makes this test the one it claims to be: the output
+        // has to happen *while nobody is attached*, so that what a reattaching
+        // client sees came out of the supervisor's ring rather than off the
+        // wire. Without it the bytes race the detach.
+        &["-c", "sleep 0.4; echo done-and-gone"],
+        WindowSize::new(24, 80),
+    );
+    let session_id = terminal.session_id();
+    // Detached from the *terminal* before the run could plausibly have spoken,
+    // so everything it says is observed by a supervisor with nobody watching.
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    // Waited for rather than slept through: a fixed sleep in front of a state
+    // assertion is a flake waiting for a loaded machine, and the property under
+    // test is "the output happened with nobody attached", which the detach
+    // above has already established.
+    match session.wait(PATIENCE) {
+        Ok(WaitOutcome::Exit(exit)) => assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 }),
+        Ok(WaitOutcome::StillRunning) => panic!("the run must finish"),
+        Err(err) => panic!("wait must answer: {err}"),
+    }
+    // And then away entirely, so the reattach below is a fresh connection.
+    session.detach();
+
+    let reconnected = match store.attach_control(session_id) {
+        Ok(session) => session,
+        Err(err) => panic!("reconnection must succeed: {err}"),
+    };
+    let mut terminal = match reconnected.attach(WindowSize::new(24, 80)) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("attaching to a finished run must succeed: {err}"),
+    };
+    assert_eq!(
+        terminal.ack().state(),
+        LifecycleState::Exited,
+        "the ack must say the run is over"
+    );
+    let exit = match terminal.ack().exit() {
+        Some(exit) => exit.clone(),
+        None => panic!("the ack for a finished run must carry the exit facts"),
+    };
+    assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 });
+    assert_eq!(exit.activation(), ActivationObservation::Observed);
+
+    // The tail the ring kept, and then the end — promptly, not at a timeout.
+    let tail = read_until(&mut terminal, "done-and-gone", PATIENCE);
+    assert!(tail.contains("done-and-gone"), "{tail:?}");
+    let ended = loop {
+        match terminal.read_event(Instant::now() + PATIENCE) {
+            Ok(TerminalEvent::Ended(end)) => break end,
+            Ok(TerminalEvent::Output(_) | TerminalEvent::Pong) => {}
+            Ok(TerminalEvent::Idle) => panic!("the end must arrive promptly, not at a timeout"),
+            Err(err) => panic!("the terminal must answer: {err}"),
+        }
+    };
+    assert_eq!(ended.state(), LifecycleState::Exited);
+    assert_eq!(
+        ended.exit().map(nono::lifecycle::SandboxExit::outcome),
+        Some(ExitOutcome::Exited { code: 0 }),
+        "the end frame must carry the facts the supervisor witnessed"
+    );
+
+    let session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// (f) Hostility: raw bytes are raw, and a broken frame breaks only the channel.
+// ---------------------------------------------------------------------------
+
+/// A payload chosen to be indistinguishable from framing, if framing were
+/// content-based.
+///
+/// `0xFF`, NULs, and — the load-bearing part — a byte sequence that *is* a
+/// well-formed frame header for a 64-byte `Output` frame. A protocol that
+/// escaped or scanned its payload would split this; a length-prefixed one
+/// carries it.
+fn hostile_payload() -> Vec<u8> {
+    let mut bytes = vec![0xFF_u8, 0x00, 0x00, 0xFE];
+    bytes.push(AttachTag::Output.as_byte());
+    bytes.extend_from_slice(&64_u32.to_le_bytes());
+    bytes.extend_from_slice(&[0x00, 0xFF, 0x00, AttachTag::Detach.as_byte(), 0, 0, 0, 0]);
+    bytes.extend_from_slice(b"tail");
+    bytes
+}
+
+/// A `cat` behind a terminal in raw mode, so what comes back is what went in.
+fn raw_mode_cat(store: &SessionStore, writable: &Path) -> AttachedTerminal {
+    let mut terminal = interactive_attached(
+        store,
+        writable,
+        "/bin/sh",
+        // Raw mode with echo off: the line discipline neither translates
+        // newlines, interprets control characters, nor echoes, so every byte
+        // that comes back came back from `cat` and not from the terminal.
+        &["-c", "stty raw -echo; printf ready; exec /bin/cat"],
+        WindowSize::new(24, 80),
+    );
+    read_until(&mut terminal, "ready", PATIENCE);
+    terminal
+}
+
+fn input_bytes_reach_the_terminal_verbatim_however_hostile() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let mut terminal = raw_mode_cat(&store, store_dir.path());
+
+    let hostile = hostile_payload();
+    if let Err(err) = terminal.write_input(&hostile) {
+        panic!("a hostile payload is still a payload: {err}");
+    }
+    let echoed = read_bytes(&mut terminal, hostile.len(), PATIENCE);
+    assert_eq!(
+        echoed, hostile,
+        "every byte must survive the round trip through the terminal unchanged"
+    );
+
+    // And the client-side bound is enforced before anything is written.
+    let too_big = vec![b'x'; MAX_ATTACH_PAYLOAD_BYTES.saturating_add(1)];
+    assert!(
+        terminal.write_input(&too_big).is_err(),
+        "a payload past the frame bound must be refused, not split"
+    );
+
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    if let Err(err) = session.stop() {
+        panic!("the run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+/// Prepare an interactive run, activate it, and give the client slot back.
+///
+/// The raw-protocol tests below drive the socket by hand, so they need the run
+/// going and nobody holding the one connection.
+fn interactive_running(store: &SessionStore, writable: &Path) -> (Uuid, PathBuf) {
+    let terminal = interactive_attached(
+        store,
+        writable,
+        "/bin/sh",
+        &["-c", COUNTER_SCRIPT],
+        WindowSize::new(24, 80),
+    );
+    let id = terminal.session_id();
+    let session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    session.detach();
+    (id, store.control_socket_path(id))
+}
+
+/// Attach again and require the run to still be there and still talking.
+fn require_still_running(store: &SessionStore, session_id: Uuid) {
+    let session = match store.attach_control(session_id) {
+        Ok(session) => session,
+        Err(err) => panic!("the session must survive a broken channel: {err}"),
+    };
+    let mut terminal = match session.attach(WindowSize::new(24, 80)) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("the session must still be attachable: {err}"),
+    };
+    assert_eq!(terminal.ack().state(), LifecycleState::Running);
+    let seen = read_until(&mut terminal, "tick", PATIENCE);
+    assert!(
+        seen.contains("tick"),
+        "the run must still be talking: {seen:?}"
+    );
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    if let Err(err) = session.stop() {
+        panic!("the run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+fn a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let (session_id, socket) = interactive_running(&store, store_dir.path());
+
+    let mut client = RawClient::connect_free(&socket);
+    let ack = client.attach(session_id, WindowSize::new(24, 80));
+    assert_eq!(ack.state(), LifecycleState::Running);
+    // A tag no version of this protocol has. The channel is over — a stream
+    // whose framing cannot be trusted cannot be resynchronized — and the close
+    // is the whole of the answer.
+    client.send_attach_frame(0x7F, b"nonsense");
+    assert!(
+        client.closes_after_draining(PATIENCE),
+        "an unknown terminal frame tag must end the channel"
+    );
+    drop(client);
+
+    require_still_running(&store, session_id);
+}
+
+fn an_oversize_input_frame_ends_the_channel_not_the_run() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let (session_id, socket) = interactive_running(&store, store_dir.path());
+
+    let mut client = RawClient::connect_free(&socket);
+    client.attach(session_id, WindowSize::new(24, 80));
+    // A gigabyte announced and nothing sent. If the bound were checked after
+    // the payload rather than before it, the supervisor would buffer a gigabyte
+    // waiting for a body that never comes.
+    client.send_attach_prefix(AttachTag::Input.as_byte(), 1_024 * 1_024 * 1_024);
+    assert!(
+        client.closes_after_draining(PATIENCE),
+        "an oversize terminal frame must end the channel"
+    );
+    drop(client);
+
+    require_still_running(&store, session_id);
+}
+
+// ---------------------------------------------------------------------------
+// (g) The slot discipline attach inherits.
+// ---------------------------------------------------------------------------
+
+fn an_attach_occupies_the_one_client_slot() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let mut terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &["-c", COUNTER_SCRIPT],
+        WindowSize::new(24, 80),
+    );
+    read_until(&mut terminal, "tick0", PATIENCE);
+
+    let socket = store.control_socket_path(terminal.session_id());
+    let mut second = RawClient::connect(&socket);
+    assert_eq!(
+        refusal(second.read_reply()),
+        ControlRefusal::Busy,
+        "attach holds the one client slot, so a second connection is told so"
+    );
+    assert!(second.is_closed());
+
+    // And the attached client is untouched by the refusal.
+    let after = read_until(&mut terminal, "tick", PATIENCE);
+    assert!(after.contains("tick"), "{after:?}");
+
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    if let Err(err) = session.stop() {
+        panic!("the run must be stoppable: {err}");
+    }
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// The ring's bound, and the honesty about it.
+// ---------------------------------------------------------------------------
+
+fn the_scrollback_ring_stays_bounded_and_says_what_it_dropped() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    // Roughly 400 KiB, comfortably past the 256 KiB ring, produced with nobody
+    // attached. The removal-detection target: without the bound in
+    // `Scrollback::push` the ack would report every byte buffered and nothing
+    // dropped, and both assertions below fail.
+    let terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &[
+            "-c",
+            "i=0; while [ $i -lt 400 ]; do printf '%01023d\\n' $i; i=$((i+1)); done",
+        ],
+        WindowSize::new(24, 80),
+    );
+    let session_id = terminal.session_id();
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    match session.wait(PATIENCE) {
+        Ok(WaitOutcome::Exit(exit)) => assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 }),
+        Ok(WaitOutcome::StillRunning) => panic!("the flood must finish"),
+        Err(err) => panic!("wait must answer: {err}"),
+    }
+
+    let terminal = match session.attach(WindowSize::new(24, 80)) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("attach must succeed: {err}"),
+    };
+    let ack = terminal.ack();
+    assert!(
+        ack.buffered() <= SCROLLBACK_CAPACITY_BYTES as u64,
+        "the ring must stay bounded: {} bytes buffered, bound is {}",
+        ack.buffered(),
+        SCROLLBACK_CAPACITY_BYTES
+    );
+    assert!(
+        ack.dropped() > 0,
+        "a run that outran the ring must be told how much it lost, got {}",
+        ack.dropped()
+    );
+    assert_eq!(ack.state(), LifecycleState::Exited);
+    assert_eq!(
+        session_id,
+        terminal.session_id(),
+        "still the same session throughout"
+    );
+
+    let session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    session.detach();
+}
+
+// ---------------------------------------------------------------------------
+// The two refusals that keep the terminal honest.
+// ---------------------------------------------------------------------------
+
+fn a_headless_run_refuses_an_attach_with_a_reason() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let (session, _handle) = detached_true(&store, store_dir.path());
+    // A headless run's standard streams are /dev/null. An attach to one would
+    // be a client watching a terminal that can never say anything, so it is
+    // refused with the reason rather than accepted into silence.
+    let refused = session.attach(WindowSize::new(24, 80));
+    match refused {
+        Ok(_) => panic!("a headless run has no terminal to attach to"),
+        Err(err) => assert_eq!(
+            err.refusal(),
+            Some(&ControlRefusal::NoTerminal),
+            "expected a typed no-terminal refusal, got {err:?}"
+        ),
+    }
+}
+
+fn an_interactive_plan_is_refused_where_nothing_can_own_a_terminal() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    // The ephemeral paths have no process that outlives the call, so there is
+    // nowhere for a terminal master to live. Refused with the method that does
+    // implement it named, rather than run headless behind the caller's back.
+    let plan = || {
+        let plan = SandboxPlan::new("/bin/echo")
+            .session_mode(SessionMode::Interactive)
+            .capabilities(capabilities(store_dir.path()));
+        match plan.validate() {
+            Ok(plan) => plan,
+            Err(err) => panic!("the plan must validate: {err}"),
+        }
+    };
+    let refused = store.prepare(plan());
+    assert!(
+        matches!(
+            refused,
+            Err(LifecycleError::Prepare(
+                PrepareError::InteractiveNeedsSupervisor
+            ))
+        ),
+        "a store prepare must refuse an interactive plan: {:?}",
+        refused.err()
+    );
+    let refused = nono::lifecycle::PreparedSandbox::prepare(plan());
+    assert!(
+        matches!(refused, Err(PrepareError::InteractiveNeedsSupervisor)),
+        "an ephemeral prepare must refuse it too"
+    );
 }

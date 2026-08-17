@@ -71,6 +71,11 @@ pub enum PreExecStage {
     /// verification would have had no group to probe. The child dies here
     /// rather than run without either guarantee.
     ProcessGroup,
+    /// Taking the pseudo-terminal as this session's controlling terminal
+    /// failed, so a run that asked to be interactive would have got a terminal
+    /// that delivers no `SIGINT`, no `SIGWINCH`, and no hangup. The child dies
+    /// here rather than run something that only looks like a terminal session.
+    ControllingTerminal,
     /// Applying the platform sandbox to the child itself failed. Nothing ran
     /// unconfined: the child died instead.
     SandboxApply,
@@ -100,6 +105,7 @@ impl PreExecStage {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ProcessGroup => "process_group",
+            Self::ControllingTerminal => "controlling_terminal",
             Self::SandboxApply => "sandbox_apply",
             Self::GateWait => "gate_wait",
             Self::GateClosed => "gate_closed",
@@ -131,6 +137,11 @@ impl PreExecStage {
             Self::GateProtocol => 0x14,
             Self::WorkingDirectory => 0x15,
             Self::Exec => 0x16,
+            // Appended rather than slotted in after `ProcessGroup`, which is
+            // where the sequence would put it: 0x10 is `SandboxApply` and the
+            // existing tags are contract. So the numbers no longer read in
+            // sequence order, and `as_tag` is the only place that matters.
+            Self::ControllingTerminal => 0x17,
             Self::Unknown => 0xFF,
         }
     }
@@ -148,6 +159,7 @@ impl PreExecStage {
             0x14 => Self::GateProtocol,
             0x15 => Self::WorkingDirectory,
             0x16 => Self::Exec,
+            0x17 => Self::ControllingTerminal,
             _ => Self::Unknown,
         }
     }
@@ -552,7 +564,7 @@ impl ActivatedSandbox {
         self.events.emit(LifecycleEventKind::StopRequested);
         self.report(change);
 
-        kill_group(self.process_group).map_err(|errno| StopError::SignalFailed {
+        kill_own_group(self.process_group).map_err(|errno| StopError::SignalFailed {
             target: self.process_group,
             errno,
         })?;
@@ -675,7 +687,7 @@ impl Drop for ActivatedSandbox {
         // Best effort, in the order a stop uses: the group, then the direct
         // child by pid (which covers a descendant that left the group), then
         // the wait that turns the request into an observation.
-        let _ = kill_group(self.process_group);
+        let _ = kill_own_group(self.process_group);
         kill_and_reap(self.identity.pid());
     }
 }
@@ -785,6 +797,34 @@ pub(crate) fn kill_group(pgid: i32) -> Result<(), i32> {
     }
 }
 
+/// `SIGKILL` a group this process's own unreaped child leads.
+///
+/// [`kill_group`] with one extra reading, and the reading is only sound here.
+///
+/// The two platforms spell "there is nothing in this group left to signal"
+/// differently once its members are zombies: Linux answers `ESRCH`, and macOS
+/// answers **`EPERM`** — `killpg` reports success only if it signalled at least
+/// one process, and a zombie is not one it will signal. Reported as a failure,
+/// that turns "the run had already ended" into "the stop could not be
+/// delivered", which is a lie about a race every stop can lose.
+///
+/// It is safe to read `EPERM` that way *here* and nowhere else: this group's id
+/// is the unreaped child's own pid, so the kernel cannot have reissued it to a
+/// process belonging to somebody else, and every member is descended from a
+/// child this process forked. [`super::RecoveredSession`] deliberately does not
+/// get this treatment — its recorded group id may well have been reissued, and
+/// there an `EPERM` really could be somebody else's process.
+///
+/// What this does *not* do is claim the group is gone. Nothing here treats a
+/// sent signal as proof; [`ActivatedSandbox::verify_cleanup`] is what answers
+/// that question, and it probes rather than assuming.
+fn kill_own_group(pgid: i32) -> Result<(), i32> {
+    match kill_group(pgid) {
+        Err(errno) if errno == libc::EPERM => Ok(()),
+        other => other,
+    }
+}
+
 /// `SIGKILL` one process, reporting what the kernel said.
 ///
 /// Same treatment of `ESRCH` as [`kill_group`], and the same refusal of pids
@@ -806,8 +846,9 @@ pub(crate) fn kill_pid(pid: i32) -> Result<(), i32> {
 mod tests {
     use super::*;
 
-    const ALL_STAGES: [PreExecStage; 9] = [
+    const ALL_STAGES: [PreExecStage; 10] = [
         PreExecStage::ProcessGroup,
+        PreExecStage::ControllingTerminal,
         PreExecStage::SandboxApply,
         PreExecStage::GateWait,
         PreExecStage::GateClosed,
@@ -817,6 +858,65 @@ mod tests {
         PreExecStage::Exec,
         PreExecStage::Unknown,
     ];
+
+    #[test]
+    fn a_group_of_zombies_is_nothing_left_to_signal_not_a_refusal() {
+        // The platform difference this exists for, exercised rather than
+        // asserted about. A child that leads its own group and has exited is a
+        // zombie in a group with no signalable member; `killpg` answers ESRCH
+        // on Linux and EPERM on macOS, and both mean the run had already ended.
+        //
+        // Removal detection: dropping the `EPERM` arm from `kill_own_group`
+        // fails this test on macOS, and with it every detached stop that raced
+        // the run's own exit.
+        //
+        // SAFETY: `fork` duplicates this process. The child branch runs two
+        // syscalls and `_exit`s, so it never returns into Rust, never unwinds,
+        // and never runs a destructor.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: `setpgid` and `_exit` are async-signal-safe, take
+            // integers, and touch no memory.
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        assert!(child > 0, "the test fork must succeed");
+
+        // Wait until the group stops accepting signals. Deliberately *not* by
+        // reaping: a reaped child is gone from the table entirely, and the
+        // state under test is the one in between — exited, unreaped, and no
+        // longer signalable.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut refused = None;
+        while std::time::Instant::now() < deadline {
+            // ESRCH is folded into `Ok` by `kill_group` itself, so the loop
+            // watches for the raw refusal and for the folded one alike.
+            if let Err(errno) = kill_group(child) {
+                refused = Some(errno);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        match refused {
+            // macOS: the group holds a zombie and nothing signalable.
+            Some(errno) => {
+                assert_eq!(errno, libc::EPERM, "the only refusal expected here");
+                assert_eq!(
+                    kill_own_group(child),
+                    Ok(()),
+                    "a group whose every member is already a zombie is not a refusal"
+                );
+            }
+            // Linux: `killpg` answers ESRCH, which `kill_group` already folds
+            // into success, so the loop above never saw a refusal. The
+            // tolerance is unreachable there and correctly makes no difference.
+            None => assert_eq!(kill_own_group(child), Ok(())),
+        }
+        kill_and_reap(child);
+    }
 
     #[test]
     fn every_failure_stage_round_trips_through_its_wire_tag() {

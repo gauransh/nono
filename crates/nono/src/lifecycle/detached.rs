@@ -48,6 +48,7 @@ use super::protocol::{
 };
 use super::session_store::SessionStoreError;
 use super::state::LifecycleState;
+use super::terminal::{AttachAck, AttachedTerminal, WindowSize};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -365,6 +366,55 @@ impl DetachedSession {
         }
     }
 
+    /// Take over the run's terminal.
+    ///
+    /// Only an interactive run has one: a headless run's standard streams are
+    /// `/dev/null`, and the refusal for one is
+    /// [`ControlRefusal::NoTerminal`] rather than an attach to a terminal that
+    /// would never say anything.
+    ///
+    /// `window` is applied to the terminal *before* any output is replayed, so
+    /// a program released after this reads the size the viewer actually has.
+    /// The returned [`AttachedTerminal`] holds this connection; [`detach`][d]
+    /// gives it back.
+    ///
+    /// Attach occupies the supervisor's single client slot. A second connection
+    /// is told [`ControlRefusal::Busy`] exactly as it was before, which is also
+    /// why there is no separate "already attached" answer: a second attach
+    /// cannot reach the supervisor to be refused.
+    ///
+    /// # Errors
+    ///
+    /// [`DetachedError::Refused`] carrying [`ControlRefusal::NoTerminal`] for a
+    /// headless run, or a transport failure. Either way this connection is
+    /// spent — reconnect with [`super::SessionStore::attach_control`]; the run
+    /// itself is untouched.
+    ///
+    /// [d]: AttachedTerminal::detach
+    pub fn attach(mut self, window: WindowSize) -> Result<AttachedTerminal, DetachedError> {
+        let ack = self.attach_request(window)?;
+        Ok(AttachedTerminal::new(self, ack, window))
+    }
+
+    /// Ask for the mode switch and take the ack.
+    ///
+    /// Shared with [`AttachedTerminal::activate`], which re-enters attach mode
+    /// after a control exchange and must ask exactly the same question.
+    pub(super) fn attach_request(
+        &mut self,
+        window: WindowSize,
+    ) -> Result<AttachAck, DetachedError> {
+        match self.exchange(&ControlRequest::Attach { window }, CONTROL_TIMEOUT)? {
+            ControlReply::AttachAck { ack } => Ok(*ack),
+            other => Err(unexpected("attach_ack", &other)),
+        }
+    }
+
+    /// The socket underneath, for the terminal channel that borrows it.
+    pub(super) fn stream(&mut self) -> &mut UnixStream {
+        &mut self.stream
+    }
+
     /// Leave, politely.
     ///
     /// The run carries on. Saying goodbye rather than simply dropping lets the
@@ -417,6 +467,7 @@ fn reply_name(reply: &ControlReply) -> &'static str {
         ControlReply::Stopped { .. } => "stopped",
         ControlReply::Status { .. } => "status",
         ControlReply::Cleanup { .. } => "cleanup",
+        ControlReply::AttachAck { .. } => "attach_ack",
         ControlReply::Farewell => "farewell",
         ControlReply::Refused { .. } => "refused",
     }

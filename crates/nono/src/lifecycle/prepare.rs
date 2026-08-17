@@ -203,6 +203,29 @@ pub enum PrepareError {
     #[error("SessionStore::prepare_detached needs a plan built with .detached(true)")]
     DetachedNotRequested,
 
+    /// An interactive plan reached a path with nobody to own the terminal.
+    ///
+    /// A PTY's master has to live somewhere for as long as the run does, and on
+    /// the ephemeral paths the only candidate is the caller's own process —
+    /// which would mean a terminal that closed the moment the caller returned,
+    /// and a run whose output went to a descriptor nobody held. The supervisor
+    /// of [`super::SessionStore::prepare_detached`] is the process that can own
+    /// one, so an interactive plan has to be a detached plan.
+    #[error(
+        "an interactive (PTY) run needs a supervisor to own the terminal; build the plan with \
+         .detached(true) and use SessionStore::prepare_detached"
+    )]
+    InteractiveNeedsSupervisor,
+
+    /// The pseudo-terminal could not be allocated.
+    #[error("pseudo-terminal setup failed at stage {stage}: errno {errno}")]
+    Terminal {
+        /// Which step of the allocation failed.
+        stage: &'static str,
+        /// Platform error number.
+        errno: i32,
+    },
+
     /// This process's own executable could not be resolved, so there is no
     /// image to re-execute as a supervisor.
     ///
@@ -474,6 +497,10 @@ impl PreparedSandbox {
             gate_write: gate_write.as_raw_fd(),
             status_read: status_read.as_raw_fd(),
             status_write: status_write.as_raw_fd(),
+            // Headless by construction: `refuse_unsupported` above has already
+            // refused an interactive plan on this path, because nothing here
+            // outlives the call to own a terminal.
+            terminal: None,
             program: image.program.as_ptr(),
             argv: argv_ptrs.as_ptr(),
             envp: envp_ptrs.as_ptr(),
@@ -1279,25 +1306,28 @@ impl Drop for PreparedSandbox {
 
 /// Refuse a plan whose promises this path cannot keep.
 ///
-/// A PTY and resource ceilings are each a separate mechanism that arrives in a
-/// later slice. Until then, asking for one is an error rather than a no-op:
-/// silently running headless and unlimited would leave a caller believing in
-/// confinement that was never applied.
+/// Resource ceilings are a separate mechanism that arrives in a later slice.
+/// Until then, asking for one is an error rather than a no-op: silently running
+/// unlimited would leave a caller believing in confinement that was never
+/// applied.
 ///
-/// Detachment is judged differently, because it is now implemented: `detached`
+/// Detachment is judged differently, because it is implemented: `detached`
 /// names *who owns the run*, and only the supervisor launch of
 /// [`super::SessionStore::prepare_detached`] can own one that outlives the
 /// caller. `supervised` is true on exactly that path — it is set by the code
 /// that has already forked a supervisor to hold the child — and false on the
 /// two paths that would otherwise run a detached plan attached.
+///
+/// An interactive plan is judged by the same question and answered the same
+/// way. A PTY's master must be held for as long as the run lives, and the
+/// ephemeral paths have no process that outlives the call to hold it, so
+/// interactive is refused there with a reason that names the path that works.
 pub(super) fn refuse_unsupported(
     plan: &ValidatedPlan,
     supervised: bool,
 ) -> Result<(), PrepareError> {
-    if plan.session_mode() != SessionMode::Headless {
-        return Err(PrepareError::UnsupportedPlanFeature {
-            feature: "interactive session (PTY)",
-        });
+    if plan.session_mode() == SessionMode::Interactive && !supervised {
+        return Err(PrepareError::InteractiveNeedsSupervisor);
     }
     if plan.is_detached() && !supervised {
         return Err(PrepareError::DetachedNeedsSupervisor);
@@ -1457,12 +1487,32 @@ impl ExecImage {
     }
 }
 
+/// The two descriptors an interactive child is given, and what it does with
+/// them.
+///
+/// Both numbers name descriptors the launcher opened before any fork: the
+/// slave becomes 0, 1, and 2, and the master is closed, because a program
+/// holding the master of its own terminal could read back everything it wrote
+/// and everything typed at it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ChildTerminal {
+    /// The slave end, which becomes the customer's standard streams.
+    pub(super) slave: RawFd,
+    /// The master end, closed here so the supervisor is its only holder.
+    pub(super) master: RawFd,
+}
+
 /// Everything the child needs, as values it can use without allocating.
 pub(super) struct ChildContext<'a> {
     pub(super) gate_read: RawFd,
     pub(super) gate_write: RawFd,
     pub(super) status_read: RawFd,
     pub(super) status_write: RawFd,
+    /// The terminal, when the plan asked for an interactive session.
+    ///
+    /// `None` is a headless run, whose standard streams are whatever the
+    /// launcher set up — `/dev/null` on the detached path.
+    pub(super) terminal: Option<ChildTerminal>,
     pub(super) program: *const c_char,
     pub(super) argv: *const *const c_char,
     pub(super) envp: *const *const c_char,
@@ -1494,15 +1544,45 @@ pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
     // pid. Before the sandbox apply, so a policy that refuses the call fails
     // here with its own stage rather than being mistaken for a sandbox
     // failure; before the gate wait, so the group exists for the whole run.
-    // SAFETY: `setpgid` takes two integers, touches no memory, and is
-    // async-signal-safe. `(0, 0)` names "this process" and "a new group of its
-    // own"; a non-zero return is a plain failure with `errno` set, which the
-    // record written below carries.
-    if unsafe { libc::setpgid(0, 0) } != 0 {
+    //
+    // **An interactive child leads a SESSION, not just a group.** `TIOCSCTTY`
+    // is refused for a process that is not a session leader, and a terminal
+    // nobody controls delivers no `SIGINT`, no `SIGWINCH`, and no hangup — so
+    // an interactive run has to be a session of its own or it is not really a
+    // terminal session at all. Nothing downstream loses by it: `setsid` puts
+    // the process in a *new process group* as well, whose id is again this
+    // child's own pid, so the group the parent recorded is still the group the
+    // run lives in and cleanup verification's group probe is unchanged.
+    // SAFETY: both calls take integers, touch no memory, and are
+    // async-signal-safe. `setpgid(0, 0)` names "this process" and "a new group
+    // of its own"; `setsid` cannot fail for the usual reason (a fresh fork is
+    // never already a process group leader). A non-zero return is a plain
+    // failure with `errno` set, which the record written below carries.
+    let led = match context.terminal {
+        Some(_) => unsafe { libc::setsid() },
+        None => unsafe { libc::setpgid(0, 0) },
+    };
+    if led < 0 {
         child_fail(
             context.status_write,
             PreExecStage::ProcessGroup,
             last_errno(),
+        );
+    }
+
+    // The terminal, before the sandbox apply and therefore before any policy
+    // could refuse it. That ordering is not convenience: the slave was opened
+    // by the launcher, so a confined child never has to be granted the right to
+    // open a device node, and the only terminal it can reach is the one it was
+    // given.
+    if let Some(terminal) = context.terminal
+        && let Err(errno) =
+            super::terminal::adopt_controlling_terminal(terminal.slave, terminal.master)
+    {
+        child_fail(
+            context.status_write,
+            PreExecStage::ControllingTerminal,
+            errno,
         );
     }
 
@@ -1632,6 +1712,16 @@ pub(super) fn close_inherited_descriptors(keep: &mut [RawFd]) {
         let mut first: RawFd = 3;
         let mut swept = true;
         for keeper in keep.iter() {
+            // A keeper below 3 is not one this sweep could touch anyway: the
+            // standard streams are never swept, and `-1` is how a caller
+            // spells "no such descriptor" in a fixed-size set it may not
+            // allocate (the detached launcher's terminal master, which only an
+            // interactive run has). Skipping it matters: the set is sorted, so
+            // a `-1` left in would move `first` to 0 and the next gap would
+            // close 0, 1, and 2.
+            if *keeper < 3 {
+                continue;
+            }
             swept = swept && close_range(first, keeper.saturating_sub(1));
             first = keeper.saturating_add(1);
         }
@@ -2055,17 +2145,21 @@ mod tests {
     fn features_this_slice_cannot_deliver_are_refused_not_ignored() {
         use std::num::NonZeroU64;
 
+        // A PTY is not a missing feature any more; it is a question of
+        // *ownership*, exactly like detachment. The master has to be held for
+        // as long as the run lives, and only the supervisor outlives the call.
         let interactive =
             sealed(SandboxPlan::new("/bin/echo").session_mode(SessionMode::Interactive));
-        for supervised in [false, true] {
-            assert_eq!(
-                refuse_unsupported(&interactive, supervised).err(),
-                Some(PrepareError::UnsupportedPlanFeature {
-                    feature: "interactive session (PTY)"
-                }),
-                "a PTY is refused on every path, including the supervisor's"
-            );
-        }
+        assert_eq!(
+            refuse_unsupported(&interactive, false).err(),
+            Some(PrepareError::InteractiveNeedsSupervisor),
+            "an ephemeral path has nobody to own a terminal"
+        );
+        assert_eq!(
+            refuse_unsupported(&interactive, true),
+            Ok(()),
+            "the supervisor's own path owns one"
+        );
 
         let limited = sealed(
             SandboxPlan::new("/bin/echo").resource_limits(ResourceLimits {

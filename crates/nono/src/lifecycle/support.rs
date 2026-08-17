@@ -759,6 +759,11 @@ impl SupportReport {
         let seccomp_user_notification = gather_seccomp_user_notification();
         let network_filtering =
             gather_network_filtering(&landlock, &seccomp, &seccomp_user_notification);
+        // Probed once and reused: the interactive-session answer is the PTY
+        // answer plus a supervisor, and a report that opened two terminals to
+        // say so would be paying for the same fact twice.
+        let pty = gather_pty();
+        let interactive_session = gather_interactive_session(&pty);
 
         Self {
             schema_version: SUPPORT_REPORT_SCHEMA_VERSION,
@@ -768,16 +773,8 @@ impl SupportReport {
             seccomp_user_notification,
             seatbelt: gather_seatbelt(),
             network_filtering,
-            pty: gather_pty(),
-            interactive_session: Capability::plain(
-                SupportStatus::Unavailable,
-                Determination::Declared,
-                SupportReason::NotImplemented {
-                    slice: "interactive session (PTY): PreparedSandbox::prepare refuses \
-                            SessionMode::Interactive rather than running headless"
-                        .to_string(),
-                },
-            ),
+            pty,
+            interactive_session,
             detached_supervisor: Capability::plain(
                 SupportStatus::Available,
                 // Not `ProbedLive`, and the distinction is the whole point:
@@ -805,19 +802,7 @@ impl SupportReport {
                         .to_string(),
                 },
             ),
-            attach: Capability::plain(
-                SupportStatus::Partial,
-                Determination::Declared,
-                SupportReason::NotImplemented {
-                    slice: "R09 slice C (terminal attach): control attach is implemented — \
-                            SessionStore::attach_control and RecoveredSession::attach reach a \
-                            detached run's socket and drive it, so exit facts survive a caller \
-                            restart. What is not implemented is attaching to a run's terminal: \
-                            a headless detached run's standard streams are /dev/null and there \
-                            is no PTY to reattach to"
-                        .to_string(),
-                },
-            ),
+            attach: gather_attach(),
             process_identity: gather_process_identity(),
             cleanup_verification: gather_cleanup_verification(),
             event_observation: event_observation(),
@@ -1408,6 +1393,80 @@ fn gather_pty() -> Capability {
     )
 }
 
+/// Whether the lifecycle will actually run a terminal session.
+///
+/// Two halves, and only one of them is probeable. The *terminal* half is the
+/// live `posix_openpt` of [`gather_pty`], reused rather than repeated — if this
+/// host will not give this process a pseudo-terminal, no amount of supervisor
+/// will produce an interactive run, and the refusal is reported with the
+/// probe's own reason and its `ProbedLive` strength. The *supervisor* half
+/// cannot be probed at all: establishing it means forking twice, executing this
+/// binary again, binding a socket and writing a durable record, which is not
+/// something a diagnostic call may do. So an available PTY yields
+/// [`Determination::PlatformApi`] with the precondition stated, exactly as
+/// [`SupportReport::detached_supervisor`] does and for the same reason.
+///
+/// The live suite `crates/nono/tests/lifecycle_detached.rs` drives the whole
+/// path — allocate, fork, `setsid`, `TIOCSCTTY`, attach, resize, detach,
+/// reattach — but a test that ran on somebody else's machine is not a probe
+/// that ran in this process during this call, and [`Determination::ProbedLive`]
+/// means the latter. Claiming it here would make the strongest word in this
+/// module mean something weaker.
+fn gather_interactive_session(pty: &Capability) -> Capability {
+    if pty.status() != SupportStatus::Available {
+        return Capability::plain(pty.status(), pty.determination(), pty.reason().clone());
+    }
+    Capability::plain(
+        SupportStatus::Available,
+        Determination::PlatformApi,
+        SupportReason::PlatformApiLinked {
+            api: "posix_openpt(3) + grantpt(3) + unlockpt(3) in the launcher, setsid(2) and \
+                  TIOCSCTTY in the customer child, with the master held by the detached \
+                  supervisor"
+                .to_string(),
+            why_not_probed: "PRECONDITION: an interactive plan must also be a detached plan \
+                             (SandboxPlan::detached(true) + SessionStore::prepare_detached), \
+                             because a PTY master has to be held for as long as the run lives \
+                             and only the supervisor outlives the call — the ephemeral paths \
+                             refuse with PrepareError::InteractiveNeedsSupervisor. That \
+                             supervisor in turn needs the entry hook named under \
+                             detached_supervisor. Establishing either would mean launching a \
+                             run, so what is probed here is the terminal primitive and what is \
+                             reported is the mechanism above it."
+                .to_string(),
+        },
+    )
+}
+
+/// Whether a caller can attach to a run it did not start.
+///
+/// Both kinds, since R09 slice C: the control conversation (activate, wait,
+/// stop, status, verify) and the run's *terminal*. Not probed, for the same
+/// reason the two entries above are not: the only honest probe launches a
+/// supervisor.
+fn gather_attach() -> Capability {
+    Capability::plain(
+        SupportStatus::Available,
+        Determination::PlatformApi,
+        SupportReason::PlatformApiLinked {
+            api: "unix(7) control socket in the session store, peer-uid checked at accept; \
+                  control protocol v1 frames, and after ControlRequest::Attach the tagged \
+                  terminal framing of nono::lifecycle::terminal"
+                .to_string(),
+            why_not_probed: "Establishing it means launching a supervisor and a run — see \
+                             detached_supervisor. Two limits are worth knowing before \
+                             depending on it: attach occupies the supervisor's single client \
+                             slot, so a second connection is refused ControlRefusal::Busy; and \
+                             a headless run has no terminal, so an attach to one is refused \
+                             ControlRefusal::NoTerminal. Output produced while nobody is \
+                             attached is kept in a bounded ring \
+                             (SCROLLBACK_CAPACITY_BYTES), oldest dropped, and the count of \
+                             what was dropped rides on the next AttachAck."
+                .to_string(),
+        },
+    )
+}
+
 /// Capture this process's own identity and re-check it, right now.
 ///
 /// The strongest identity probe available: we know the answer — this process is
@@ -1756,15 +1815,13 @@ mod tests {
                     probe: "posix_openpt(O_RDWR | O_NOCTTY), closed immediately".to_string(),
                 },
             ),
-            interactive_session: Capability::plain(
-                SupportStatus::Unavailable,
-                Determination::Declared,
-                SupportReason::NotImplemented {
-                    slice: "interactive session (PTY): PreparedSandbox::prepare refuses \
-                            SessionMode::Interactive rather than running headless"
-                        .to_string(),
+            interactive_session: gather_interactive_session(&Capability::plain(
+                SupportStatus::Available,
+                Determination::ProbedLive,
+                SupportReason::Probed {
+                    probe: "posix_openpt(O_RDWR | O_NOCTTY), closed immediately".to_string(),
                 },
-            ),
+            )),
             detached_supervisor: Capability::plain(
                 SupportStatus::Available,
                 // Not `ProbedLive`, and the distinction is the whole point:
@@ -1792,19 +1849,7 @@ mod tests {
                         .to_string(),
                 },
             ),
-            attach: Capability::plain(
-                SupportStatus::Partial,
-                Determination::Declared,
-                SupportReason::NotImplemented {
-                    slice: "R09 slice C (terminal attach): control attach is implemented — \
-                            SessionStore::attach_control and RecoveredSession::attach reach a \
-                            detached run's socket and drive it, so exit facts survive a caller \
-                            restart. What is not implemented is attaching to a run's terminal: \
-                            a headless detached run's standard streams are /dev/null and there \
-                            is no PTY to reattach to"
-                        .to_string(),
-                },
-            ),
+            attach: gather_attach(),
             process_identity: Capability::detailed(
                 SupportStatus::Available,
                 Determination::ProbedLive,
@@ -2014,23 +2059,71 @@ mod tests {
     }
 
     #[test]
-    fn terminal_attach_is_still_honestly_incomplete() {
-        // Control attach landed; terminal attach did not. Reporting the pair as
-        // one `available` would tell a consumer it can reattach to a run's
-        // output, which it cannot: a headless detached run's streams are
-        // /dev/null.
+    fn attach_is_available_with_its_two_limits_stated() {
+        // Both kinds of attach landed, so the status is `available` — but an
+        // `available` with no caveats would let a consumer plan on two things
+        // that are not true: that several clients can watch one run, and that
+        // every byte of a detached run's output is kept.
         let report = SupportReport::gather();
         let attach = report.attach();
-        assert_eq!(attach.status(), SupportStatus::Partial);
-        assert_eq!(attach.determination(), Determination::Declared);
-        let SupportReason::NotImplemented { slice } = attach.reason() else {
+        assert_eq!(attach.status(), SupportStatus::Available);
+        assert_eq!(attach.determination(), Determination::PlatformApi);
+        let SupportReason::PlatformApiLinked {
+            api,
+            why_not_probed,
+        } = attach.reason()
+        else {
             panic!(
-                "a partial capability must name the work that would finish it: {:?}",
+                "attach rests on a linked platform API: {:?}",
                 attach.reason()
             );
         };
-        assert!(slice.contains("attach_control"), "{slice}");
-        assert!(slice.contains("PTY"), "{slice}");
+        assert!(api.contains("unix(7) control socket"), "{api}");
+        assert!(
+            why_not_probed.contains("Busy"),
+            "the single-client limit must be stated: {why_not_probed}"
+        );
+        assert!(
+            why_not_probed.contains("NoTerminal"),
+            "and the headless refusal: {why_not_probed}"
+        );
+        assert!(
+            why_not_probed.contains("bounded ring"),
+            "and that scrollback is bounded: {why_not_probed}"
+        );
+    }
+
+    #[test]
+    fn an_interactive_session_is_the_terminal_probe_plus_a_supervisor() {
+        // The status is the live PTY probe's, because a host that will not give
+        // this process a pseudo-terminal cannot run an interactive session
+        // however good the supervisor is. The *determination* is not the
+        // probe's: the supervisor half was not established, and saying
+        // `probed_live` would make the strongest word in this module mean
+        // something weaker.
+        let report = SupportReport::gather();
+        let interactive = report.interactive_session();
+        assert_eq!(interactive.status(), report.pty().status());
+        if interactive.status() == SupportStatus::Available {
+            assert_eq!(interactive.determination(), Determination::PlatformApi);
+            let SupportReason::PlatformApiLinked {
+                api,
+                why_not_probed,
+            } = interactive.reason()
+            else {
+                panic!("{:?}", interactive.reason());
+            };
+            assert!(api.contains("TIOCSCTTY"), "{api}");
+            assert!(
+                why_not_probed.contains("InteractiveNeedsSupervisor"),
+                "the precondition must name the refusal it produces: {why_not_probed}"
+            );
+        } else {
+            // A host with no PTY: the refusal is the probe's own, with the
+            // probe's own strength, rather than a second-hand claim.
+            assert_eq!(interactive.determination(), report.pty().determination());
+            assert_eq!(interactive.reason(), report.pty().reason());
+        }
     }
 
     #[test]

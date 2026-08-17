@@ -61,6 +61,7 @@ use super::cleanup::CleanupVerification;
 use super::exit::SandboxExit;
 use super::gate::{ACTIVATION_TOKEN_BYTES, ActivationError, StopError};
 use super::state::LifecycleState;
+use super::terminal::{AttachAck, WindowSize};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, RawFd};
@@ -253,6 +254,16 @@ pub enum ControlRefusal {
         state: LifecycleState,
     },
 
+    /// The run has no terminal to attach to.
+    ///
+    /// A headless run's standard streams are `/dev/null` and there is no PTY
+    /// anywhere in the picture, so there is nothing an attach could show. The
+    /// refusal is typed rather than an empty terminal, because a client that
+    /// attached to a run that cannot speak would sit watching silence and
+    /// conclude the run had hung.
+    #[error("this run is headless: there is no terminal to attach to")]
+    NoTerminal,
+
     /// The operation is one a later slice implements.
     #[error("control operation {op} is not implemented in this build")]
     Unimplemented {
@@ -307,6 +318,20 @@ pub enum ControlRequest {
     /// not.
     VerifyCleanup,
 
+    /// Take over this run's terminal, at this size.
+    ///
+    /// The last control frame the connection carries: the
+    /// [`ControlReply::AttachAck`] that answers it switches both sides to the
+    /// terminal framing of [`super::terminal`], and only a
+    /// [`AttachTag::Detach`][detach] switches them back.
+    ///
+    /// [detach]: super::AttachTag::Detach
+    Attach {
+        /// The size to give the terminal before any output is replayed, so a
+        /// program that reads it at startup reads the size the viewer has.
+        window: WindowSize,
+    },
+
     /// Leave. The run carries on; this connection does not.
     Goodbye,
 }
@@ -340,6 +365,7 @@ impl std::fmt::Debug for ControlRequest {
             Self::Stop => f.write_str("Stop"),
             Self::Status => f.write_str("Status"),
             Self::VerifyCleanup => f.write_str("VerifyCleanup"),
+            Self::Attach { window } => f.debug_struct("Attach").field("window", window).finish(),
             Self::Goodbye => f.write_str("Goodbye"),
         }
     }
@@ -356,6 +382,7 @@ impl ControlRequest {
             Self::Stop => "stop",
             Self::Status => "status",
             Self::VerifyCleanup => "verify_cleanup",
+            Self::Attach { .. } => "attach",
             Self::Goodbye => "goodbye",
         }
     }
@@ -472,6 +499,22 @@ pub enum ControlReply {
         verdict: CleanupVerification,
         /// The state the verdict left the run in.
         state: LifecycleState,
+    },
+
+    /// The attach was accepted, and this connection is now a terminal.
+    ///
+    /// The last control frame this connection carries until a detach. The ack
+    /// says where the run is, how much scrollback is about to arrive, how much
+    /// the bounded ring could not keep, and — for a run that has already ended
+    /// — the exit facts, so a client that attaches to a finished run learns
+    /// that from the ack rather than from silence.
+    AttachAck {
+        /// The terminal's state at the moment of the attach.
+        ///
+        /// Boxed because it carries a whole [`SandboxExit`] and every other
+        /// reply would otherwise be as big as it in every buffer either side
+        /// allocates — the same reasoning [`Self::Status`] uses.
+        ack: Box<AttachAck>,
     },
 
     /// The client said goodbye and the supervisor acknowledged it.
@@ -625,7 +668,11 @@ pub(super) fn read_exact_by(
 }
 
 /// Write all of `bytes`, waiting only through `poll` and only until `deadline`.
-fn write_all_by(
+///
+/// Shared with the terminal channel, which frames its own messages but needs
+/// exactly the same discipline underneath: a client that stopped reading must
+/// not be able to park the writer.
+pub(super) fn write_all_by(
     stream: &mut impl AsRawFd,
     bytes: &[u8],
     deadline: Instant,
@@ -960,14 +1007,36 @@ mod tests {
             ControlRefusal::Cleanup {
                 state: LifecycleState::Running,
             },
+            ControlRefusal::NoTerminal,
             ControlRefusal::Unimplemented {
-                op: "attach".to_string(),
+                op: "reprepare".to_string(),
             },
         ];
         for refusal in refusals {
             let json = serde_json::to_string(&refusal)?;
             assert_eq!(serde_json::from_str::<ControlRefusal>(&json)?, refusal);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_attach_and_its_ack_round_trip_over_a_socket() -> Result<(), FrameError> {
+        // The mode switch rides on ordinary control framing, so the two frames
+        // that perform it must survive the same round trip as everything else.
+        let (mut left, mut right) = pair();
+        set_nonblocking(left.as_raw_fd())?;
+        set_nonblocking(right.as_raw_fd())?;
+        let request = ControlRequest::Attach {
+            window: WindowSize::new(40, 100),
+        };
+        write_frame(&mut left, &request, soon())?;
+        assert_eq!(read_frame::<ControlRequest>(&mut right, soon())?, request);
+
+        let reply = ControlReply::AttachAck {
+            ack: Box::new(AttachAck::new(LifecycleState::Running, 7, 3, None)),
+        };
+        write_frame(&mut right, &reply, soon())?;
+        assert_eq!(read_frame::<ControlReply>(&mut left, soon())?, reply);
         Ok(())
     }
 
@@ -991,6 +1060,13 @@ mod tests {
         assert_eq!(ControlRequest::Status.as_str(), "status");
         assert_eq!(ControlRequest::VerifyCleanup.as_str(), "verify_cleanup");
         assert_eq!(ControlRequest::Goodbye.as_str(), "goodbye");
+        assert_eq!(
+            ControlRequest::Attach {
+                window: WindowSize::new(24, 80)
+            }
+            .as_str(),
+            "attach"
+        );
         assert_eq!(
             ControlRequest::Wait {
                 deadline_millis: 10

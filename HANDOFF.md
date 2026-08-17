@@ -1,6 +1,6 @@
 # HANDOFF — Parallel Stream 1: Crystal Nono fork (generic sandbox substrate)
 
-Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 7
+Run: EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C · Updated: 2026-08-17, iteration 9
 
 STATUS: IN PROGRESS — this stream is NOT yet done. Only the final integration
 agent may declare the combined system complete; this file records the current
@@ -205,11 +205,88 @@ frozen-contract state of THIS repository only.
   dropped, and `DetachedSession::status().events()` is how you read them. A
   consumer that needs every event stays connected.
 
-- Still being added: attach to a detached run's *terminal* (slice C:
-  PTY ownership, attach/detach/resize framing on the same socket), interactive
-  (PTY) sessions, and re-prepare with an incremented generation — each reported
-  by `SupportReport` (`attach` is now `partial`, not `unavailable`) rather than
-  left to inference (ADR-0001 §6).
+- Landed (iteration 9): **R09 slice C, the run's terminal.** A detached run can
+  now have a real PTY, owned by the supervisor, that a client attaches to,
+  types at, resizes, detaches from, and comes back to — across a restart of the
+  caller.
+
+  **Interactive is a question of ownership, not a feature flag.** A PTY master
+  has to be held for as long as the run lives, and the ephemeral paths have
+  nothing that outlives the call to hold one. So an interactive plan has to be
+  a *detached* plan:
+
+  ```rust
+  let plan = SandboxPlan::new("/bin/sh")
+      .args(["-c", "..."])
+      .session_mode(SessionMode::Interactive)
+      .detached(true)                     // required, and refused without it
+      .capabilities(caps)
+      .validate()?;
+
+  let (session, handle) = store.prepare_detached(plan)?;
+  // Attach *before* activating: the window size has to reach the terminal
+  // before the program starts, or a program that reads its size at startup
+  // reads the zeroes a fresh PTY carries.
+  let mut terminal = session.attach(WindowSize::new(40, 100))?;
+  terminal.activate(&handle)?;
+  ```
+
+  `PreparedSandbox::prepare` and `SessionStore::prepare` refuse an interactive
+  plan with the new `PrepareError::InteractiveNeedsSupervisor`, which names the
+  method that does implement it.
+
+  New API:
+
+  | Item | What it is |
+  |---|---|
+  | `DetachedSession::attach(window)` | `-> AttachedTerminal`. The last control frame this connection carries until a detach. |
+  | `AttachedTerminal::{write_input, resize, ping, read_event, activate, detach, ack, session_id, supervisor}` | The terminal, over the same socket. Every call is deadline-bounded; `read_event` takes the deadline explicitly. |
+  | `TerminalEvent::{Output(Vec<u8>), Ended(TerminalEnd), Pong, Idle}` | What a read found. `Idle` is a quiet terminal, not a failure. |
+  | `AttachAck::{state, buffered, dropped, exit}` | The run's state at the attach, how much scrollback is about to arrive, **how much the ring could not keep**, and the exit facts if it has already ended. |
+  | `TerminalEnd::{state, exit}` | The `SessionEnded` payload. `exit` is an `Option` because a run can reach a terminal state whose facts were never observed. |
+  | `WindowSize::{new, rows, cols}` | Character cells. Pixels are deliberately not carried — almost nothing sets them and almost nothing honours them. |
+  | `AttachError`, `AttachViolation`, `AttachTag`, `Peer`, `LifecycleError::Attach` | The typed failures and the wire vocabulary, exported so a consumer can match on them. |
+  | `MAX_ATTACH_PAYLOAD_BYTES` (32 KiB), `SCROLLBACK_CAPACITY_BYTES` (256 KiB) | Documented bounds. |
+  | `ControlRequest::Attach`, `ControlReply::AttachAck`, `ControlRefusal::NoTerminal` | Protocol v1 additions. |
+  | `PrepareError::{InteractiveNeedsSupervisor, Terminal}`, `PreExecStage::ControllingTerminal` | New typed refusals. |
+
+  Five consumer-visible consequences, none of them hidden:
+
+  1. **One viewer at a time.** Attach occupies the supervisor's single client
+     slot; a second connection is refused `ControlRefusal::Busy` exactly as it
+     was before. There is no separate "already attached" answer because a
+     second attach cannot reach the supervisor to be refused.
+  2. **A headless run has no terminal**, and an attach to one is refused
+     `ControlRefusal::NoTerminal` rather than seating you in front of silence.
+  3. **Scrollback is bounded, and says so.** Output produced while nobody is
+     attached goes to a 256 KiB oldest-dropped ring. `AttachAck::dropped()` is
+     how many bytes were lost; a consumer that needs every byte stays attached.
+     Output already handed to a client and not consumed is *not* replayed —
+     the ring covers from the detach onwards.
+  4. **A stalled client is dropped; the run is not.** A client that stops
+     reading eventually stalls the terminal (that is what backpressure is for);
+     after ten seconds the client goes, output returns to the ring, and the run
+     carries on.
+  5. **A stop hangs the terminal up.** The supervisor drains the master and
+     closes it before the kill, because a session leader holding a controlling
+     terminal cannot finish exiting until that terminal has drained — and the
+     process that would drain it is the one about to block in `waitpid`. The
+     practical effect is that a stopped interactive run may be observed as
+     `Signaled { SIGHUP }` rather than `SIGKILL`; the exit reports what was
+     seen, as always. A later attach still works and still replays the ring.
+
+  One repository-internal change worth flagging to a reviewer: macOS `killpg`
+  answers **`EPERM`, not `ESRCH`**, for a process group whose every member is
+  already a zombie, so a stop that raced the run's own exit used to report "the
+  signal could not be delivered". `ActivatedSandbox::{stop, drop}` now read that
+  as "nothing left in the group to signal" — and only there, where the group id
+  is an unreaped child's own pid and so cannot have been reissued.
+  `RecoveredSession::kill_group` keeps the strict reading, because its recorded
+  group id may well have been reissued.
+
+- Still being added: re-prepare with an incremented generation, and resource
+  ceilings — each reported by `SupportReport` rather than left to inference
+  (ADR-0001 §6). `interactive_session` and `attach` are now `available`.
 
 ## Toolchain and platform requirements
 
@@ -249,9 +326,16 @@ frozen-contract state of THIS repository only.
 | `cargo test -p nono --test lifecycle_live` (after F9) | 25 passed, unmodified; clean on 3 consecutive runs |
 | removal detection for the F9 guards | hello version check deleted → the wrong-version client is greeted instead of refused (`left: Hello{protocol: 1, …}`); frame-length bound deleted → the supervisor reads a body that never arrives and the oversize test fails with "the supervisor must answer"; stale-socket unlink deleted from `recover` → "recovery must remove the stale socket it just proved dead"; hello-first guard deleted → a `Status` sent before any hello is served; **peer-uid consult** deleted (either the `peer_uid` call or the whole `accept_decision` consult) → `the_live_accept_path_consults_the_peer_credential` fails with "a connection from another uid must not become the client", and hardcoding `Serve` additionally fails the busy-refusal test |
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F9) | 7 loom models pass, unchanged — F9 adds no shared-state machinery inside a process (the supervisor loop is single-threaded by construction), and the one signature change (`reconcile` gaining `SupervisorPresence`) is a pure argument the models pass `NeverDetached` for |
+| `cargo test --workspace --no-fail-fast` (after F10, iteration 9) | 3703 passed / 0 failed / 2 ignored, 34 suites |
+| `cargo test -p nono lifecycle` (after F10) | 235 unit (218 unchanged + 17 new: 14 `terminal`, 1 `protocol` attach round trip, 1 `exit` zombie-group, 1 reshaped `support` pair) |
+| `cargo test -p nono --test lifecycle_detached` (after F10) | 27 passed / 0 failed / 1 ignored (15 unchanged + 12 new); clean on 3 consecutive runs, no leaked supervisors and no leftover store directories |
+| `cargo test -p nono --test lifecycle_live` (after F10) | 25 passed, unmodified; clean on 3 consecutive runs |
+| removal detection for the F10 guards | unknown-tag guard deleted from `FrameDecoder::next_frame` (decode as `Input` instead) → `a_tag_this_protocol_does_not_have_is_named_not_skipped` fails *and* the live `a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run` fails with "an unknown terminal frame tag must end the channel"; scrollback bound deleted from `Scrollback::push` → the two ring unit tests fail (`left: 524288, right: 262144`) and the live flood test fails with "the ring must stay bounded: 406282 bytes buffered, bound is 262144"; the `EPERM` arm deleted from `kill_own_group` → `a_group_of_zombies_is_nothing_left_to_signal_not_a_refusal` fails on macOS, and with it every detached stop that races the run's own exit |
+| `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` (after F10) | 7 loom models pass, unchanged — F10 adds no shared-state machinery inside a process (the supervisor loop is single-threaded by construction) |
 | `cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
 | `RUSTFLAGS='--cfg nono_loom' cargo clippy -p nono --all-targets -- -D warnings -D clippy::unwrap_used` | clean |
 | `cargo fmt --all -- --check` | clean |
+| `cargo test --doc -p nono` | 11 passed |
 
 Full gate for every iteration: `make ci` equivalent (clippy -D warnings -D
 clippy::unwrap_used, fmt check, workspace tests) + scripts above.
@@ -263,7 +347,7 @@ clippy::unwrap_used, fmt check, workspace tests) + scripts above.
   command_runtime dry-run test (+ F1b: same for 3 flaky tool-sandbox git
   tests). Details: NONO_UPSTREAM_DELTA.md.
 - F2 (fork-only docs): SOURCE_LOCK.json, baseline docs, ADR-0001, this file.
-- F3-F9 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
+- F3-F10 (fork substrate): the `crates/nono/src/lifecycle/` module, one row per
   slice in NONO_UPSTREAM_DELTA.md with its disposition and deletion condition.
 
 ## Remaining external blockers

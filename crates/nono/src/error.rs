@@ -266,7 +266,8 @@ impl NonoError {
             // conversation over it.
             Self::Lifecycle(
                 crate::lifecycle::LifecycleError::Session(_)
-                | crate::lifecycle::LifecycleError::Detached(_),
+                | crate::lifecycle::LifecycleError::Detached(_)
+                | crate::lifecycle::LifecycleError::Attach(_),
             ) => NonoDiagnosticCode::IoError,
             Self::Lifecycle(
                 crate::lifecycle::LifecycleError::Transition(_)

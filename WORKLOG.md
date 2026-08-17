@@ -487,3 +487,125 @@ and raised seven items. All applied before commit.
   another uid must not become the client"; replacing the whole
   `accept_decision(…)` consult with a hardcoded `AcceptDecision::Serve` fails
   that test *and* `the_live_accept_path_refuses_a_second_client_in_words`.
+
+## 2026-08-17 — Iteration 9: R09 slice C supervisor-owned PTY + terminal attach (delta F10)
+
+- Goal: give a detached run a real terminal that outlives its caller, and a way
+  to attach to it, type at it, resize it, leave it, and come back.
+- New module `crates/nono/src/lifecycle/terminal.rs` (1577 lines): the PTY
+  primitives, the attach framing, the bounded scrollback ring, and the client's
+  `AttachedTerminal`. Everything else is edits to `supervisor.rs` (the launcher's
+  allocation, the intermediate's descriptor discipline, the loop), `prepare.rs`
+  (the child's session/`TIOCSCTTY` branch and the ownership refusal),
+  `protocol.rs` (`Attach`/`AttachAck`/`NoTerminal`), `detached.rs` (the entry
+  point), `exit.rs` (a new pre-exec stage, and the `killpg` reading below), and
+  `support.rs` + the schema doc.
+
+### The three decisions worth recording
+
+1. **Interactive is a question of ownership, not a feature flag.** A PTY master
+   has to be held for as long as the run lives, and the ephemeral paths have
+   nothing that outlives the call to hold one. So `SessionMode::Interactive` is
+   supported on the detached path *only*, and `refuse_unsupported` now judges it
+   exactly as it already judged detachment — same shape, same `supervised` flag,
+   new typed `PrepareError::InteractiveNeedsSupervisor` that names the method
+   which does implement it. Running such a plan headless behind the caller's
+   back was the alternative, and it is the failure mode this whole module
+   exists to avoid.
+
+2. **An interactive child leads a SESSION, not just a group.** `TIOCSCTTY` is
+   refused for a process that is not a session leader, so `setpgid(0, 0)`
+   becomes `setsid()` for an interactive run. That was the one place where the
+   change could have quietly weakened R11: it does not, because `setsid` also
+   puts the process in a *new process group* whose id is again the child's own
+   pid — the number the parent recorded — so the group probe cleanup
+   verification depends on is unchanged. Stated in the child's own comment
+   rather than left for a reader to reconstruct.
+
+3. **Raw bytes and controls are distinct by framing, not by content.** The
+   attach channel is `[u8 tag][u32 LE len][bytes]`, so an `Input` payload
+   reaches the master byte for byte — `0xFF`, NULs, and a sequence that *is* a
+   well-formed frame header all travel unchanged, because the length prefix
+   already said how many bytes the frame owns. There is no escape to get wrong.
+   Proven at the unit level and end to end through a real `/bin/cat` behind
+   `stty raw -echo`.
+
+### Two deadlocks the live tests found, both real
+
+Both were reproduced with standalone C programs before anything was changed, so
+the fix is against a measured fact rather than a theory.
+
+1. **A session leader holding a controlling terminal cannot finish exiting until
+   that terminal's output has drained** — and the only process that can drain it
+   is the one about to block in `waitpid`. Measured: `waitpid` never returns
+   (100 × 10 ms and still `?Es`), while draining or closing the master reaps in
+   10 ms. So `Supervisor::stop` drains and then *hangs the terminal up* before
+   the kill; `Supervisor::wait` services the terminal on every slice (without
+   which a run that outran the tty buffer blocked writing while its own caller
+   waited for it to finish — that is what made the ring-flood test hang); and
+   the loop hangs up before any handle's `Drop` can reap. Consequence stated
+   rather than hidden: a stopped interactive run may be observed as
+   `Signaled { SIGHUP }` rather than `SIGKILL`, and a later attach still works
+   and still replays the ring.
+
+2. **macOS `killpg` answers `EPERM`, not `ESRCH`, for a group whose every member
+   is already a zombie.** Measured directly: `kill(zombie) rc=0`,
+   `killpg(zombie) rc=-1 errno=1`. So a stop that raced the run's own exit
+   reported "the stop signal could not be delivered" — a pre-existing R11
+   fragility that slice C's hang-up made deterministic, and which no test had
+   ever reached because nothing exercised `ActivatedSandbox::stop` over the
+   control socket. `ActivatedSandbox::{stop, drop}` now go through a private
+   `kill_own_group` that reads `EPERM` as "nothing left in the group to signal",
+   **and only there**: the group id is an unreaped child's own pid and so cannot
+   have been reissued. `RecoveredSession::kill_group` deliberately keeps the
+   strict reading, because its recorded group id may well have been. This is the
+   one change outside slice C's stated scope and it is flagged as such.
+
+### Deviations from the brief, with reasons
+
+- **No `AttachBusy` refusal.** The brief resolved to "keep the existing
+  single-client-at-a-time socket discipline; a second connection still gets
+  `Busy`". With that discipline a second attach cannot reach the supervisor to
+  be refused, so an `AttachBusy` variant would be unreachable code — which the
+  repository forbids. `Busy` is the answer, and the protocol docs say why.
+- **`AttachedTerminal::activate` rather than attach-after-activate.** Test (a)
+  needs the window size to reach the terminal before the program starts, so the
+  attach has to precede the activation. `activate` leaves attach mode for one
+  control exchange and returns to it; nothing is lost across the gap because
+  output with nobody attached goes to the ring. The alternative — new frame tags
+  to tunnel control operations — would have widened the wire vocabulary the
+  brief specified exactly.
+- **`interactive_session` and `attach` are `platform_api`, not `probed_live`.**
+  The brief said `ProbedLive` was acceptable given the live tests. The module's
+  own definition of `ProbedLive` is "a probe ran *in this process, during this
+  call*", and a test that ran elsewhere is not that; claiming it would make the
+  strongest word in the report mean something weaker. `interactive_session`
+  takes its *status* from the live `posix_openpt` probe (a host with no PTY
+  cannot run one however good the supervisor is) but not its *determination*.
+- **Darwin `TIOC*` constants are carried in-tree.** `libc` declares no `TIOC*`
+  numbers for Apple targets and no `ptsname_r`. `TIOCSCTTY`, `TIOCSWINSZ` and
+  `TIOCPTYGNAME` are defined in `terminal.rs` from the platform header, and a
+  unit test recomputes all three from the BSD `_IOC` encoding rule so a
+  transposed digit fails there rather than as an `ENOTTY` at the point of use.
+
+- Gates after: 235 lifecycle unit (218 + 17 new); `--test lifecycle_detached`
+  27 passed / 1 ignored ×3; `--test lifecycle_live` 25 passed ×3; loom 7/7
+  unchanged; workspace 3703/0/2 across 34 suites; strict clippy clean (also
+  under `nono_loom`); fmt clean; both lint scripts exit 0; doctests 11.
+- Removal detection (each restored to green afterwards):
+  - unknown-tag guard deleted from `FrameDecoder::next_frame` (decode as `Input`
+    instead) → `a_tag_this_protocol_does_not_have_is_named_not_skipped` FAILED,
+    and the live `a_frame_tag_this_protocol_does_not_have_ends_the_channel_not_the_run`
+    FAILED with "an unknown terminal frame tag must end the channel".
+  - scrollback bound deleted from `Scrollback::push` →
+    `the_ring_stays_bounded_and_counts_what_it_dropped` FAILED
+    (`left: 524288, right: 262144`), `the_ring_keeps_the_tail_not_the_head`
+    FAILED (`left: 262150, right: 262144`), and the live
+    `the_scrollback_ring_stays_bounded_and_says_what_it_dropped` FAILED with
+    "the ring must stay bounded: 406282 bytes buffered, bound is 262144".
+  - `EPERM` arm deleted from `kill_own_group` →
+    `a_group_of_zombies_is_nothing_left_to_signal_not_a_refusal` FAILED on
+    macOS, and with it every detached stop that races the run's own exit.
+- Still Linux-unverified behind R07: the whole PTY path — `open_pty`'s Linux
+  `ptsname_r` arm, `setsid`/`TIOCSCTTY`, and the master's `EIO`-on-last-slave-close
+  end of file (macOS returns 0; both are folded into `ReadOutcome::Ended`).

@@ -85,7 +85,29 @@
 //! launcher's pipes would keep them open after the launcher exited, which is
 //! exactly the thing "detached" is supposed to stop. The consequence is stated
 //! rather than hidden: **a headless detached run's output goes nowhere.**
-//! Giving it back is what the PTY of slice C is for.
+//!
+//! An *interactive* run is the answer to that, and it is why a plan that asks
+//! for a terminal has to ask to be detached as well. The launcher allocates a
+//! pseudo-terminal before any fork — [`open_pty`], because `posix_openpt`,
+//! `grantpt` and the slave `open` can each allocate, take a lock, or walk the
+//! filesystem, none of which a forked child may do — and then lets go of both
+//! ends. The slave becomes the customer child's 0, 1 and 2; the master crosses
+//! the exec and is held by the supervisor, and by nothing else anywhere. See
+//! [`super::terminal`] for the channel a client reaches it through.
+//!
+//! ```text
+//! descriptor   launcher                intermediate            customer child      supervisor
+//! ----------   --------                ------------            --------------      ----------
+//! pty master   opens, closes at fork   inherits, un-CLOEXEC    closes explicitly   owns, sole holder
+//! pty slave    opens, closes at fork   closes after the fork   dup2 -> 0,1,2       never has it
+//! ```
+//!
+//! Three closes matter and each is load-bearing. The launcher's slave, because
+//! a copy left there would keep the terminal open after the run ended and the
+//! supervisor's master would never see the end of output. The intermediate's
+//! slave, for the same reason. The customer child's master, because a program
+//! holding the master of its own terminal could read back everything it wrote
+//! and everything typed at it.
 
 use super::LifecycleError;
 use super::detached::{CONTROL_TIMEOUT, DetachedSession};
@@ -93,11 +115,12 @@ use super::events::{EventEmitter, EventRing, EventSink, LifecycleEventKind};
 use super::exit::SandboxExit;
 use super::gate::{ACTIVATION_TOKEN_BYTES, ActivationHandle, GATE_MESSAGE_BYTES, GateSecrets};
 use super::identity::ProcessIdentity;
+use super::plan::SessionMode;
 use super::plan::ValidatedPlan;
 use super::prepare::{
-    AdoptedChild, ChildContext, ExecImage, PlatformSandbox, PrepareError, PreparedSandbox,
-    child_main, close_inherited_descriptors, last_errno, open_channel, refuse_unsupported,
-    resolve_program, write_record,
+    AdoptedChild, ChildContext, ChildTerminal, ExecImage, PlatformSandbox, PrepareError,
+    PreparedSandbox, child_main, close_inherited_descriptors, last_errno, open_channel,
+    refuse_unsupported, resolve_program, write_record,
 };
 use super::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlRefusal, ControlReply, ControlRequest, FrameError,
@@ -106,7 +129,14 @@ use super::protocol::{
 };
 use super::session_store::{SessionHandle, SessionRecord, SessionStore};
 use super::state::LifecycleState;
+use super::terminal::{
+    AttachAck, AttachFrame, AttachTag, FrameDecoder, MAX_ATTACH_PAYLOAD_BYTES, Peer, ReadOutcome,
+    Scrollback, TERMINAL_READ_CHUNK, TerminalEnd, WindowSize, WriteOutcome, decode_window,
+    encode_frame, open_pty, outbound_bound, read_nonblocking, set_window_size, stall_deadline,
+    write_nonblocking,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::ffi::{CString, c_char};
 use std::io::{PipeReader, PipeWriter};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -361,6 +391,11 @@ struct Bootstrap {
     gate_fd: RawFd,
     /// The status descriptor's read end, likewise.
     status_fd: RawFd,
+    /// The terminal master's descriptor number, for an interactive run.
+    ///
+    /// `None` is a headless run, whose standard streams are `/dev/null` and
+    /// which therefore has nothing for an attach to show.
+    pty_fd: Option<RawFd>,
     /// The plan's activation expiry, in milliseconds.
     expiry_millis: Option<u64>,
     /// The message that releases the held child.
@@ -513,6 +548,19 @@ fn launch_inner(
     let (handshake_read, handshake_write) = open_channel()?;
     let (bootstrap_read, bootstrap_write) = open_channel()?;
 
+    // Allocated here, in the launcher, and for the same reason everything else
+    // is: `posix_openpt`, `grantpt` and the slave open can each allocate, take
+    // a lock, or walk the filesystem, and a forked child may do none of those.
+    // What crosses the fork is two descriptor numbers.
+    let pty = match plan.session_mode() {
+        SessionMode::Interactive => Some(open_pty()?),
+        SessionMode::Headless => None,
+    };
+    let terminal = pty.as_ref().map(|pty| ChildTerminal {
+        slave: pty.slave.as_raw_fd(),
+        master: pty.master.as_raw_fd(),
+    });
+
     let secrets = GateSecrets::generate().map_err(|_| PrepareError::TokenGeneration)?;
 
     // Built before the fork, because the intermediate may not allocate. The
@@ -525,6 +573,7 @@ fn launch_inner(
         metadata: plan.metadata().to_vec(),
         gate_fd: gate_write.as_raw_fd(),
         status_fd: status_read.as_raw_fd(),
+        pty_fd: terminal.map(|terminal| terminal.master),
         expiry_millis: plan
             .gate()
             .activation_expiry
@@ -559,6 +608,7 @@ fn launch_inner(
         gate_write: gate_write.as_raw_fd(),
         status_read: status_read.as_raw_fd(),
         status_write: status_write.as_raw_fd(),
+        terminal,
         program: image.program.as_ptr(),
         argv: argv_ptrs.as_ptr(),
         envp: envp_ptrs.as_ptr(),
@@ -599,6 +649,13 @@ fn launch_inner(
     // particular: while this process held a copy, a dead supervisor would not
     // make the held child's `read` return 0, and the ADR-0001 property that a
     // held child never outlives every writer of its gate would be broken.
+    //
+    // The pseudo-terminal is the same argument twice over. The launcher's copy
+    // of the *slave* would keep the terminal open after the run ended, so the
+    // supervisor's master would never see the end of output — and a launcher
+    // that lived for hours would hold a terminal for a run that finished in
+    // seconds. The launcher's copy of the *master* would mean two processes
+    // could read the run's output, one of which is not the one that owns it.
     drop(gate_read);
     drop(gate_write);
     drop(status_read);
@@ -606,6 +663,7 @@ fn launch_inner(
     drop(handshake_write);
     drop(bootstrap_read);
     drop(bootstrap_write);
+    drop(pty);
 
     let mut handshake_read = handshake_read;
     if let Err(err) = set_nonblocking(handshake_read.as_raw_fd()) {
@@ -822,6 +880,15 @@ fn intermediate_main(context: &LaunchContext<'_>) -> ! {
         libc::close(context.child.status_write);
     }
 
+    // And the terminal's slave, for the same reason as the status descriptor:
+    // the supervisor's master reaches end-of-file only when the *last* slave
+    // closes, so a copy left here would mean a run whose output never ended.
+    // The customer child has its own copy on 0, 1, and 2.
+    if let Some(terminal) = context.child.terminal {
+        // SAFETY: a descriptor this process owns, closed exactly once.
+        unsafe { libc::close(terminal.slave) };
+    }
+
     // The customer child's pid, then the launcher's prebuilt blob. The pid is
     // the one fact the launcher could not know before the fork, so it is the
     // one thing written here rather than prepared there.
@@ -834,15 +901,24 @@ fn intermediate_main(context: &LaunchContext<'_>) -> ! {
     // Deliberately inheritable across the exec: these are the supervisor's
     // whole inheritance, and every one of them was created close-on-exec so
     // that no *other* exec in this process's history could have leaked it.
+    //
+    // The terminal master is the sixth when there is one. `-1` stands in for
+    // "no terminal" rather than a shorter array, because this runs between a
+    // fork and an exec and may not allocate: `fcntl` and `close` on `-1` are
+    // `EBADF` and change nothing.
     let survivors = [
         context.child.gate_write,
         context.child.status_read,
         context.listener,
         context.handshake_write,
         context.bootstrap_read,
+        context
+            .child
+            .terminal
+            .map_or(-1, |terminal| terminal.master),
     ];
     for fd in survivors {
-        if !clear_close_on_exec(fd) {
+        if fd >= 0 && !clear_close_on_exec(fd) {
             intermediate_fail(context.handshake_write, last_errno());
         }
     }
@@ -1135,8 +1211,8 @@ fn serve(
     // and the customer child was forked before that — so nothing is left that
     // needs to inherit any of them, and re-arming closes the window before this
     // process ever execs anything again. That is not hypothetical work for its
-    // own sake: slice C's PTY path will exec, and a supervisor that leaked its
-    // own control socket or its own gate descriptor into whatever it started
+    // own sake: a supervisor that leaked its own control socket, its own gate
+    // descriptor, or the master of the run's terminal into whatever it started
     // would hand that program the run.
     for fd in [
         marker.bootstrap,
@@ -1144,8 +1220,11 @@ fn serve(
         marker.listener,
         bootstrap.blob.gate_fd,
         bootstrap.blob.status_fd,
+        bootstrap.blob.pty_fd.unwrap_or(-1),
     ] {
-        set_close_on_exec(fd);
+        if fd >= 0 {
+            set_close_on_exec(fd);
+        }
     }
 
     let identity = ProcessIdentity::capture(own_pid());
@@ -1209,6 +1288,23 @@ fn serve(
     ));
     prepared.attach_session(Arc::clone(&session));
 
+    // The terminal, if this run has one. Non-blocking, because it joins the one
+    // poll set that also accepts connections and watches the child: a master
+    // whose customer had stopped reading would otherwise park the whole
+    // supervisor inside a single `write`.
+    let terminal = match bootstrap.blob.pty_fd {
+        Some(fd) => {
+            // SAFETY: inherited across `execve`, named by the bootstrap blob
+            // the intermediate wrote, and owned by nothing else in this
+            // process — the launcher dropped its copies after the fork and the
+            // customer child closed its own before the sandbox applied.
+            let master = unsafe { OwnedFd::from_raw_fd(fd) };
+            set_nonblocking(master.as_raw_fd()).map_err(|_| libc::EIO)?;
+            Some(Terminal::new(master))
+        }
+        None => None,
+    };
+
     // Installed *before* readiness is announced, so that the byte the launcher
     // reads means what it says. A supervisor that reported ready and then
     // installed its `SIGCHLD` handler would have a window in which a child that
@@ -1244,6 +1340,7 @@ fn serve(
         client: None,
         listener,
         signals,
+        terminal,
         idle_since: None,
     };
     supervisor.serve_until_done();
@@ -1445,6 +1542,8 @@ struct Supervisor {
     client: Option<Client>,
     listener: UnixListener,
     signals: SignalPipe,
+    /// The run's terminal, when it has one. This process is its only holder.
+    terminal: Option<Terminal>,
     /// When the run reached a terminal state with nobody connected.
     idle_since: Option<Instant>,
 }
@@ -1454,7 +1553,15 @@ impl Supervisor {
     fn serve_until_done(&mut self) {
         loop {
             self.observe_child();
+            self.service_terminal();
             if self.should_exit() {
+                // Unplugged before anything else is dropped. Every remaining
+                // handle's `Drop` kills and reaps, and a reap of a session
+                // leader that still holds an undrained controlling terminal
+                // never returns — see `Terminal::hang_up`.
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.hang_up();
+                }
                 return;
             }
             self.poll_once();
@@ -1504,62 +1611,123 @@ impl Supervisor {
 
     /// Wait for something to happen, then handle exactly what did.
     fn poll_once(&mut self) {
-        let mut descriptors = Vec::with_capacity(4);
-        descriptors.push(libc::pollfd {
-            fd: self.listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        descriptors.push(libc::pollfd {
-            fd: self.signals.reader.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
+        let mut watch = WatchSet::new();
+        watch.add(Watched::Listener, self.listener.as_raw_fd(), libc::POLLIN);
+        watch.add(
+            Watched::Signals,
+            self.signals.reader.as_raw_fd(),
+            libc::POLLIN,
+        );
         if let Some(client) = &self.client {
-            descriptors.push(libc::pollfd {
-                fd: client.stream.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
+            watch.add(
+                Watched::Client,
+                client.stream.as_raw_fd(),
+                self.client_interest(client),
+            );
+        }
+        if let Some(terminal) = &self.terminal
+            && let Some(master) = terminal.fd()
+        {
+            watch.add(Watched::Terminal, master, self.terminal_interest(terminal));
         }
         // Before activation the status descriptor is how a child that died at
         // the gate announces itself; after it, the descriptor is gone and
         // `SIGCHLD` is the only report.
         if let Some(status) = self.prepared.status_fd() {
-            descriptors.push(libc::pollfd {
-                fd: status,
-                events: libc::POLLIN,
-                revents: 0,
-            });
+            watch.add(Watched::Status, status, libc::POLLIN);
         }
 
         let slice = libc::c_int::try_from(POLL_SLICE.as_millis()).unwrap_or(250);
-        match poll_fds(&mut descriptors, slice) {
+        match poll_fds(&mut watch.descriptors, slice) {
             PollOutcome::Ready => {}
             // A timeout and an interruption both mean "go round again": the
-            // loop re-checks the child and the grace period on every pass.
+            // loop re-checks the child, the terminal, and the grace period on
+            // every pass.
             PollOutcome::TimedOut | PollOutcome::Interrupted => return,
             PollOutcome::Failed(_) => return,
         }
 
-        let listener_ready = descriptors
-            .first()
-            .is_some_and(|entry| entry.revents & libc::POLLIN != 0);
-        let signal_ready = descriptors
-            .get(1)
-            .is_some_and(|entry| entry.revents & libc::POLLIN != 0);
-        let client_ready =
-            self.client.is_some() && descriptors.get(2).is_some_and(|entry| entry.revents != 0);
-
-        if signal_ready {
+        if watch.ready(Watched::Signals, libc::POLLIN) {
             self.signals.drain();
         }
-        if listener_ready {
+        if watch.ready(Watched::Listener, libc::POLLIN) {
             self.accept_one();
         }
-        if client_ready {
-            self.serve_one_request();
+        // The terminal before the client, so output that arrived in the same
+        // wakeup as a request is already queued when the request is answered.
+        // In particular a detach then carries everything the run had said.
+        if watch.ready(
+            Watched::Terminal,
+            libc::POLLIN | libc::POLLOUT | libc::POLLHUP,
+        ) {
+            self.service_terminal();
         }
+        if watch.ready(
+            Watched::Client,
+            libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        ) {
+            self.serve_client();
+        }
+        if watch.ready(Watched::Client, libc::POLLOUT) {
+            self.flush_client();
+        }
+    }
+
+    /// What the connected client's descriptor is watched for.
+    ///
+    /// Two pieces of backpressure live here. Output owed to the client makes
+    /// this watch for writability; bytes owed to the *terminal* stop it
+    /// watching for readability, so a client that types faster than the run
+    /// reads fills its own socket buffer instead of this process's memory.
+    fn client_interest(&self, client: &Client) -> libc::c_short {
+        let terminal_busy = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| !terminal.to_master.is_empty());
+        let mut events = if terminal_busy { 0 } else { libc::POLLIN };
+        if client
+            .attached
+            .as_ref()
+            .is_some_and(|channel| !channel.outbound.is_empty())
+        {
+            events |= libc::POLLOUT;
+        }
+        events
+    }
+
+    /// What the terminal master is watched for.
+    ///
+    /// Readable while there is somewhere to put the output: an attached client
+    /// with room in its queue, or the ring, which always has room because it
+    /// drops its oldest. Writable while the client has typed something the
+    /// terminal has not taken.
+    fn terminal_interest(&self, terminal: &Terminal) -> libc::c_short {
+        let mut events = 0;
+        if !terminal.ended && self.terminal_has_room() {
+            events |= libc::POLLIN;
+        }
+        if !terminal.to_master.is_empty() {
+            events |= libc::POLLOUT;
+        }
+        events
+    }
+
+    /// Whether there is anywhere for more terminal output to go.
+    fn terminal_has_room(&self) -> bool {
+        match self.attached() {
+            // The ring always has room: it is bounded and drops its oldest,
+            // which is why a detached run can never be stalled by the fact
+            // that nobody is listening.
+            None => true,
+            Some(channel) => channel.outbound.len() < outbound_bound(),
+        }
+    }
+
+    /// The attach channel, when the connected client is watching the terminal.
+    fn attached(&self) -> Option<&AttachChannel> {
+        self.client
+            .as_ref()
+            .and_then(|client| client.attached.as_ref())
     }
 
     /// Accept a connection, deciding what to do with it before reading a byte.
@@ -1568,8 +1736,18 @@ impl Supervisor {
             self.client = Some(Client {
                 stream,
                 greeted: false,
+                attached: None,
             });
             self.idle_since = None;
+        }
+    }
+
+    /// Read from the client, in whichever mode the connection is in.
+    fn serve_client(&mut self) {
+        if self.attached().is_some() {
+            self.serve_attached();
+        } else {
+            self.serve_one_request();
         }
     }
 
@@ -1662,10 +1840,68 @@ impl Supervisor {
                 status: Box::new(self.status()),
             },
             ControlRequest::VerifyCleanup => self.verify_cleanup(),
+            ControlRequest::Attach { window } => self.attach(window),
             ControlRequest::Goodbye => ControlReply::Farewell,
         };
         let farewell = matches!(reply, ControlReply::Farewell);
-        client.reply(&reply) && !farewell
+        let attached = matches!(reply, ControlReply::AttachAck { .. });
+        if !client.reply(&reply) {
+            return false;
+        }
+        if attached {
+            // The ack was the last control frame this connection carries. The
+            // switch happens *after* the write, so a failed ack leaves the
+            // connection in the mode both sides still agree about.
+            client.attached = Some(AttachChannel::new());
+            self.seed_attach(client);
+        }
+        !farewell
+    }
+
+    /// Accept an attach, or say why the run has nothing to attach to.
+    ///
+    /// The window is applied before the reply, so a program released after this
+    /// reads the size the viewer has rather than the zeroes a fresh terminal
+    /// carries.
+    fn attach(&mut self, window: WindowSize) -> ControlReply {
+        let state = self.state();
+        let exit = self.exit();
+        let Some(terminal) = self.terminal.as_mut() else {
+            return ControlReply::Refused {
+                refusal: ControlRefusal::NoTerminal,
+            };
+        };
+        // Best effort, and absent entirely once the terminal has been hung up:
+        // a master that refuses a window size is still a master, and refusing
+        // the attach over it would trade a working terminal for a cosmetic
+        // failure. There is no channel to report it on yet either — this is the
+        // frame that creates one.
+        if let Some(master) = terminal.fd() {
+            let _ = set_window_size(master, window);
+        }
+        ControlReply::AttachAck {
+            ack: Box::new(AttachAck::new(
+                state,
+                terminal.ring.len() as u64,
+                terminal.ring.dropped(),
+                exit,
+            )),
+        }
+    }
+
+    /// Hand the fresh channel everything the ring was holding.
+    ///
+    /// The count in the ack has already said how much this is, so a client that
+    /// wants to distinguish scrollback from live output can.
+    fn seed_attach(&mut self, client: &mut Client) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        let Some(channel) = client.attached.as_mut() else {
+            return;
+        };
+        let backlog = terminal.ring.take();
+        channel.queue_output(&backlog);
     }
 
     /// Check the three facts a hello carries.
@@ -1736,6 +1972,11 @@ impl Supervisor {
         let deadline = Instant::now() + requested.min(super::detached::MAX_CONTROL_WAIT);
         loop {
             self.observe_child();
+            // A wait must not stop the terminal being read. Without this the
+            // run's own output would fill the terminal's buffer, the program
+            // would block writing, and a caller waiting for it to finish would
+            // be waiting for something it had itself prevented.
+            self.service_terminal();
             if let Some(exit) = self.exit() {
                 return ControlReply::Waited {
                     outcome: WaitOutcome::Exit(exit),
@@ -1755,43 +1996,49 @@ impl Supervisor {
 
     /// One slice of a wait: sleep on the descriptors, service the listener.
     fn wait_slice(&mut self, deadline: Instant) {
-        let mut descriptors = [
-            libc::pollfd {
-                fd: self.listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: self.signals.reader.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+        let mut watch = WatchSet::new();
+        watch.add(Watched::Listener, self.listener.as_raw_fd(), libc::POLLIN);
+        watch.add(
+            Watched::Signals,
+            self.signals.reader.as_raw_fd(),
+            libc::POLLIN,
+        );
+        if let Some(master) = self.terminal.as_ref().and_then(Terminal::fd) {
+            watch.add(Watched::Terminal, master, libc::POLLIN);
+        }
         let slice = remaining_millis(deadline)
             .unwrap_or(0)
             .min(libc::c_int::try_from(POLL_SLICE.as_millis()).unwrap_or(250));
-        match poll_fds(&mut descriptors, slice) {
+        match poll_fds(&mut watch.descriptors, slice) {
             PollOutcome::Ready => {}
             _ => return,
         }
-        if descriptors
-            .get(1)
-            .is_some_and(|entry| entry.revents & libc::POLLIN != 0)
-        {
+        if watch.ready(Watched::Signals, libc::POLLIN) {
             self.signals.drain();
         }
-        if descriptors
-            .first()
-            .is_some_and(|entry| entry.revents & libc::POLLIN != 0)
-        {
+        if watch.ready(Watched::Listener, libc::POLLIN) {
             // The client slot is occupied by the connection this wait belongs
             // to, so this can only ever refuse.
             self.accept_one();
         }
+        // The terminal is serviced by the caller's loop on the next pass; the
+        // descriptor is here so that the wait wakes for it rather than sitting
+        // out a whole poll slice with output ready.
     }
 
     /// End the run, through whichever handle owns it.
     fn stop(&mut self) -> ControlReply {
+        // Read everything the run has said, then unplug its terminal, *before*
+        // the kill. A stop reaps, and a reap blocks — and a session leader
+        // holding a controlling terminal cannot finish exiting until that
+        // terminal has drained. Draining is this thread's job, and this thread
+        // is the one about to block, so the terminal has to go first or the
+        // wait is for a death that can never complete. Proven: without the
+        // hang-up the reap never returns.
+        self.service_terminal();
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.hang_up();
+        }
         let stopped = match self.activated.as_mut() {
             Some(activated) => activated.stop(),
             None => self.prepared.stop_before_activation(),
@@ -1885,6 +2132,450 @@ impl Supervisor {
         self.session
             .emit_reconstructed(LifecycleEventKind::GateAborted);
     }
+
+    // -----------------------------------------------------------------------
+    // The terminal.
+    // -----------------------------------------------------------------------
+
+    /// Move every byte that can move, in the order that keeps them in order.
+    ///
+    /// Called on every pass of the loop rather than only when `poll` said so,
+    /// because two of the five steps have no descriptor to wait on: the
+    /// end-of-run frame is owed to a fact about the *child*, and the stall
+    /// deadline is owed to the absence of an event.
+    fn service_terminal(&mut self) {
+        self.pump_to_terminal();
+        self.pump_from_terminal();
+        self.announce_end();
+        self.flush_client();
+        self.drop_stalled_client();
+    }
+
+    /// Hand the terminal whatever the client typed.
+    fn pump_to_terminal(&mut self) {
+        let Some(terminal) = self.terminal.as_mut() else {
+            return;
+        };
+        let Some(master) = terminal.fd() else {
+            terminal.to_master.clear();
+            return;
+        };
+        while let Some(chunk) = front_slice(&terminal.to_master) {
+            match write_nonblocking(master, chunk) {
+                WriteOutcome::Wrote(count) => {
+                    terminal.to_master.drain(..count);
+                }
+                WriteOutcome::WouldBlock => return,
+                // The terminal is gone. Input for a run that has ended is
+                // dropped rather than held: there is nothing left to type at.
+                WriteOutcome::Ended => {
+                    terminal.to_master.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Take whatever the run said, and put it wherever it goes.
+    fn pump_from_terminal(&mut self) {
+        let Self {
+            terminal, client, ..
+        } = self;
+        let Some(terminal) = terminal.as_mut() else {
+            return;
+        };
+        let Some(master) = terminal.fd().filter(|_| !terminal.ended) else {
+            return;
+        };
+        let mut channel = client
+            .as_mut()
+            .and_then(|client| client.attached.as_mut())
+            .filter(|channel| !channel.detaching);
+        loop {
+            // Room first: with a client attached this is the backpressure that
+            // reaches all the way to the run, because an unread master stops
+            // the program writing. With nobody attached the ring always has
+            // room, so a detached run is never stalled by not being watched.
+            let room = channel
+                .as_ref()
+                .is_none_or(|channel| channel.outbound.len() < outbound_bound());
+            if !room {
+                return;
+            }
+            let mut chunk = [0_u8; TERMINAL_READ_CHUNK];
+            match read_nonblocking(master, &mut chunk) {
+                ReadOutcome::Read(count) => {
+                    let bytes = chunk.get(..count).unwrap_or_default();
+                    match channel.as_mut() {
+                        Some(channel) => channel.queue_output(bytes),
+                        None => terminal.ring.push(bytes),
+                    }
+                }
+                ReadOutcome::WouldBlock => return,
+                ReadOutcome::Ended => {
+                    // The last slave closed, which is what a run whose program
+                    // has finished looks like from here. Recorded rather than
+                    // acted on: the *exit* facts come from `waitpid`, and this
+                    // is only the statement that no more output can arrive.
+                    terminal.ended = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Tell an attached client that the run is over, exactly once.
+    ///
+    /// Sent only once the run has reached a terminal state, and only after the
+    /// pass that drained the master — so everything the program wrote is
+    /// already queued in front of it.
+    fn announce_end(&mut self) {
+        if !self.is_terminal() {
+            return;
+        }
+        let end = TerminalEnd::new(self.state(), self.exit());
+        let Some(channel) = self
+            .client
+            .as_mut()
+            .and_then(|client| client.attached.as_mut())
+        else {
+            return;
+        };
+        if channel.announced || channel.detaching {
+            return;
+        }
+        channel.announced = true;
+        let payload = serde_json::to_vec(&end).unwrap_or_default();
+        channel.queue_control(AttachTag::SessionEnded, &payload);
+    }
+
+    /// Write whatever is owed to the client, without waiting for it.
+    fn flush_client(&mut self) {
+        let Some(client) = self.client.as_mut() else {
+            return;
+        };
+        let fd = client.stream.as_raw_fd();
+        let Some(channel) = client.attached.as_mut() else {
+            return;
+        };
+        let before = channel.outbound.len();
+        while let Some(chunk) = front_slice(&channel.outbound) {
+            match write_nonblocking(fd, chunk) {
+                WriteOutcome::Wrote(count) => {
+                    channel.outbound.drain(..count);
+                }
+                WriteOutcome::WouldBlock => break,
+                WriteOutcome::Ended => {
+                    // The client is gone. Dropping it here rather than waiting
+                    // for the read to notice keeps the ring collecting output
+                    // from this moment instead of the next poll slice.
+                    self.client = None;
+                    return;
+                }
+            }
+        }
+        channel.note_progress(before);
+        if channel.detaching && channel.outbound.is_empty() {
+            // Everything the client was owed has landed, including the detach
+            // confirmation. The connection goes back to control framing with
+            // both sides agreeing about when.
+            client.attached = None;
+        }
+    }
+
+    /// Drop a client that has stopped reading.
+    ///
+    /// The run is not the thing to sacrifice here. A client that stalls holds
+    /// the terminal still — the backpressure above eventually stops the master
+    /// being read — so after the deadline the *client* goes, output returns to
+    /// the ring, and the next attach is told how much it missed.
+    fn drop_stalled_client(&mut self) {
+        let stalled = self
+            .attached()
+            .and_then(AttachChannel::stalled_since)
+            .is_some_and(|since| since.elapsed() >= stall_deadline());
+        if stalled {
+            self.client = None;
+        }
+    }
+
+    /// Read one batch of terminal frames from the client and act on them.
+    ///
+    /// Incremental by construction: a socket delivers bytes, not messages, and
+    /// a read that waited for a whole frame would let one client hold the
+    /// thread that also watches the run.
+    fn serve_attached(&mut self) {
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+        let fd = client.stream.as_raw_fd();
+        let mut chunk = [0_u8; TERMINAL_READ_CHUNK];
+        match read_nonblocking(fd, &mut chunk) {
+            ReadOutcome::Read(count) => {
+                if let Some(channel) = client.attached.as_mut() {
+                    channel.decoder.feed(chunk.get(..count).unwrap_or_default());
+                }
+            }
+            ReadOutcome::WouldBlock => {
+                self.client = Some(client);
+                return;
+            }
+            // The client closed. The run carries on; that is what detached
+            // means.
+            ReadOutcome::Ended => return,
+        }
+
+        loop {
+            let frame = match client
+                .attached
+                .as_mut()
+                .map(|channel| channel.decoder.next_frame())
+            {
+                Some(Ok(Some(frame))) => frame,
+                Some(Ok(None)) | None => break,
+                // A tag this protocol does not have, a tag the client may not
+                // send, or an oversize length. The channel is over — a stream
+                // whose framing cannot be trusted cannot be resynchronized —
+                // and the *session* is untouched, which is what a reattach
+                // proves.
+                Some(Err(_)) => return,
+            };
+            if !self.handle_attach_frame(&mut client, frame) {
+                return;
+            }
+        }
+        self.client = Some(client);
+        self.service_terminal();
+    }
+
+    /// Act on one terminal frame. Returns whether the channel survives it.
+    fn handle_attach_frame(&mut self, client: &mut Client, frame: AttachFrame) -> bool {
+        match frame.tag {
+            AttachTag::Input => {
+                // Verbatim, and that is the whole point: the length prefix has
+                // already said how many bytes belong to this frame, so a
+                // payload containing 0xFF, a NUL, or something that looks
+                // exactly like a frame header is payload and nothing else.
+                if let Some(terminal) = self.terminal.as_mut() {
+                    terminal.to_master.extend(frame.payload.iter().copied());
+                }
+                true
+            }
+            AttachTag::Resize => {
+                let Ok(window) = decode_window(&frame.payload) else {
+                    // A resize that is not a resize is the same class of fault
+                    // as an unknown tag: the client and this side disagree
+                    // about the protocol.
+                    return false;
+                };
+                if let Some(master) = self.terminal.as_ref().and_then(Terminal::fd) {
+                    // Best effort, and deliberately not reported: the kernel
+                    // signals `SIGWINCH` to the foreground group when the size
+                    // changes, so the run hears about a successful resize
+                    // without this side saying anything, and a failed one on a
+                    // live master means the terminal is going away anyway.
+                    let _ = set_window_size(master, window);
+                }
+                true
+            }
+            AttachTag::Detach => {
+                if let Some(channel) = client.attached.as_mut() {
+                    channel.detaching = true;
+                    channel.queue_control(AttachTag::Detach, &[]);
+                }
+                true
+            }
+            AttachTag::Ping => {
+                if let Some(channel) = client.attached.as_mut() {
+                    channel.queue_control(AttachTag::Pong, &[]);
+                }
+                true
+            }
+            // The answer to a ping this build does not send. Accepted and
+            // ignored rather than refused: a peer that answers a question
+            // nobody asked has broken nothing.
+            AttachTag::Pong => true,
+            // Refused by direction in the decoder before they reach here.
+            AttachTag::Output | AttachTag::SessionEnded => false,
+        }
+    }
+}
+
+/// The run's terminal, and everything this process keeps for it.
+struct Terminal {
+    /// The master, while the terminal is plugged in. This process is its only
+    /// holder, anywhere.
+    ///
+    /// `None` after [`Self::hang_up`], which is what a stop does. The ring
+    /// survives it: a client that attaches to a stopped run still gets
+    /// everything the run said.
+    master: Option<OwnedFd>,
+    /// Output nobody was connected to hear.
+    ring: Scrollback,
+    /// Bytes a client typed that the terminal has not taken yet.
+    ///
+    /// Bounded without a constant: the client's descriptor stops being watched
+    /// for readability while this is non-empty, so it can only ever hold what
+    /// one read produced.
+    to_master: VecDeque<u8>,
+    /// Whether the master has said there will be no more output.
+    ended: bool,
+}
+
+impl Terminal {
+    fn new(master: OwnedFd) -> Self {
+        Self {
+            master: Some(master),
+            ring: Scrollback::new(),
+            to_master: VecDeque::new(),
+            ended: false,
+        }
+    }
+
+    /// The master's number, while there is one.
+    fn fd(&self) -> Option<RawFd> {
+        self.master.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// Unplug the terminal.
+    ///
+    /// **This is load-bearing, not tidiness.** A session leader that holds a
+    /// controlling terminal cannot finish exiting until that terminal's output
+    /// queue has drained, and the only process that can drain it is this one —
+    /// which is about to block in `waitpid`. A supervisor that killed such a
+    /// child while still holding an unread master would wait for a death that
+    /// can never be completed. Closing the master hangs the terminal up, which
+    /// is what unplugging a real one does, and the child's exit completes.
+    ///
+    /// Every caller drains first, so what the run said is already in the ring
+    /// or already on its way to a client.
+    fn hang_up(&mut self) {
+        self.master = None;
+        self.ended = true;
+        self.to_master.clear();
+    }
+}
+
+/// A client that is watching the terminal rather than driving the run.
+struct AttachChannel {
+    /// Frames arriving from the client.
+    decoder: FrameDecoder,
+    /// Framed bytes owed to the client.
+    outbound: VecDeque<u8>,
+    /// How much was owed when progress was last made, and when.
+    stall: Option<(usize, Instant)>,
+    /// Whether the client has asked to go back to control framing.
+    detaching: bool,
+    /// Whether the end-of-run frame has been queued.
+    announced: bool,
+}
+
+impl AttachChannel {
+    fn new() -> Self {
+        Self {
+            decoder: FrameDecoder::new(Peer::Client),
+            outbound: VecDeque::new(),
+            stall: None,
+            detaching: false,
+            announced: false,
+        }
+    }
+
+    /// Queue raw output, split into frames the protocol can carry.
+    fn queue_output(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(MAX_ATTACH_PAYLOAD_BYTES) {
+            let mut frame = Vec::with_capacity(chunk.len().saturating_add(8));
+            if encode_frame(AttachTag::Output, chunk, &mut frame).is_ok() {
+                self.outbound.extend(frame);
+            }
+        }
+    }
+
+    /// Queue one non-output frame.
+    fn queue_control(&mut self, tag: AttachTag, payload: &[u8]) {
+        let mut frame = Vec::with_capacity(payload.len().saturating_add(8));
+        if encode_frame(tag, payload, &mut frame).is_ok() {
+            self.outbound.extend(frame);
+        }
+    }
+
+    /// Record whether the last flush moved anything.
+    ///
+    /// The clock starts when bytes are owed and nothing moves, and is reset by
+    /// any progress at all — so a slow client is tolerated and a stopped one is
+    /// not.
+    fn note_progress(&mut self, before: usize) {
+        if self.outbound.is_empty() {
+            self.stall = None;
+            return;
+        }
+        match self.stall {
+            Some((owed, _)) if owed == self.outbound.len() && before == self.outbound.len() => {}
+            _ => self.stall = Some((self.outbound.len(), Instant::now())),
+        }
+    }
+
+    /// When this channel last failed to make progress on a non-empty queue.
+    fn stalled_since(&self) -> Option<Instant> {
+        self.stall.map(|(_, since)| since)
+    }
+}
+
+/// The contiguous front of a byte queue, or `None` when it is empty.
+fn front_slice(queue: &VecDeque<u8>) -> Option<&[u8]> {
+    let (front, back) = queue.as_slices();
+    let slice = if front.is_empty() { back } else { front };
+    if slice.is_empty() { None } else { Some(slice) }
+}
+
+/// What a descriptor in the poll set is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watched {
+    Listener,
+    Signals,
+    Client,
+    Terminal,
+    Status,
+}
+
+/// The poll set, with each descriptor's meaning kept beside it.
+///
+/// The set is no longer a fixed shape — the terminal is there only for an
+/// interactive run, and the status descriptor only before activation — so the
+/// positions are recorded rather than assumed. The bug this prevents is the one
+/// a positional `descriptors.get(2)` invites: a set that grew by one and a
+/// reader that did not notice, silently reading the terminal's readiness as the
+/// client's.
+struct WatchSet {
+    descriptors: Vec<libc::pollfd>,
+    kinds: Vec<Watched>,
+}
+
+impl WatchSet {
+    fn new() -> Self {
+        Self {
+            descriptors: Vec::with_capacity(5),
+            kinds: Vec::with_capacity(5),
+        }
+    }
+
+    fn add(&mut self, kind: Watched, fd: RawFd, events: libc::c_short) {
+        self.descriptors.push(libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        });
+        self.kinds.push(kind);
+    }
+
+    /// Whether the named descriptor reported any of `mask`.
+    fn ready(&self, kind: Watched, mask: libc::c_short) -> bool {
+        self.kinds
+            .iter()
+            .position(|entry| *entry == kind)
+            .and_then(|index| self.descriptors.get(index))
+            .is_some_and(|entry| entry.revents & mask != 0)
+    }
 }
 
 /// The one client a supervisor serves at a time.
@@ -1896,6 +2587,14 @@ struct Client {
     /// protocol version, the session, and the generation are agreed, and an
     /// operation sent before it was checked against nothing.
     greeted: bool,
+    /// The terminal channel, once an attach has switched this connection into
+    /// it. `None` is control framing.
+    ///
+    /// Attach occupies this one slot, which is the whole of the "one viewer at
+    /// a time" rule: a second connection is refused
+    /// [`ControlRefusal::Busy`] at accept exactly as it was before, so there is
+    /// no second attach for a second answer to be about.
+    attached: Option<AttachChannel>,
 }
 
 impl Client {

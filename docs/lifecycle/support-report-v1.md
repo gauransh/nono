@@ -52,9 +52,9 @@ typed `facts`:
 | `seatbelt` | capability | no | Seatbelt (macOS). |
 | `network_filtering` | capability of `NetworkFilteringFacts` | no | Network filtering, per mechanism. |
 | `pty` | capability | no | The platform's pseudo-terminal primitive. **Not** a statement that the lifecycle will give a run a PTY — that is `interactive_session`. |
-| `interactive_session` | capability | no | Whether the lifecycle will run a PTY session. |
+| `interactive_session` | capability | no | Whether the lifecycle will run a PTY session. Its `status` is `pty`'s, because a host that will not give this process a pseudo-terminal cannot run one however good the supervisor is; its `determination` is `platform_api` rather than the probe's `probed_live`, because the supervisor half was not established. **With a precondition**: an interactive plan must also be a detached plan — a PTY master has to be held for as long as the run lives, and only the supervisor outlives the call. The ephemeral paths refuse with `PrepareError::InteractiveNeedsSupervisor`. |
 | `detached_supervisor` | capability | no | Whether a run can outlive its supervisor by design. `available` / `platform_api`, **with a precondition**: the mechanism is a re-exec of `current_exe()` and it works only if the embedder calls `nono::lifecycle::supervisor_entry()` first thing in `main`. That cannot be probed without launching a supervisor, so `why_not_probed` states it and a binary without the hook fails closed at the readiness deadline with `PrepareError::SupervisorUnresponsive`. See [ADR-0002](../adr/0002-detached-supervisor.md). |
-| `attach` | capability | no | Whether a caller can attach to a run it did not start. `partial`: control attach is implemented (`SessionStore::attach_control`, `RecoveredSession::attach` — activate, wait, stop, status, verify cleanup over the control socket), terminal attach is not (a headless detached run's standard streams are `/dev/null`). |
+| `attach` | capability | no | Whether a caller can attach to a run it did not start. `available` since R09 slice C, for both kinds: the control conversation (`SessionStore::attach_control`, `RecoveredSession::attach` — activate, wait, stop, status, verify cleanup) and the run's *terminal* (`DetachedSession::attach` → `AttachedTerminal`). **Three limits ride in `why_not_probed`**: attach occupies the supervisor's single client slot, so a second connection is refused `ControlRefusal::Busy`; a headless run has no terminal, so an attach to one is refused `ControlRefusal::NoTerminal`; and output produced while nobody is attached is kept in a bounded ring, oldest dropped, with the dropped count reported on the next `AttachAck`. |
 | `process_identity` | capability of `IdentityFacts` | no | Whether the facts that make a pid non-reusable are readable here. |
 | `cleanup_verification` | capability of `CleanupFacts` | no | Whether the probes cleanup verification is built on answer here. |
 | `event_observation` | array | no | Which event families this library observes, and which it does not. |
@@ -244,11 +244,12 @@ the kind of claim this report exists to prevent.
     }
   },
   "interactive_session": {
-    "status": "unavailable",
-    "determination": "declared",
+    "status": "available",
+    "determination": "platform_api",
     "reason": {
-      "reason": "not_implemented",
-      "slice": "interactive session (PTY): PreparedSandbox::prepare refuses SessionMode::Interactive rather than running headless"
+      "reason": "platform_api_linked",
+      "api": "posix_openpt(3) + grantpt(3) + unlockpt(3) in the launcher, setsid(2) and TIOCSCTTY in the customer child, with the master held by the detached supervisor",
+      "why_not_probed": "PRECONDITION: an interactive plan must also be a detached plan (SandboxPlan::detached(true) + SessionStore::prepare_detached), because a PTY master has to be held for as long as the run lives and only the supervisor outlives the call — the ephemeral paths refuse with PrepareError::InteractiveNeedsSupervisor. That supervisor in turn needs the entry hook named under detached_supervisor. Establishing either would mean launching a run, so what is probed here is the terminal primitive and what is reported is the mechanism above it."
     }
   },
   "detached_supervisor": {
@@ -261,11 +262,12 @@ the kind of claim this report exists to prevent.
     }
   },
   "attach": {
-    "status": "partial",
-    "determination": "declared",
+    "status": "available",
+    "determination": "platform_api",
     "reason": {
-      "reason": "not_implemented",
-      "slice": "R09 slice C (terminal attach): control attach is implemented — SessionStore::attach_control and RecoveredSession::attach reach a detached run's socket and drive it, so exit facts survive a caller restart. What is not implemented is attaching to a run's terminal: a headless detached run's standard streams are /dev/null and there is no PTY to reattach to"
+      "reason": "platform_api_linked",
+      "api": "unix(7) control socket in the session store, peer-uid checked at accept; control protocol v1 frames, and after ControlRequest::Attach the tagged terminal framing of nono::lifecycle::terminal",
+      "why_not_probed": "Establishing it means launching a supervisor and a run — see detached_supervisor. Two limits are worth knowing before depending on it: attach occupies the supervisor's single client slot, so a second connection is refused ControlRefusal::Busy; and a headless run has no terminal, so an attach to one is refused ControlRefusal::NoTerminal. Output produced while nobody is attached is kept in a bounded ring (SCROLLBACK_CAPACITY_BYTES), oldest dropped, and the count of what was dropped rides on the next AttachAck."
     }
   },
   "process_identity": {

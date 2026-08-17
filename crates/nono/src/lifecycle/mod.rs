@@ -41,22 +41,38 @@
 //! - [`session_store`][self]: [`SessionStore`], the schema-versioned durable
 //!   record and the identity-reconciled [`SessionStore::recover`] that reads it
 //!   back after the caller restarts.
+//! - [`terminal`][self]: the run's PTY, owned by the detached supervisor, and
+//!   the tagged channel one client at a time reaches it through
+//!   ([`AttachedTerminal`], [`TerminalEvent`], [`AttachAck`]). Output produced
+//!   while nobody is attached goes to a bounded ring, and the ring says what it
+//!   dropped.
 //!
 //! # What it does not contain yet
 //!
-//! The recoverable supervisor and attach arrive in later slices. Nothing yet
-//! survives its supervisor *by design*: dropping a [`PreparedSandbox`] or an
-//! [`ActivatedSandbox`] kills and reaps the run rather than leaving it running,
-//! and every prepared session is generation 1 because nothing re-prepares into
-//! an existing session's slot. What the durable store adds is the ability to
-//! reason honestly about a run whose supervisor died *anyway* — a crash, a
-//! `SIGKILL`, a machine that went away — rather than a supported way to detach.
+//! Resource ceilings, and re-preparing into an existing session's slot: every
+//! prepared session is still generation 1 because nothing increments one.
+//!
+//! Two things that used to be listed here are now implemented, and the shape of
+//! what they cost is worth stating. *Detachment* is not a flag but a question of
+//! ownership: the run that outlives its caller needs a process that outlives it
+//! too, which is [`SessionStore::prepare_detached`] and its one line of embedder
+//! cooperation ([`supervisor_entry`]). An *interactive* run is the same question
+//! again — a PTY master has to be held for as long as the run lives — so an
+//! interactive plan has to be a detached plan, and the ephemeral paths refuse it
+//! with [`PrepareError::InteractiveNeedsSupervisor`] rather than running
+//! headless behind the caller's back.
+//!
+//! Outside those two paths, nothing survives its supervisor: dropping a
+//! [`PreparedSandbox`] or an [`ActivatedSandbox`] kills and reaps the run.
 //!
 //! One consequence of that is worth stating here rather than only in
-//! [`session_store`][self]: a recovered process is not this process's child, so
-//! `waitpid` cannot reach it and its exit code or signal is not observable
+//! [`session_store`][self]: a *recovered* process — one reached through the
+//! record rather than through a live supervisor — is not this process's child,
+//! so `waitpid` cannot reach it and its exit code or signal is not observable
 //! after a restart. Recovery reports presence and absence, and never
-//! manufactures a [`SandboxExit`] it did not witness.
+//! manufactures a [`SandboxExit`] it did not witness. A run whose supervisor is
+//! still alive does not have that problem: the supervisor called `waitpid`
+//! itself, and [`DetachedSession::wait`] carries what it saw.
 //!
 //! [`SandboxPlan::validate`] still performs no existence or canonicalization
 //! checks — those belong to [`PreparedSandbox::prepare`], at the point where
@@ -94,6 +110,7 @@ mod session_store;
 mod state;
 mod supervisor;
 mod support;
+mod terminal;
 
 // The shared core is crate-internal in every ordinary build. Under `--cfg
 // nono_loom` it is exported so `tests/loom_lifecycle.rs`, which is an
@@ -140,6 +157,10 @@ pub use support::{
     EventObservationSupport, HostFacts, IdentityFacts, KernelFacts, LandlockFacts, LandlockRight,
     LandlockRightSupport, NetworkFilteringFacts, NetworkMechanism, NetworkMechanismSupport,
     SUPPORT_REPORT_SCHEMA_VERSION, SupportReason, SupportReport, SupportStatus,
+};
+pub use terminal::{
+    AttachAck, AttachError, AttachTag, AttachViolation, AttachedTerminal, MAX_ATTACH_PAYLOAD_BYTES,
+    Peer, SCROLLBACK_CAPACITY_BYTES, TerminalEnd, TerminalEvent, WindowSize,
 };
 
 use crate::error::NonoError;
@@ -190,6 +211,10 @@ pub enum LifecycleError {
     /// Talking to a detached supervisor failed, or there was none to talk to.
     #[error(transparent)]
     Detached(#[from] DetachedError),
+
+    /// Talking to a run's terminal failed.
+    #[error(transparent)]
+    Attach(#[from] AttachError),
 }
 
 impl From<PlanError> for NonoError {
@@ -243,6 +268,12 @@ impl From<SessionStoreError> for NonoError {
 impl From<DetachedError> for NonoError {
     fn from(err: DetachedError) -> Self {
         Self::Lifecycle(LifecycleError::Detached(err))
+    }
+}
+
+impl From<AttachError> for NonoError {
+    fn from(err: AttachError) -> Self {
+        Self::Lifecycle(LifecycleError::Attach(err))
     }
 }
 
