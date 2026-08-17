@@ -1,8 +1,11 @@
 # PLATFORM_CAPABILITY_BASELINE — upstream @ 149579a7
 
 Honest per-platform capability model as implemented at the pinned base.
-Host for live verification: aarch64-apple-darwin (Darwin 23.6.0). Linux live runs require a
-provisioned environment (Docker/CI) — see BLOCKED_ROWS.json notes.
+Hosts for live verification: aarch64-apple-darwin, **two macOS versions** — the development
+host (macOS 14.7, Darwin 23.6.0, xnu-10063) and the `macos-latest` GitHub runner (macOS
+26.5.2, Darwin 25.5.0, xnu-12377, arm64). They do not answer identically; see "Version
+differences observed live" under macOS below. Linux live runs require a provisioned
+environment (Docker/CI) — see BLOCKED_ROWS.json notes.
 
 > **Fork delta (R06).** The three-value `AccessMode` described below is unchanged and still
 > means what it meant. A **mode vocabulary** now sits beside it: `FsModeSet` over thirteen
@@ -103,6 +106,36 @@ provisioned environment (Docker/CI) — see BLOCKED_ROWS.json notes.
   (fork + `sandbox_init`) exists only in `nono setup --check-only`
   (`nono-cli/src/setup.rs:91-165`), println-only, no machine-readable output.
 
+### Version differences observed live (Darwin 23.6.0 vs Darwin 25.5.0)
+
+**Already-open descriptors are checked on macOS 26 and not on macOS 14.** On Darwin 25.5.0
+Seatbelt evaluates `file-read-metadata` for an `fstat(2)` of a descriptor the confined process
+merely *inherited*; on Darwin 23.6.0 it does not evaluate it at all — a profile carrying an
+explicit `(deny file-read-metadata (literal "<that descriptor's path>"))` changes nothing
+there, verified locally. Writes to such a descriptor are *not* checked on either version:
+granting `write` on the path changed nothing on the runner, while the same run with
+`read_metadata` on it exited 0, and `wc(1)` wrote its count to that same descriptor throughout.
+
+Consequence for callers: a sandboxed child that treats a failed `fstat` of its own stdout as
+fatal fails on macOS 26 with an error naming *stdout*, whatever it was asked to read.
+`cat(1)` is such a program — `raw_cat` sizes its copy buffer from `fstat(fileno(stdout))` and
+calls `err(1, "stdout")` on failure — while `echo`, `ls`, `stat` and `wc` tolerate the same
+denial. Nothing about the mode mapping is involved: this is the profile naming no rule for a
+descriptor the launcher opened, and the coarse `AccessMode` path emits no such rule either
+(inferred from the same emitter, not observed live).
+
+Evidence, all from the `macos-latest` runner (`lifecycle-modes-live` gate, run 32055182301):
+the kernel's own report, `Sandbox: cat(31705) deny(1) file-read-metadata
+/Users/runner/work/_temp/gate-logs/lifecycle-modes-live.log`; the same `cat` run exiting 0
+once that one path is granted `read_metadata` and 1 when it is granted `write`; and `cmp -s`
+and `wc -l` reading the *subject* to end-of-file under the unchanged `read_contents` grant.
+The subject's location (`/var/folders` vs a repo-local directory) and spelling (`/var` vs
+`/private/var`) made no difference in either direction.
+
+**No row of the per-mode table below differs between the two versions.** `read_contents` is
+`file-read-data` + `file-map-executable` on both and enforces exactly that on both — proven by
+a reader that touches nothing else (`crates/nono/tests/lifecycle_modes_live.rs`, `READER`).
+
 ## Mode-aware filesystem vocabulary (fork delta, R06)
 
 `crates/nono/src/capability_modes/` — `FsMode` (13 modes), `FsModeSet`, `FsModeCapability`,
@@ -166,7 +199,10 @@ the process model's timing into a capability bit. Proven live: a `#!` program in
 `delegated{target}`), `probed_live` on Linux against the real detected ABI and `platform_api`
 on macOS. `partial` on both platforms, for opposite reasons.
 
-**Verification status.** macOS: live-proven, 14 positive/negative lifecycle pairs. Linux:
+**Verification status.** macOS: live-proven, 14 positive/negative lifecycle pairs, now on
+**both** verified macOS versions (Darwin 23.6.0 host and Darwin 25.5.0 runner) with identical
+answers per mode — the one place the two kernels differ is ambient rather than per-mode and is
+written up under "Version differences observed live" above. Linux:
 mapping logic host-tested against a faked ABI (every arm, all three gates — the two ABI ones
 and the file/directory one); the ruleset wiring ran green on the ubuntu job for the first time
 in R20 (`linux-landlock-live` 122/0, `linux-lifecycle-live` 52/0), against directory grants

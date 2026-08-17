@@ -1305,3 +1305,226 @@ ok. Doc tests 11/0. Miri still NOT_RUN here (no miri component on this host).
 
 Same list as the entry above, plus nothing new: `supervisor.rs`,
 `lifecycle_detached.rs`, `NONO_UPSTREAM_DELTA.md`, `WORKLOG.md`.
+
+
+## 2026-08-17 — Iteration 13: the macOS 26 `read_contents` probe (delta F13)
+
+One gate, one test, one runner: `lifecycle-modes-live` ::
+`read_contents_granted_reads_and_ungranted_is_denied` failed on `macos-latest` and nowhere
+else. The runner is **macOS 26.5.2 / Darwin 25.5.0 / xnu-12377, arm64**; the host that wrote
+the file is **macOS 14.7 / Darwin 23.6.0 / xnu-10063**. The sandbox was applied, the program
+did `execve` (`activation: Observed`), and `/bin/cat` exited 1.
+
+### What the failure actually said, before any new push
+
+The gate log already carried the child's stderr, three lines above the panic:
+
+```
+cat: stdout: Operation not permitted
+```
+
+`cat: <path>: …` is the message for a subject it cannot read. `cat: stdout: …` is a different
+sentence: `raw_cat` sizes its copy buffer from `fstat(fileno(stdout))` and calls
+`err(1, "stdout")` when that fails. So the complaint was about the descriptor the *harness*
+had opened — the gate log file itself — and not about the file the test had granted.
+
+### The diagnostic push, and what each probe settled
+
+One commit (`diag(modes):`, since removed) added a temporary test that ran on the failing
+host. It answered every open question in a single run:
+
+```
+diag: fd 1: path=/Users/runner/work/_temp/gate-logs/lifecycle-modes-live.log st_mode=0o100644
+diag[cat-baseline]:            Exited { code: 1 }
+diag[cat-canonical-arg]:       Exited { code: 1 }      # /private/var spelling: irrelevant
+diag[cat-repo-local]:          Exited { code: 1 }      # subject outside /var/folders: irrelevant
+diag[cmp-silent]:              Exited { code: 0 }      # the subject's bytes read fine
+diag[wc-lines]:                Exited { code: 0 }      # read fine AND wrote to that same stdout
+diag[cat+stdout-metadata]:     Exited { code: 0 }      # <- granting read_metadata on the log file
+diag[cat+stdout-write]:        Exited { code: 1 }      # <- granting write on it does nothing
+diag[cat+stdout-read-write]:   Exited { code: 0 }
+diag: log … Sandbox: cat(31705) deny(1) file-read-metadata …/gate-logs/lifecycle-modes-live.log
+```
+
+The last line is the kernel's own report, pulled with `log show` under the predicate
+`nono-cli/src/sandbox_log.rs` already uses. Four hypotheses died at once: canonicalization
+(same failure under both spellings), ancestor traversal (same failure for a subject in the
+repo), the `/var/folders` temp confinement (ditto), and any mapping change (`cmp`/`wc` read
+the very same subject under the very same grant).
+
+### Root cause
+
+macOS 26 evaluates `file-read-metadata` for an `fstat(2)` of a descriptor the confined process
+merely **inherited**. macOS 14 does not evaluate it at all — verified on the host by handing
+the profile an explicit `(deny file-read-metadata (literal "<stdout's path>"))` and watching
+`cat` succeed anyway. Writes to that descriptor are unchecked on both (`wc` wrote its count
+through it on the runner, and granting `write` on the path changed nothing). Programs that
+tolerate a failed `fstat` of stdout — `echo`, `ls`, `stat`, `wc` — never noticed; `cat` treats
+it as fatal, so it died with an error about stdout while holding a perfectly good read.
+
+### The fix, and why it is the honest one
+
+Nothing was widened, because nothing needed widening: `read_contents` compiles to
+`file-read-data` + `file-map-executable` on both versions and enforces exactly that on both.
+The defect was in the *probe*: `cat` needed something the pair never named, which makes the
+positive half a false alarm — and would have made the negative half a false pass, since on
+macOS 26 `cat` exits 1 whether or not the subject was grantable.
+
+Both pairs that read bytes now read with `/usr/bin/cmp -s a b` over two identical files in the
+granted directory. It writes nothing at all, so the only thing it needs is the mode under
+test, and its exit 0 is a *stronger* claim than `cat`'s ever was: both files opened, both read
+to end-of-file, contents equal. `cat`'s exit 0 only ever meant one open succeeded.
+
+Granting the test's own stdout was considered and rejected: it would make the fixture depend
+on what the harness's descriptor happens to be (a file under the gate script, a pipe under
+`cargo test`, a tty by hand), and a pipe has no path to grant.
+
+### Removal detection
+
+```
+# read_metadata taught to also carry file-read-data in sbpl_map::operations_for
+read_contents_granted_reads_and_ungranted_is_denied ............. FAILED
+read_metadata_alone_permits_stat_and_still_denies_reading_the_bytes  FAILED
+read_dir_granted_lists_and_ungranted_is_denied ................... FAILED
+# reverted
+14 passed; 0 failed
+```
+
+### Gates
+
+`--test lifecycle_modes_live` 14/0 ×3. `--test lifecycle_live` 25/0 ×3.
+`--test lifecycle_detached` ×3 and `cargo test -p nono` / `--workspace`: see the note below —
+this working tree also carries another stream's in-flight `supervisor.rs` edit, so those
+suites were not this change's to certify. Strict clippy and its `nono_loom` variant clean,
+`cargo fmt --all -- --check` clean, both lint scripts ok, doc tests 11/0.
+
+### Not mine, and not fixed here
+
+`lifecycle_detached::a_dead_client_frees_the_slot_even_when_nothing_else_would_notice` fails
+**on Linux** from commit `5e83240b` onward (runs 32054242954, 32054457710, 32055182301, all
+four Linux gates, "control frame did not complete before its deadline"). The last green ubuntu
+job is `62080b42` (run 32052788218). That is a supervisor concern from the previous iteration,
+not the mode vocabulary, and it is reported rather than touched.
+
+## 2026-08-17 — Iteration 12 (cont. 2): the two regressions the FIX 7/8 commit caused
+
+CI run 32054242954 went red on ubuntu where 32052788218 had been 14 PASS. Both
+failures trace to the same commit and neither is a flake. One of them is a real
+library defect that the new test was the first thing ever to stand in front of.
+
+### Regression A — root cause is the library, not the test
+
+```
+a_dead_client_frees_the_slot_even_when_nothing_else_would_notice  (linux)
+  a session whose only client died must be adoptable, even while its terminal is
+  backpressured; got control frame did not complete before its deadline
+```
+
+The fresh client was **accepted and then never spoken to**. That is the adjacent
+asymmetry the last entry flagged and left alone, and leaving it alone was the
+wrong call: `client_interest` masked `POLLIN` for the connected client whenever
+the terminal still owed input, *whatever kind of client it was*.
+
+Only an attached client can send terminal input. A client in control framing
+sends `Hello`, `Status`, `Activate`, `Wait`, `Stop`, `VerifyCleanup`, `Attach` —
+not one of which has anything to do with what the run is reading. A supervisor
+that cannot answer *hello* because a program is not reading its stdin is wrong on
+its own terms, and it is worse than untidy: it makes the crash-recovery guarantee
+conditional on the run's behaviour. The process that comes to adopt a session
+whose holder died connects, is accepted, and waits out its deadline in silence.
+
+`client_interest` is now a free function over `(Option<&AttachChannel>, bool)`,
+the mask applies only when the client is attached, and both halves are unit
+tested. The backpressure it exists for is unchanged: an attached client that
+types faster than the run reads still stops being read, so the bytes pile up in
+its own socket buffer rather than in this process.
+
+Linux surfaced it because its `AF_UNIX` and pty buffers are large enough for the
+state to outlast a ten-second control timeout. **The defect was equally present
+on macOS**, and is now reproducible here: with the mask restored to its old shape
+the test fails on this host with the same sentence Linux printed, 3/3.
+
+### Regression B — a race the ring test never mentioned
+
+```
+the_scrollback_ring_stays_bounded_and_says_what_it_dropped  (linux)
+  a run that outran the ring must be told how much it lost, got 0
+```
+
+Not interference, and not the retire path: the test was deciding a race it did
+not name, and this commit's extra wall-clock time changed which way it went.
+
+`interactive_attached` attaches *before* activating — it must, so the window size
+reaches the program — so the flood and the detach start together. Output produced
+before the detach completes goes to the **attached channel**, which is allowed to
+hold `MAX_ATTACH_OUTBOUND_BYTES` = 256 KiB of it, and those bytes are then
+neither delivered (the client has stopped reading terminal frames) nor in the
+ring (they never reached it): they are dropped with the channel. Lose enough of a
+400 KiB flood that way and the ring never overflows, `dropped()` is 0, and the
+assertion fails with nothing wrong with the ring at all. How much is lost depends
+on socket buffer sizes and scheduling — which is exactly why it passed on macOS,
+whose `AF_UNIX` buffers are an order of magnitude smaller than Linux's.
+
+The fix is the idiom the neighbouring test already documents: the program sleeps
+0.4 s before flooding, so the output provably happens with nobody attached. Not a
+reordering and not a serialization — the test no longer depends on its
+neighbours, on socket buffer sizes, or on when the detach lands.
+
+Measured rather than argued: with the ring's bound temporarily removed, the ack
+now reports **410270 bytes buffered** — the whole flood, 400 × 1024 plus its
+newlines. Before the pause, some fraction of that was going to the channel on
+every run.
+
+### Is the FIX 8 test portable now?
+
+Yes, and it is a stronger test than the one it replaces.
+
+- The fill is **probed, not assumed**. How much input a terminal accepts before
+  holding any back is a property of the host — macOS stops at `TTYHOG` (1 KiB),
+  Linux at the tty port's memory limit plus the line discipline's buffer
+  (~68 KiB) — so the test sends up to sixteen 32 KiB frames and stops at the
+  first one that produces the state, checking after each with a ping that goes
+  unanswered. On macOS it sends one frame. If half a megabyte never produces the
+  state, the test says so and fails rather than proceeding to prove nothing.
+- The run is now `sleep 30` rather than `sleep 2`, so nothing can be rescued by
+  the terminal draining underneath an assertion — the old version passed on macOS
+  partly because the run ended in time, which is precisely the "passes for the
+  wrong reason" shape.
+- The adopting client connects while the terminal is *still* backpressured, so
+  the test now pins regression A's fix as well, on both platforms.
+
+No `#[ignore]` and no cfg gate is needed.
+
+### Removal detection
+
+```
+# client_interest's attachment condition reverted (regression A's fix)
+a_dead_client_frees_the_slot_even_when_nothing_else_would_notice ... FAILED  3/3
+  ...got control frame did not complete before its deadline     <- the Linux symptom, on macOS
+
+# the accept-time reap deleted (FIX 3's ordering half)
+a_dead_client_frees_the_slot_even_when_nothing_else_would_notice ... FAILED  3/3
+  ...got another client is connected to this session
+
+# Scrollback::push's bound disabled (the ring test's own target, after the pause)
+the_scrollback_ring_stays_bounded_and_says_what_it_dropped ... FAILED
+  the ring must stay bounded: 410270 bytes buffered, bound is 262144
+```
+
+One test, two distinct guards, two distinct failure messages — which is what
+makes it a diagnosis rather than an alarm.
+
+### Gates
+
+`cargo test -p nono lifecycle` 246/0. `cargo test -p nono` 1025 + 40 + 31(+1
+ignored) + 25 + 14 + 16 + 11, 0 failed. `--test lifecycle_live` 25/0 ×3.
+`--test lifecycle_modes_live` 14/0 ×3. `--test lifecycle_detached` 31/0 **×5**
+(the run count is the point: the interference hypothesis for B had to be ruled
+out rather than assumed). loom 7/0. `cargo test --workspace --no-fail-fast` exit
+0. Strict clippy and its `nono_loom` variant clean. `cargo fmt --all -- --check`
+clean. Both lint scripts ok. Doc tests 11/0. Miri NOT_RUN (no component here).
+
+**Linux is unverifiable on this host.** Regression A's fix is argued from the
+poll-set computation and *reproduced locally* by reverting it; regression B's fix
+is argued from `MAX_ATTACH_OUTBOUND_BYTES` and measured locally at 410270 bytes.
+Neither has run on a Linux kernel. The ubuntu job is the confirmation.
