@@ -232,6 +232,12 @@ run_gate doc-tests tests \
 # decision table. Everything else in this module forks, execs, opens sockets or
 # writes files, none of which miri can interpret — so the filter is a
 # deliberate subset and not a whole-crate claim.
+#
+# `--lib` is part of the gate, not a convenience: the crate's integration
+# targets spawn processes and re-exec themselves, so building or running any of
+# them under miri can only ever produce "unsupported operation". If a
+# `Running tests/...` line ever appears in this gate's log, the target selection
+# below has stopped working and the gate is measuring something else.
 MIRI_FILTERS=(
   lifecycle::state::
   lifecycle::gate::
@@ -241,9 +247,44 @@ MIRI_FILTERS=(
   a_supervisor_that_is_gone_falls_back_to_the_slice_a_table
   every_verdict_maps_to_exactly_one_decision
 )
+
+# Miri's sandbox refuses `clock_gettime(CLOCK_REALTIME)` — a host clock read is
+# not something it can interpret deterministically — and the plan tests take
+# timestamps for their event ring. Disabling isolation is the documented way to
+# let interpreted code read the real clock; it does not weaken any check miri
+# makes about the code itself, which is what this gate is for.
+MIRI_ENV=(MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-disable-isolation")
+
+# How many tests a libtest log says actually ran.
+test_ran_count() {
+  awk '
+    /^test result:/ {
+      for (i = 1; i <= NF; i++) {
+        if ($(i+1) ~ /^passed/) p += $i
+        if ($(i+1) ~ /^failed/) f += $i
+      }
+    }
+    END { print p + f + 0 }
+  ' "$1"
+}
+
 if miri_available; then
-  run_gate miri-pure-lifecycle tests \
-    cargo +nightly miri test -p nono --lib -- "${MIRI_FILTERS[@]}"
+  MIRI_LOG="$LOG_DIR/miri-pure-lifecycle.log"
+  if env "${MIRI_ENV[@]}" \
+      cargo +nightly miri test -p nono --lib -- "${MIRI_FILTERS[@]}" \
+      >"$MIRI_LOG" 2>&1; then
+    # A filter that matches nothing exits zero, and a gate that reports PASS for
+    # zero tests is the exact shape of a check that has quietly stopped
+    # checking. Zero is NOT_RUN, with the reason named.
+    if [[ "$(test_ran_count "$MIRI_LOG")" -gt 0 ]]; then
+      pass miri-pure-lifecycle "$(test_summary "$MIRI_LOG")"
+    else
+      not_run miri-pure-lifecycle \
+        "miri ran zero tests: the filters in MIRI_FILTERS match no test in the library target (a green run of nothing is not a pass)"
+    fi
+  else
+    fail miri-pure-lifecycle "$(test_summary "$MIRI_LOG") — $(failure_tail "$MIRI_LOG")"
+  fi
 else
   not_run miri-pure-lifecycle "$(miri_absent_reason)"
 fi

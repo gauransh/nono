@@ -651,11 +651,22 @@ fn access_fs_for(right: LandlockRightName) -> AccessFs {
 /// which fails the whole apply. That is the fail-closed half of the mode
 /// vocabulary: on a kernel without `TRUNCATE`, truncation is not restrictable at
 /// all, so a grant that quietly compiled to no right would read as enforcement.
+///
+/// The grant's *path type* goes in with it, because Landlock's rule vocabulary
+/// depends on it: a rule on a non-directory may carry only `ACCESS_FILE`
+/// rights, and one that carries more is either refused by the kernel with
+/// `EINVAL` (the raw path, [`PreparedLandlockSandbox::apply_raw`]) or masked to
+/// nothing by `rust-landlock`'s best-effort compatibility (the `PathBeneath`
+/// path). Passing `cap.is_file` is what turns both of those into the same typed
+/// refusal every other unexpressible mode already gets — see
+/// [`LandlockRightName::is_directory_only`][dir-only].
+///
+/// [dir-only]: crate::capability_modes::landlock_map::LandlockRightName::is_directory_only
 fn mode_cap_access(
     cap: &FsModeCapability,
     abi: ABI,
 ) -> Result<(BitFlags<AccessFs>, landlock_map::CompiledLandlock)> {
-    let compiled = landlock_map::compile(cap.modes, rights_available(abi));
+    let compiled = landlock_map::compile(cap.modes, rights_available(abi), cap.is_file);
     if let Some(refusal) = compiled.modes.first_refusal() {
         return Err(NonoError::ModeUnsupported {
             mode: refusal.mode.to_string(),
@@ -6135,5 +6146,93 @@ mod tests {
             "V1 must refuse a rename grant: REFER does not exist there"
         );
         assert!(mode_cap_access(&rename, ABI::V2).is_ok());
+    }
+
+    /// A file under this process's own temp directory, removed with the guard.
+    struct TestFile {
+        path: PathBuf,
+    }
+
+    impl TestFile {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("nono-mode-scope-{}-{name}", std::process::id()));
+            if let Err(err) = std::fs::write(&path, b"x") {
+                panic!("a test file must be creatable at {}: {err}", path.display());
+            }
+            Self { path }
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn a_directory_only_mode_on_a_file_refuses_the_apply_instead_of_emptying_the_rule() {
+        // The Linux-only half of the gate the mapping tests cover on every
+        // host. Both consumers of `mode_cap_access` are dishonest without it:
+        // `apply_landlock` builds a `PathBeneath`, whose best-effort
+        // compatibility masks the offending rights and hands back a rule that
+        // grants nothing, and `prepare_seccomp_with_abi` builds a raw
+        // `landlock_add_rule` the kernel answers with EINVAL inside the forked
+        // child, surfacing as `PreExecStage::SandboxApply` errno 22. Neither is
+        // a caller telling a caller what happened.
+        let file = TestFile::new("dir-only");
+        for mode in [
+            FsMode::ReadDir,
+            FsMode::Create,
+            FsMode::RemoveFile,
+            FsMode::RemoveDir,
+            FsMode::Rename,
+            FsMode::AtomicWrite,
+        ] {
+            let cap = match FsModeCapability::new_file(&file.path, FsModeSet::empty().with(mode)) {
+                Ok(cap) => cap,
+                Err(err) => panic!("a real file must be grantable: {err}"),
+            };
+            match mode_cap_access(&cap, ABI::V6) {
+                Ok((access, _)) => panic!(
+                    "a {mode} grant on a file must be refused, not compiled to {access:?} \
+                     (the kernel rejects it and rust-landlock masks it to nothing)"
+                ),
+                Err(NonoError::ModeUnsupported { detail, path, .. }) => {
+                    assert_eq!(path, cap.resolved);
+                    assert!(
+                        detail.contains("not a directory"),
+                        "the refusal must name the kernel restriction: {detail}"
+                    );
+                }
+                Err(err) => panic!("the refusal must be typed ModeUnsupported, got {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_rule_still_carries_every_right_a_file_rule_may_carry() {
+        // The positive control. A gate that refused every file grant would
+        // satisfy the test above and delete the point of `allow_file_modes`.
+        let file = TestFile::new("file-legal");
+        for (mode, right) in [
+            (FsMode::ReadContents, AccessFs::ReadFile),
+            (FsMode::Write, AccessFs::WriteFile),
+            (FsMode::Truncate, AccessFs::Truncate),
+            (FsMode::Execute, AccessFs::Execute),
+        ] {
+            let cap = match FsModeCapability::new_file(&file.path, FsModeSet::empty().with(mode)) {
+                Ok(cap) => cap,
+                Err(err) => panic!("a real file must be grantable: {err}"),
+            };
+            let (access, _) = match mode_cap_access(&cap, ABI::V6) {
+                Ok(pair) => pair,
+                Err(err) => panic!("{mode} is legal on a file rule: {err}"),
+            };
+            assert!(
+                access.contains(right),
+                "{mode} on a file must still compile to {right:?}"
+            );
+        }
     }
 }

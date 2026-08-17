@@ -490,6 +490,15 @@ pub enum RefusalReason {
         /// The ABI version that first carries the right.
         needed_abi: u8,
     },
+    /// The Landlock access right this mode needs may not appear in a rule whose
+    /// path is not a directory. Refused rather than dropped for the same reason
+    /// as above: the kernel refuses such a rule outright, and `rust-landlock`
+    /// masks the offending rights instead — so a grant that compiled to a
+    /// silently emptied rule would read as enforcement.
+    DirectoryOnlyRightOnFile {
+        /// The right that only a directory rule may carry.
+        right: landlock_map::LandlockRightName,
+    },
 }
 
 impl std::fmt::Display for RefusalReason {
@@ -504,6 +513,13 @@ impl std::fmt::Display for RefusalReason {
                 "Landlock ABI V{abi} does not carry {right}, which first appears in V{needed_abi}; \
                  on this kernel the operation cannot be restricted at all, so the grant is \
                  refused rather than compiled to a rule that would enforce nothing"
+            ),
+            RefusalReason::DirectoryOnlyRightOnFile { right } => write!(
+                f,
+                "Landlock will not carry {right} in a rule on a path that is not a directory: the \
+                 kernel accepts only EXECUTE, WRITE_FILE, READ_FILE, TRUNCATE and IOCTL_DEV there \
+                 and refuses anything else with EINVAL, so the grant is refused rather than \
+                 compiled to a rule the kernel would reject or a library would silently empty"
             ),
         }
     }

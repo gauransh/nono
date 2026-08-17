@@ -2320,6 +2320,14 @@ mod tests {
             #[cfg(target_os = "macos")]
             let produced_something = !compiled.operations.is_empty();
 
+            // Directory scope, because that is what the table describes: a
+            // rule on a non-directory may carry only Landlock's `ACCESS_FILE`
+            // rights, so compiling the table against a file would report
+            // `read_dir`, `create`, `remove_file`, `remove_dir` and `rename` as
+            // refusals of the *path type* rather than statements about the
+            // mode. (macOS passes `true` above for the opposite reason: there
+            // `is_file` selects only the atomic-write temp-sibling rule, and
+            // the wider of the two shapes is the one worth checking.)
             #[cfg(target_os = "linux")]
             let compiled = crate::capability_modes::landlock_map::compile(
                 requested,
@@ -2329,6 +2337,7 @@ mod tests {
                         Err(_) => 0,
                     },
                 ),
+                false,
             );
             #[cfg(target_os = "linux")]
             let produced_something = !compiled.rights.is_empty();

@@ -68,6 +68,35 @@ impl LandlockRightName {
             _ => 1,
         }
     }
+
+    /// Whether a rule may carry this right only when its path is a directory.
+    ///
+    /// The kernel's own split, not this library's: `add_rule_path_beneath`
+    /// refuses a rule on a non-directory that carries anything outside
+    /// `ACCESS_FILE` — `EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE |
+    /// IOCTL_DEV` — with `EINVAL`. `rust-landlock` knows this and *masks* the
+    /// offending rights instead (`landlock-0.4.5` `src/fs.rs:202` for the set
+    /// and `:285-308` for the mask, whose own comment is "Linux would return
+    /// EINVAL"), which turns a rule the kernel would have rejected into one
+    /// that carries nothing. Both outcomes are dishonest here, so the mapping
+    /// refuses before either can happen.
+    ///
+    /// Matched exhaustively so that a right added to this enum has to be
+    /// classified rather than defaulting to "a file may carry it".
+    #[must_use]
+    pub fn is_directory_only(self) -> bool {
+        match self {
+            LandlockRightName::ReadFile
+            | LandlockRightName::WriteFile
+            | LandlockRightName::Execute
+            | LandlockRightName::Truncate => false,
+            LandlockRightName::ReadDir
+            | LandlockRightName::MakeReg
+            | LandlockRightName::RemoveFile
+            | LandlockRightName::RemoveDir
+            | LandlockRightName::Refer => true,
+        }
+    }
 }
 
 impl std::fmt::Display for LandlockRightName {
@@ -190,7 +219,10 @@ pub(super) fn implications(mode: FsMode, target: ModeTarget) -> &'static [(FsMod
     }
 }
 
-/// Compile `requested` against the rights `available` really carries.
+/// Compile `requested` against the rights `available` really carries, for a
+/// path that is a file (`is_file`) or a directory.
+///
+/// Two gates, and neither of them drops anything.
 ///
 /// A mode whose right the ABI does not carry is **refused**, never dropped. On
 /// those kernels the operation is not restrictable at all — a `truncate` grant
@@ -199,17 +231,37 @@ pub(super) fn implications(mode: FsMode, target: ModeTarget) -> &'static [(FsMod
 /// enforcement. The caller gets a [`RefusalReason::UnsupportedRight`] naming the
 /// right, the ABI found, and the ABI needed, and the apply path turns it into an
 /// error.
+///
+/// A mode whose right only a directory rule may carry
+/// ([`LandlockRightName::is_directory_only`]) is refused the same way when the
+/// path is a file, with [`RefusalReason::DirectoryOnlyRightOnFile`]. Without
+/// this gate the rule reaches either the kernel, which answers `EINVAL`, or
+/// `rust-landlock`'s best-effort mask, which empties the rule and reports a
+/// partial compatibility result nobody upstream of here reads — a grant that
+/// grants nothing while reading as enforcement.
+///
+/// The ABI gate is checked first, so a kernel that does not carry the right at
+/// all says so rather than blaming the path type.
 #[must_use]
-pub fn compile(requested: FsModeSet, available: LandlockRightsAvailable) -> CompiledLandlock {
+pub fn compile(
+    requested: FsModeSet,
+    available: LandlockRightsAvailable,
+    is_file: bool,
+) -> CompiledLandlock {
     let (modes, granted) = compile_common(requested, ModeTarget::Landlock, implications, |mode| {
-        rights_for(mode)
-            .iter()
-            .find(|right| !available.has(**right))
-            .map(|right| RefusalReason::UnsupportedRight {
-                right: *right,
-                abi: available.abi(),
-                needed_abi: right.first_abi(),
-            })
+        rights_for(mode).iter().find_map(|right| {
+            if !available.has(*right) {
+                return Some(RefusalReason::UnsupportedRight {
+                    right: *right,
+                    abi: available.abi(),
+                    needed_abi: right.first_abi(),
+                });
+            }
+            if is_file && right.is_directory_only() {
+                return Some(RefusalReason::DirectoryOnlyRightOnFile { right: *right });
+            }
+            None
+        })
     });
 
     // A refused grant has no rights at all. Fail closed means the rule is never
@@ -237,10 +289,22 @@ mod tests {
     /// A kernel with everything, so a test can isolate one mode.
     const V6: LandlockRightsAvailable = LandlockRightsAvailable { abi: 6 };
 
+    /// One mode on a *directory*, which is the shape every other test here
+    /// means when it says "a grant".
     fn compile_one(mode: FsMode, abi: u8) -> CompiledLandlock {
         compile(
             FsModeSet::empty().with(mode),
             LandlockRightsAvailable::from_abi_version(abi),
+            false,
+        )
+    }
+
+    /// The same mode on a single file.
+    fn compile_one_file(mode: FsMode, abi: u8) -> CompiledLandlock {
+        compile(
+            FsModeSet::empty().with(mode),
+            LandlockRightsAvailable::from_abi_version(abi),
+            true,
         )
     }
 
@@ -323,6 +387,7 @@ mod tests {
         let compiled = compile(
             FsModeSet::of(&[FsMode::Write, FsMode::Append]),
             LandlockRightsAvailable::from_abi_version(6),
+            false,
         );
         assert!(
             compiled.modes.bundled().is_empty(),
@@ -431,9 +496,147 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_only_right_is_refused_on_a_file_rather_than_masked_away() {
+        // The kernel refuses a PATH_BENEATH rule on a non-directory carrying
+        // any right outside ACCESS_FILE with EINVAL, and rust-landlock masks
+        // those rights instead of letting it. Either way the caller's grant
+        // stops meaning what it says, so the mapping refuses first.
+        let table = [
+            (FsMode::ReadDir, LandlockRightName::ReadDir),
+            (FsMode::Create, LandlockRightName::MakeReg),
+            (FsMode::RemoveFile, LandlockRightName::RemoveFile),
+            (FsMode::RemoveDir, LandlockRightName::RemoveDir),
+            (FsMode::Rename, LandlockRightName::Refer),
+        ];
+        for (mode, right) in table {
+            let compiled = compile_one_file(mode, 6);
+            assert_eq!(
+                compiled.modes.refused(),
+                &[crate::capability_modes::ModeRefusal {
+                    mode,
+                    why: RefusalReason::DirectoryOnlyRightOnFile { right },
+                }][..],
+                "{mode} on a file must be refused by name, not compiled to a rule the kernel \
+                 rejects or a library empties"
+            );
+            assert!(
+                compiled.rights.is_empty(),
+                "a refused grant produces no rule at all"
+            );
+            // The positive control: the same mode on a directory is untouched.
+            assert!(
+                compile_one(mode, 6).modes.refused().is_empty(),
+                "{mode} on a directory must still compile"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rights_a_file_rule_may_carry_are_still_granted_on_a_file() {
+        // The other half of the gate. A refusal that swallowed everything would
+        // satisfy the test above and break every file grant this vocabulary
+        // exists to make.
+        for (mode, right) in [
+            (FsMode::ReadContents, LandlockRightName::ReadFile),
+            (FsMode::Write, LandlockRightName::WriteFile),
+            (FsMode::Append, LandlockRightName::WriteFile),
+            (FsMode::Truncate, LandlockRightName::Truncate),
+            (FsMode::Execute, LandlockRightName::Execute),
+        ] {
+            let compiled = compile_one_file(mode, 6);
+            assert!(
+                compiled.modes.refused().is_empty(),
+                "{mode} is legal on a file rule and must not be refused"
+            );
+            assert!(
+                compiled.rights.contains(&right),
+                "{mode} on a file must still compile to {right}"
+            );
+        }
+        // And the two that carry no right at all are unaffected by the path
+        // type, because they never reach a rule.
+        for mode in [FsMode::ReadMetadata, FsMode::UnixSocketConnect] {
+            assert!(compile_one_file(mode, 6).modes.refused().is_empty());
+        }
+    }
+
+    #[test]
+    fn atomic_write_on_a_file_is_refused_because_its_members_need_a_directory() {
+        // The mode a caller is most likely to name on a single file, and the
+        // one where a silently emptied rule would be least visible: three of
+        // its four members are directory-only rights.
+        let compiled = compile_one_file(FsMode::AtomicWrite, 6);
+        let refused: Vec<FsMode> = compiled
+            .modes
+            .refused()
+            .iter()
+            .map(|refusal| refusal.mode)
+            .collect();
+        assert_eq!(
+            refused,
+            vec![FsMode::Create, FsMode::RemoveFile, FsMode::Rename],
+            "every directory-only member must be named, not just the first"
+        );
+        for refusal in compiled.modes.refused() {
+            assert!(matches!(
+                refusal.why,
+                RefusalReason::DirectoryOnlyRightOnFile { .. }
+            ));
+        }
+        assert!(compiled.rights.is_empty());
+    }
+
+    #[test]
+    fn a_kernel_that_lacks_the_right_says_so_before_the_path_type_does() {
+        // Both gates fire on `rename` at ABI V1 on a file. The ABI answer is
+        // the one that comes back, because a kernel without REFER cannot
+        // restrict renaming at any path type — telling the caller to point at a
+        // directory instead would be advice that does not work.
+        let compiled = compile_one_file(FsMode::Rename, 1);
+        assert_eq!(
+            compiled.modes.refused(),
+            &[crate::capability_modes::ModeRefusal {
+                mode: FsMode::Rename,
+                why: RefusalReason::UnsupportedRight {
+                    right: LandlockRightName::Refer,
+                    abi: 1,
+                    needed_abi: 2,
+                },
+            }][..]
+        );
+    }
+
+    #[test]
+    fn the_directory_only_split_is_the_kernels_access_file_set() {
+        // ACCESS_FILE, spelled out: security/landlock/fs.c admits exactly
+        // EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV in a rule on
+        // a non-directory. IOCTL_DEV has no mode in this vocabulary, so four of
+        // the five appear here. Restating the set is the point: a right that
+        // silently changed sides would otherwise only show up as an EINVAL on a
+        // kernel nobody ran the tests on.
+        for right in [
+            LandlockRightName::ReadFile,
+            LandlockRightName::WriteFile,
+            LandlockRightName::Execute,
+            LandlockRightName::Truncate,
+        ] {
+            assert!(!right.is_directory_only(), "{right} is in ACCESS_FILE");
+        }
+        for right in [
+            LandlockRightName::ReadDir,
+            LandlockRightName::MakeReg,
+            LandlockRightName::RemoveFile,
+            LandlockRightName::RemoveDir,
+            LandlockRightName::Refer,
+        ] {
+            assert!(right.is_directory_only(), "{right} is not in ACCESS_FILE");
+        }
+    }
+
+    #[test]
     fn the_full_vocabulary_on_v6_refuses_nothing_and_invents_nothing() {
         let all = FsModeSet::of(&FsMode::ALL);
-        let compiled = compile(all, V6);
+        let compiled = compile(all, V6, false);
         assert!(compiled.modes.refused().is_empty());
         // Every right in the table, and nothing that is not in the table.
         let expected: std::collections::BTreeSet<LandlockRightName> = FsMode::ALL

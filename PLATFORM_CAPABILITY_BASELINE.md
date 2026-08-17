@@ -136,6 +136,21 @@ kernel.
 delegated }` — readable before applying via `Sandbox::compile_fs_modes(&caps)`. A refusal is an
 error at prepare/apply; nothing is dropped and nothing is widened without an entry naming it.
 
+**The table above is for a grant on a directory. On Linux the path type is part of the
+vocabulary.** A Landlock rule whose path is not a directory may carry only the kernel's
+`ACCESS_FILE` set — `EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE | IOCTL_DEV` — and
+`landlock_add_rule` answers `EINVAL` for a rule that carries anything else
+(`security/landlock/fs.c`, `add_rule_path_beneath`). So `allow_file_modes(f, …)` naming
+`read_dir`, `create`, `remove_file`, `remove_dir`, `rename` — or `atomic_write`, three of whose
+four members are in that group — is a typed refusal `DirectoryOnlyRightOnFile{right}`, exactly
+like the ABI gates above and for the same reason: the alternatives are a kernel `EINVAL` inside
+the forked child (raw `apply_raw` path) or `rust-landlock`'s best-effort mask silently emptying
+the rule (`PathBeneath` path, `landlock-0.4.5 src/fs.rs:285-308`, "Linux would return EINVAL"),
+and a grant that grants nothing while reading as enforcement is the thing this vocabulary
+exists to prevent. macOS has no equivalent restriction: `is_file` there selects only the
+atomic-write temp-sibling rule. The per-mode support table reports directory scope, which is
+the wider of the two; the file-scope restriction is reported per grant, at compile time.
+
 **What this changes about macOS exec.** The unconditional `(allow process-exec*)` at
 `macos.rs:555` is now emitted only when the capability set has **no** mode grants — which is
 every existing consumer including all of `nono-cli`, so upstream behaviour is byte-identical
@@ -152,8 +167,12 @@ the process model's timing into a capability bit. Proven live: a `#!` program in
 on macOS. `partial` on both platforms, for opposite reasons.
 
 **Verification status.** macOS: live-proven, 14 positive/negative lifecycle pairs. Linux:
-mapping logic host-tested against a faked ABI (every arm, both gates); the ruleset wiring is
-written-unverified behind the R07 Linux-runner blocker.
+mapping logic host-tested against a faked ABI (every arm, all three gates — the two ABI ones
+and the file/directory one); the ruleset wiring ran green on the ubuntu job for the first time
+in R20 (`linux-landlock-live` 122/0, `linux-lifecycle-live` 52/0), against directory grants
+only — the file-scope refusal added in R20 has Linux coverage in
+`sandbox/linux.rs::a_directory_only_mode_on_a_file_refuses_the_apply_instead_of_emptying_the_rule`
+but has not yet been observed green on a runner.
 
 ## Observation fidelity (both platforms)
 

@@ -1611,6 +1611,12 @@ impl Supervisor {
 
     /// Wait for something to happen, then handle exactly what did.
     fn poll_once(&mut self) {
+        // A client that is no longer there does not get to hold the one slot.
+        // Checked at the top of every pass — including the passes a timeout
+        // ends — so that the idle clock starts when the last client left rather
+        // than when this process next happened to read from it.
+        self.reap_lost_client();
+
         let mut watch = WatchSet::new();
         watch.add(Watched::Listener, self.listener.as_raw_fd(), libc::POLLIN);
         watch.add(
@@ -1626,9 +1632,9 @@ impl Supervisor {
             );
         }
         if let Some(terminal) = &self.terminal
-            && let Some(master) = terminal.fd()
+            && let Some((master, interest)) = terminal_watch(terminal, self.terminal_has_room())
         {
-            watch.add(Watched::Terminal, master, self.terminal_interest(terminal));
+            watch.add(Watched::Terminal, master, interest);
         }
         // Before activation the status descriptor is how a child that died at
         // the gate announces itself; after it, the descriptor is gone and
@@ -1695,23 +1701,6 @@ impl Supervisor {
         events
     }
 
-    /// What the terminal master is watched for.
-    ///
-    /// Readable while there is somewhere to put the output: an attached client
-    /// with room in its queue, or the ring, which always has room because it
-    /// drops its oldest. Writable while the client has typed something the
-    /// terminal has not taken.
-    fn terminal_interest(&self, terminal: &Terminal) -> libc::c_short {
-        let mut events = 0;
-        if !terminal.ended && self.terminal_has_room() {
-            events |= libc::POLLIN;
-        }
-        if !terminal.to_master.is_empty() {
-            events |= libc::POLLOUT;
-        }
-        events
-    }
-
     /// Whether there is anywhere for more terminal output to go.
     fn terminal_has_room(&self) -> bool {
         match self.attached() {
@@ -1731,7 +1720,18 @@ impl Supervisor {
     }
 
     /// Accept a connection, deciding what to do with it before reading a byte.
+    ///
+    /// The slot is re-checked here and not only at the top of the loop, because
+    /// this is the one place its occupancy *decides* anything. A connection and
+    /// its predecessor's death routinely arrive in the same `poll` wakeup — the
+    /// process that prepared a detached session exits, its control socket is
+    /// closed by the kernel, and the process that comes to adopt the session
+    /// connects microseconds later — and a supervisor that read the slot before
+    /// noticing the death would answer [`ControlRefusal::Busy`] on behalf of a
+    /// client that no longer exists. That is not a race in the caller: it is
+    /// this process refusing the whole point of a detached session.
     fn accept_one(&mut self) {
+        self.reap_lost_client();
         if let Some(stream) = accept_or_refuse(&self.listener, self.client.is_some()) {
             self.client = Some(Client {
                 stream,
@@ -1739,6 +1739,24 @@ impl Supervisor {
                 attached: None,
             });
             self.idle_since = None;
+        }
+    }
+
+    /// Drop the connected client if there is nobody on the other end of it.
+    ///
+    /// A control connection is *usually* ended with a `Goodbye`, and a crash is
+    /// exactly the case where it is not. The kernel closes the descriptor of a
+    /// process that exits however it exited, so the connection's end is a fact
+    /// available here at once — and a supervisor that waited to notice it by
+    /// trying to read would keep the slot occupied for as long as it had
+    /// nothing to read *for*.
+    fn reap_lost_client(&mut self) {
+        let gone = self
+            .client
+            .as_ref()
+            .is_some_and(|client| client_is_gone(client.stream.as_raw_fd()));
+        if gone {
+            self.client = None;
         }
     }
 
@@ -2003,7 +2021,14 @@ impl Supervisor {
             self.signals.reader.as_raw_fd(),
             libc::POLLIN,
         );
-        if let Some(master) = self.terminal.as_ref().and_then(Terminal::fd) {
+        // Watched for output only, and only while there is output to come: an
+        // ended master reports `POLLHUP` to every `poll` on Linux whatever it
+        // was asked about, so a wait that kept it here would burn its whole
+        // allowance in a spin. See [`terminal_watch`].
+        if let Some(terminal) = self.terminal.as_ref()
+            && let Some((master, interest)) = terminal_watch(terminal, self.terminal_has_room())
+            && interest & libc::POLLIN != 0
+        {
             watch.add(Watched::Terminal, master, libc::POLLIN);
         }
         let slice = remaining_millis(deadline)
@@ -2149,6 +2174,30 @@ impl Supervisor {
         self.announce_end();
         self.flush_client();
         self.drop_stalled_client();
+        self.retire_terminal();
+    }
+
+    /// Let go of a master that has nothing left to carry.
+    ///
+    /// Last, so that everything the pass could move has moved: the run's output
+    /// is in the ring or on its way to a client, the end frame is queued, and
+    /// whatever the client typed has either reached the terminal or been
+    /// dropped by the write that found it gone.
+    ///
+    /// Two conditions, and both are load-bearing. [`Terminal::retire`] checks
+    /// that no more output can arrive and no input is still owed. This checks
+    /// that the *run* is over, which is what makes the close harmless: closing a
+    /// master hangs the terminal up and signals the session, and a program that
+    /// had merely closed its own standard streams and carried on is not a
+    /// program to hang up on. Until it ends, its master simply stops being
+    /// watched — see [`terminal_watch`] — which is all the spin needed.
+    fn retire_terminal(&mut self) {
+        if !self.is_terminal() {
+            return;
+        }
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal.retire();
+        }
     }
 
     /// Hand the terminal whatever the client typed.
@@ -2454,6 +2503,30 @@ impl Terminal {
         self.ended = true;
         self.to_master.clear();
     }
+
+    /// Unplug a terminal that is already over, without being asked to.
+    ///
+    /// [`Self::hang_up`] is what a *stop* does: it ends a terminal that may
+    /// still have been working. This is the other half — the master has itself
+    /// reported that its last slave is gone, so no further output can arrive and
+    /// a write to it can only fail. Holding the descriptor after that keeps a
+    /// dead terminal open for the whole idle grace and, on Linux, keeps handing
+    /// `poll` a `POLLHUP` it has nothing to do about.
+    ///
+    /// Drained first, in the same order and for the same reason `hang_up`'s
+    /// callers drain: what the client typed is written before the descriptor it
+    /// would have been written to goes away. The ring is untouched, so a client
+    /// that attaches afterwards still gets everything the run said, and the end
+    /// frame is queued from state rather than from the descriptor.
+    ///
+    /// Idempotent, and it is the same `Option::take` `hang_up` performs, so a
+    /// stop that follows cannot close anything twice.
+    fn retire(&mut self) {
+        if !self.ended || !self.to_master.is_empty() {
+            return;
+        }
+        self.master = None;
+    }
 }
 
 /// A client that is watching the terminal rather than driving the run.
@@ -2519,6 +2592,90 @@ impl AttachChannel {
     fn stalled_since(&self) -> Option<Instant> {
         self.stall.map(|(_, since)| since)
     }
+}
+
+/// Whether the connection on `fd` has lost its other end.
+///
+/// Two facts, and a connection that shows either is over: `poll` reports
+/// `POLLHUP`/`POLLERR` — which is what the kernel does when the peer's last
+/// descriptor is closed, whether the peer said goodbye or was killed — or the
+/// stream is readable and a peek finds end of file.
+///
+/// A *peek*, and this is the load-bearing part: a client that sent a request and
+/// then closed has not gone away in the sense that matters, because the request
+/// is still owed an answer. Peeking leaves the bytes for the reader that owns
+/// them; a read here would eat somebody else's frame.
+///
+/// A free function for the same reason [`accept_decision`] is one: the whole
+/// point is that it can be exercised against a real socket whose peer has really
+/// died, without a running supervisor to reach it through.
+fn client_is_gone(fd: RawFd) -> bool {
+    let mut descriptors = [libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    if !matches!(poll_fds(&mut descriptors, 0), PollOutcome::Ready) {
+        return false;
+    }
+    let Some(entry) = descriptors.first() else {
+        return false;
+    };
+    if entry.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    if entry.revents & libc::POLLIN == 0 {
+        return false;
+    }
+    let mut peek = [0_u8; 1];
+    // SAFETY: `peek` is a live local of exactly the length passed. `MSG_PEEK`
+    // leaves whatever it finds in the socket buffer for the reader that owns
+    // it, and `MSG_DONTWAIT` keeps this off the one thread that also watches
+    // the run — a zero return is end of file and nothing else.
+    let seen = unsafe {
+        libc::recv(
+            fd,
+            peek.as_mut_ptr().cast::<libc::c_void>(),
+            peek.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    seen == 0
+}
+
+/// The terminal master's place in a poll set, or `None` when it has none.
+///
+/// Readable while there is somewhere to put the output: an attached client with
+/// room in its queue, or the ring, which always has room because it drops its
+/// oldest. Writable while the client has typed something the terminal has not
+/// taken.
+///
+/// **`None` is a guard, not a tidy-up.** Linux's `poll` reports `POLLHUP` for an
+/// entry whose `events` is zero — `do_pollfd` masks the kernel's answer with
+/// `demangle_poll(events) | EPOLLERR | EPOLLHUP`, so those two are never masked
+/// out — and `n_tty_poll` sets `EPOLLHUP` permanently once the terminal's other
+/// end has closed. A master that had said "no more output" but was still in the
+/// set with nothing to wait for would therefore make every `poll` return
+/// immediately, forever: the supervisor would spin at 100% of a core until the
+/// idle grace expired. macOS's kqueue-backed `poll` synthesises nothing for a
+/// zero-`events` entry, which is exactly why this could not be seen there.
+///
+/// A free function rather than a method so the decision can be tested without a
+/// whole running supervisor — two forks, an exec and a record — which is what
+/// stopped the previous shape from being exercised at all.
+fn terminal_watch(terminal: &Terminal, has_room: bool) -> Option<(RawFd, libc::c_short)> {
+    let master = terminal.fd()?;
+    let mut events: libc::c_short = 0;
+    if !terminal.ended && has_room {
+        events |= libc::POLLIN;
+    }
+    if !terminal.to_master.is_empty() {
+        events |= libc::POLLOUT;
+    }
+    if events == 0 {
+        return None;
+    }
+    Some((master, events))
 }
 
 /// The contiguous front of a byte queue, or `None` when it is empty.
@@ -3020,5 +3177,192 @@ mod tests {
         assert!(IDLE_AFTER_TERMINAL_GRACE >= Duration::from_secs(60));
         assert!(IDLE_AFTER_TERMINAL_GRACE <= Duration::from_secs(3600));
         assert!(READINESS_DEADLINE < IDLE_AFTER_TERMINAL_GRACE);
+    }
+
+    #[test]
+    fn a_connection_whose_peer_has_closed_is_read_as_gone() {
+        use std::io::Write;
+
+        // The fact the slot is freed on. A control connection ends with a
+        // `Goodbye` when the client is well, and with nothing at all when it is
+        // not — a process that exits has its descriptors closed for it — so
+        // "gone" has to be readable from the socket rather than from anything
+        // the client said.
+        let listener = TestListener::bind();
+        let mut client = match UnixStream::connect(&listener.path) {
+            Ok(client) => client,
+            Err(err) => panic!("a test client must connect: {err}"),
+        };
+        let (served, _) = match listener.listener.accept() {
+            Ok(pair) => pair,
+            Err(err) => panic!("a test listener must accept: {err}"),
+        };
+        assert!(
+            !client_is_gone(served.as_raw_fd()),
+            "a connection whose peer is alive and quiet is not gone"
+        );
+
+        // A peer that has spoken is not gone either, and the byte it sent must
+        // still be there afterwards: this runs before every accept decision,
+        // and a read here would eat a frame somebody else is about to parse.
+        if let Err(err) = client.write_all(b"\x01\x00\x00\x00") {
+            panic!("a test client must write: {err}");
+        }
+        assert!(
+            !client_is_gone(served.as_raw_fd()),
+            "a connection with a request waiting on it is not gone"
+        );
+
+        drop(client);
+        assert!(
+            client_is_gone(served.as_raw_fd()),
+            "a connection whose peer has closed must free the slot"
+        );
+    }
+
+    #[test]
+    fn a_peek_leaves_the_bytes_where_it_found_them() {
+        use std::io::{Read, Write};
+
+        let listener = TestListener::bind();
+        let mut client = match UnixStream::connect(&listener.path) {
+            Ok(client) => client,
+            Err(err) => panic!("a test client must connect: {err}"),
+        };
+        let (mut served, _) = match listener.listener.accept() {
+            Ok(pair) => pair,
+            Err(err) => panic!("a test listener must accept: {err}"),
+        };
+        if let Err(err) = client.write_all(b"nono") {
+            panic!("a test client must write: {err}");
+        }
+        assert!(!client_is_gone(served.as_raw_fd()));
+
+        let mut seen = [0_u8; 4];
+        if let Err(err) = served.read_exact(&mut seen) {
+            panic!("the peeked bytes must still be readable: {err}");
+        }
+        assert_eq!(&seen, b"nono", "a liveness check must not consume a frame");
+    }
+
+    /// A real terminal, with the slave already gone.
+    ///
+    /// The pair is real because the property under test is about a *descriptor*
+    /// in a poll set; a fake number would prove nothing about what the kernel
+    /// reports for it. `ended` is then set the way [`Supervisor::pump_from_terminal`]
+    /// sets it — that read is the only writer of the flag, and reaching it here
+    /// would need a whole running supervisor.
+    fn ended_terminal() -> Terminal {
+        let pty = match open_pty() {
+            Ok(pty) => pty,
+            Err(err) => panic!("a test pty must open: {err}"),
+        };
+        let mut terminal = Terminal::new(pty.master);
+        drop(pty.slave);
+        terminal.ended = true;
+        terminal
+    }
+
+    #[test]
+    fn a_terminal_that_has_ended_leaves_the_poll_set_entirely() {
+        // The removal-detection target for the Linux hot spin. `poll` on Linux
+        // reports POLLHUP for an entry whose `events` is zero, and a pty master
+        // whose last slave has closed has POLLHUP set for good — so a master
+        // left in the set "watched for nothing" makes every poll return at
+        // once, forever. macOS synthesises nothing there, which is why only a
+        // structural assertion catches this on this host.
+        let pty = match open_pty() {
+            Ok(pty) => pty,
+            Err(err) => panic!("a test pty must open: {err}"),
+        };
+        let live = Terminal::new(pty.master);
+        match terminal_watch(&live, true) {
+            Some((_, events)) => assert!(
+                events & libc::POLLIN != 0,
+                "a live terminal is watched for the output still to come"
+            ),
+            None => panic!("a live terminal with somewhere to put its output must be watched"),
+        }
+        drop(pty.slave);
+        drop(live);
+
+        let ended = ended_terminal();
+        assert!(
+            terminal_watch(&ended, true).is_none(),
+            "a terminal that has said there is no more output must not be waited on"
+        );
+    }
+
+    #[test]
+    fn a_terminal_with_nowhere_to_put_its_output_is_not_waited_on_either() {
+        // The other zero-interest case: a client whose queue is full stops the
+        // master being read, which is the backpressure that reaches the run.
+        // The descriptor has nothing to report until that changes, and an
+        // ended-and-full master would spin for exactly the same reason.
+        let pty = match open_pty() {
+            Ok(pty) => pty,
+            Err(err) => panic!("a test pty must open: {err}"),
+        };
+        let mut terminal = Terminal::new(pty.master);
+        assert!(
+            terminal_watch(&terminal, false).is_none(),
+            "with nowhere to put more output there is nothing to wait for"
+        );
+        // Unless something is owed to the terminal, which is a write and is
+        // watched for whatever the room situation is.
+        terminal.to_master.extend(b"typed".iter().copied());
+        match terminal_watch(&terminal, false) {
+            Some((_, events)) => assert!(events & libc::POLLOUT != 0),
+            None => panic!("input owed to the terminal must still be waited on"),
+        }
+    }
+
+    #[test]
+    fn a_finished_terminal_lets_go_of_the_master_and_keeps_the_ring() {
+        let mut terminal = ended_terminal();
+        terminal.ring.push(b"everything the run said");
+
+        // Not while the client's keystrokes are still owed to it: the close is
+        // a hang-up, and every caller drains first.
+        terminal.to_master.extend(b"typed".iter().copied());
+        terminal.retire();
+        assert!(
+            terminal.fd().is_some(),
+            "a terminal still owing input must be drained before it is unplugged"
+        );
+
+        terminal.to_master.clear();
+        terminal.retire();
+        assert!(
+            terminal.fd().is_none(),
+            "an ended, drained terminal must let go of the master"
+        );
+        // Twice, because a stop can follow and `hang_up` takes the same option.
+        terminal.retire();
+        terminal.hang_up();
+        assert!(terminal.fd().is_none());
+
+        assert_eq!(
+            terminal.ring.take(),
+            b"everything the run said".to_vec(),
+            "the scrollback must survive the close, or a later attach sees nothing"
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_has_not_ended_keeps_its_master() {
+        // The positive control. A retirement that fired on any terminal would
+        // unplug a running interactive session mid-sentence.
+        let pty = match open_pty() {
+            Ok(pty) => pty,
+            Err(err) => panic!("a test pty must open: {err}"),
+        };
+        let mut terminal = Terminal::new(pty.master);
+        terminal.retire();
+        assert!(
+            terminal.fd().is_some(),
+            "a terminal that has not reported the end must stay plugged in"
+        );
+        drop(pty.slave);
     }
 }

@@ -24,7 +24,8 @@
 #![cfg(target_os = "macos")]
 
 use nono::lifecycle::{
-    ActivationError, ExitOutcome, PreExecStage, PreparedSandbox, SandboxPlan, ValidatedPlan,
+    ActivationError, ExitOutcome, PreExecStage, PreparedSandbox, SandboxExit, SandboxPlan,
+    ValidatedPlan,
 };
 use nono::{CapabilitySet, FsMode, FsModeSet, Sandbox};
 use std::path::Path;
@@ -83,8 +84,8 @@ fn plan_with(subject: &Path, modes: FsModeSet, program: &str, args: &[&str]) -> 
     }
 }
 
-/// Run a plan to completion and return how it ended.
-fn run(plan: ValidatedPlan) -> ExitOutcome {
+/// Run a plan to completion and return everything observed about the end.
+fn run_exit(plan: ValidatedPlan) -> SandboxExit {
     let (mut held, handle) = match PreparedSandbox::prepare(plan) {
         Ok(pair) => pair,
         Err(err) => panic!("prepare must succeed: {err}"),
@@ -94,9 +95,14 @@ fn run(plan: ValidatedPlan) -> ExitOutcome {
         Err(err) => panic!("activation must succeed: {err}"),
     };
     match running.wait() {
-        Ok(exit) => exit.outcome(),
+        Ok(exit) => exit,
         Err(err) => panic!("wait must observe the exit: {err}"),
     }
+}
+
+/// Run a plan to completion and return how it ended.
+fn run(plan: ValidatedPlan) -> ExitOutcome {
+    run_exit(plan).outcome()
 }
 
 /// Run `program` against `subject` granted `modes`, and return the outcome.
@@ -128,6 +134,44 @@ fn activation_refusal(plan: ValidatedPlan) -> ActivationError {
 /// Whether the run reached the program and the program said "fine".
 fn succeeded(outcome: ExitOutcome) -> bool {
     outcome == ExitOutcome::Exited { code: 0 }
+}
+
+/// Assert that a run succeeded, and say everything known about it when it did
+/// not.
+///
+/// A bare label is the least useful thing a live test can print. The first CI
+/// run of this file on a newer macOS than the host that wrote it failed with
+/// nothing but the sentence naming the expectation — which does not say whether
+/// the program was denied by the profile, refused before `execve`, or killed,
+/// nor what the profile was asked to contain. All three are here now:
+///
+/// - the [`SandboxExit`], which carries the outcome *and* whether the customer
+///   program was ever observed to start (a `SandboxApplicationFailure` and an
+///   `Exited { code: 1 }` are entirely different diagnoses);
+/// - the modes as written, and what this platform compiled them into, so a
+///   bundle or a refusal that changed under a new OS is visible in the failure
+///   rather than in a second push.
+///
+/// Diagnostics only: the assertion is exactly the one it replaced.
+fn assert_ran(subject: &Path, modes: FsModeSet, program: &str, args: &[&str], why: &str) {
+    let exit = run_exit(plan_with(subject, modes, program, args));
+    assert!(
+        succeeded(exit.outcome()),
+        "{why}\n  program:  {program} {args:?}\n  exit:     {exit:?}\n  \
+         modes:    {modes}\n  compiled: {}",
+        compiled_disclosure(subject, modes)
+    );
+}
+
+/// What this platform says it will do with `modes` on `subject`.
+///
+/// The same compilation the profile is built from, so a failure prints the
+/// disclosure rather than a guess about it.
+fn compiled_disclosure(subject: &Path, modes: FsModeSet) -> String {
+    match Sandbox::compile_fs_modes(&caps_with(subject, modes)) {
+        Ok(compiled) => format!("{:?}", compiled.last()),
+        Err(err) => format!("(compilation refused: {err})"),
+    }
 }
 
 fn write_file(path: &Path, contents: &str) {
@@ -175,14 +219,12 @@ fn read_contents_granted_reads_and_ungranted_is_denied() {
     write_file(&file, "contents\n");
     let arg = string_of(&file);
 
-    assert!(
-        succeeded(run_with(
-            dir.path(),
-            FsModeSet::of(&[FsMode::ReadContents, FsMode::ReadMetadata]),
-            "/bin/cat",
-            &[&arg],
-        )),
-        "read_contents must let cat read the file"
+    assert_ran(
+        dir.path(),
+        FsModeSet::of(&[FsMode::ReadContents, FsMode::ReadMetadata]),
+        "/bin/cat",
+        &[&arg],
+        "read_contents must let cat read the file",
     );
     assert!(
         !succeeded(run_with(

@@ -27,8 +27,8 @@ use nono::lifecycle::{
     AttachedTerminal, CleanupVerification, ControlRefusal, ControlReply, ControlRequest,
     DetachedError, ExitOutcome, LifecycleError, LifecycleState, MAX_ATTACH_PAYLOAD_BYTES,
     MAX_CONTROL_FRAME_BYTES, PrepareError, RecoveryDecision, SCROLLBACK_CAPACITY_BYTES,
-    SandboxPlan, SessionMode, SessionStore, SupervisorPresence, TerminalEvent, ValidatedPlan,
-    WaitOutcome, WindowSize,
+    SandboxPlan, SessionMode, SessionStore, StopError, SupervisorPresence, TerminalEvent,
+    ValidatedPlan, WaitOutcome, WindowSize,
 };
 use nono::{AccessMode, CapabilitySet};
 use std::io::{Read, Write};
@@ -123,6 +123,10 @@ fn main() {
             a_second_concurrent_client_is_told_it_is_busy,
         ),
         (
+            "a_client_that_died_without_a_goodbye_does_not_hold_the_slot",
+            a_client_that_died_without_a_goodbye_does_not_hold_the_slot,
+        ),
+        (
             "a_killed_supervisor_leaves_a_stale_socket_that_recovery_removes",
             a_killed_supervisor_leaves_a_stale_socket_that_recovery_removes,
         ),
@@ -158,6 +162,10 @@ fn main() {
         (
             "a_run_that_ended_while_detached_yields_its_tail_and_then_its_end",
             a_run_that_ended_while_detached_yields_its_tail_and_then_its_end,
+        ),
+        (
+            "a_finished_session_stops_costing_cpu_and_still_serves_its_scrollback",
+            a_finished_session_stops_costing_cpu_and_still_serves_its_scrollback,
         ),
         (
             "input_bytes_reach_the_terminal_verbatim_however_hostile",
@@ -1187,6 +1195,51 @@ fn a_second_concurrent_client_is_told_it_is_busy() {
     session.detach();
 }
 
+/// R20 defect 3: the slot is held by a client, not by its ghost.
+///
+/// `Busy` is the right answer for a second *live* client and the wrong answer
+/// for a dead one — and a dead one is the ordinary case, not the exotic one:
+/// the process that prepares a detached session is meant to be able to exit,
+/// and when it does, the kernel closes its control socket with no `Goodbye`
+/// sent. A supervisor that read its slot before noticing the close refuses the
+/// very process the session exists for. That is what broke
+/// `a_session_outlives_the_process_that_prepared_it` on Linux, where the death
+/// and the next connection arrive in one `poll` wakeup; macOS reached the same
+/// state and got away with it on scheduling.
+fn a_client_that_died_without_a_goodbye_does_not_hold_the_slot() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let (mut session, _handle) = detached_true(&store, store_dir.path());
+    let session_id = session.session_id();
+    // A completed round trip, so the slot is provably taken before it is
+    // abandoned.
+    if let Err(err) = session.status() {
+        panic!("the first client must be served: {err}");
+    }
+
+    // Gone the way a crash goes: the descriptor is closed and nothing is said.
+    // `detach` would say `Goodbye` — which is the case that already worked.
+    drop(session);
+
+    // No retry, deliberately. A bounded retry here would hide exactly the
+    // defect: the supervisor must free the slot as part of deciding about this
+    // connection, not one poll slice later.
+    match store.attach_control(session_id) {
+        Ok(session) => {
+            let mut session = session;
+            match session.status() {
+                Ok(status) => assert_eq!(status.state(), LifecycleState::Prepared),
+                Err(err) => panic!("the adopting client must be served: {err}"),
+            }
+            session.detach();
+        }
+        Err(err) => panic!(
+            "a session must be adoptable after its first client died without a goodbye, \
+             got {err}"
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (g) A killed supervisor, and the stale socket it leaves.
 // ---------------------------------------------------------------------------
@@ -1410,7 +1463,20 @@ fn a_resize_reaches_the_run_as_a_signal() {
         &store,
         store_dir.path(),
         "/bin/sh",
-        &["-c", "trap 'stty size' WINCH; stty size; sleep 5"],
+        // A *loop* of short sleeps, not one long one, and the difference is the
+        // whole test. A shell runs a trap when the foreground command it is
+        // waiting on completes, so `sleep 5` meant the second `stty size` was
+        // printed five seconds later — the run was proving that the sleep
+        // expired, not that the resize was signalled — and the run then ended
+        // on its own, which is what made the stop below fail on a loaded Linux
+        // runner. With a tenth-second body the trap is observed promptly and
+        // the run is still alive to be stopped. Bounded like `COUNTER_SCRIPT`
+        // so a supervisor that somehow lost the stop leaves nothing behind.
+        &[
+            "-c",
+            "trap 'stty size' WINCH; stty size; i=0; \
+             while [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done",
+        ],
         WindowSize::new(40, 100),
     );
 
@@ -1430,8 +1496,22 @@ fn a_resize_reaches_the_run_as_a_signal() {
         Ok(session) => session,
         Err(err) => panic!("detach must succeed: {err}"),
     };
-    if let Err(err) = session.stop() {
-        panic!("the sleeping run must be stoppable: {err}");
+    match session.stop() {
+        Ok(_) => {}
+        // A run that reached its own end before the stop arrived is a
+        // legitimate outcome, and refusing the stop is the *library* being
+        // right: a stop is a transition, not a wish, and one asked for from
+        // `Exited` has nothing left to do. This test is about the resize above,
+        // so it accepts that answer and nothing else — a stop that failed for
+        // any other reason is still a failure here.
+        Err(DetachedError::Refused(ControlRefusal::Stop(StopError::NotStoppable { state }))) => {
+            assert_eq!(
+                state,
+                LifecycleState::Exited,
+                "only an already-finished run may refuse a stop here"
+            );
+        }
+        Err(err) => panic!("the sleeping run must be stoppable: {err}"),
     }
     session.detach();
 }
@@ -1660,6 +1740,164 @@ fn a_run_that_ended_while_detached_yields_its_tail_and_then_its_end() {
         Some(ExitOutcome::Exited { code: 0 }),
         "the end frame must carry the facts the supervisor witnessed"
     );
+
+    let session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    session.detach();
+}
+
+/// How long an idle supervisor is watched for a spin.
+///
+/// Long enough that a supervisor burning a core has to show it at the one
+/// second `ps` resolves on Linux, short enough not to pad the suite.
+const SPIN_WINDOW: Duration = Duration::from_secs(2);
+
+/// The CPU an idle supervisor may use in that window.
+///
+/// A correct one wakes four times a second to re-check the child and the grace
+/// period and does nothing else, so its real figure is a rounding error; a
+/// spinning one burns the whole window. The bound sits between two numbers that
+/// are three orders of magnitude apart, so it is not delicate.
+const SPIN_BUDGET_MILLIS: u64 = 500;
+
+/// The CPU time a process has accumulated, in milliseconds.
+///
+/// `ps` rather than a platform-specific read, because the two platforms keep
+/// this in entirely different places — `/proc/<pid>/stat` fields 14 and 15 in
+/// clock ticks on Linux, `PROC_PIDTASKINFO` through `proc_pidinfo` on macOS —
+/// and neither belongs in a test that is about a poll set.
+fn cpu_millis(pid: i32) -> u64 {
+    let output = match Command::new("ps")
+        .args(["-o", "time=", "-p"])
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => panic!("ps must run: {err}"),
+    };
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        panic!("ps must report on the supervisor (pid {pid}): {raw:?}");
+    }
+    match parse_cpu_time(&raw) {
+        Some(millis) => millis,
+        None => panic!("ps printed a cpu time this test cannot read: {raw:?}"),
+    }
+}
+
+/// `[DD-]HH:MM:SS[.ss]`, which is what both platforms' `ps` prints.
+///
+/// Linux resolves to the second and macOS to the hundredth; the fraction is
+/// read when it is there and the whole seconds are the answer when it is not.
+fn parse_cpu_time(raw: &str) -> Option<u64> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // A day count is separated by '-'. It cannot happen here, but a parse that
+    // ignored it would read "1-00:00:00" as zero, which is the one wrong answer
+    // that would make this test pass for the wrong reason.
+    let (days, rest) = match text.split_once('-') {
+        Some((days, rest)) => (days.trim().parse::<u64>().ok()?, rest),
+        None => (0_u64, text),
+    };
+    let mut seconds = days.checked_mul(86_400)?;
+    let mut millis = 0_u64;
+    for field in rest.split(':') {
+        let (whole, fraction) = match field.split_once('.') {
+            Some((whole, fraction)) => (whole, Some(fraction)),
+            None => (field, None),
+        };
+        seconds = seconds
+            .checked_mul(60)?
+            .checked_add(whole.trim().parse::<u64>().ok()?)?;
+        if let Some(fraction) = fraction {
+            // Hundredths of a second, so two digits scale by ten.
+            millis = fraction.trim().parse::<u64>().ok()?.checked_mul(10)?;
+        }
+    }
+    seconds.checked_mul(1_000)?.checked_add(millis)
+}
+
+/// R20 defect 1: a run that is over must stop costing anything.
+///
+/// The bug this pins: the supervisor watched the terminal master for
+/// `POLLIN | POLLOUT | POLLHUP` and, once the run had ended, asked for nothing
+/// at all. Linux's `poll` reports `POLLHUP` for a zero-`events` entry anyway,
+/// and a pty master whose last slave has closed carries `POLLHUP` for good — so
+/// every `poll` returned immediately and the supervisor spun at 100% of a core
+/// for the whole five-minute idle grace. The same code on macOS is quiet,
+/// because kqueue synthesises nothing for an entry that asked for nothing.
+///
+/// Measured rather than reasoned about, and paired with the two things the fix
+/// must not cost: the scrollback a later attach reads, and the end frame.
+fn a_finished_session_stops_costing_cpu_and_still_serves_its_scrollback() {
+    let store_dir = TempStore::new();
+    let store = store_dir.open();
+    let terminal = interactive_attached(
+        &store,
+        store_dir.path(),
+        "/bin/sh",
+        &["-c", "sleep 0.2; echo done-and-gone"],
+        WindowSize::new(24, 80),
+    );
+    let session_id = terminal.session_id();
+    // Detached before the run speaks, so its output lands in the supervisor's
+    // ring — which is where the reattach below has to find it after the master
+    // has been let go of.
+    let mut session = match terminal.detach() {
+        Ok(session) => session,
+        Err(err) => panic!("detach must succeed: {err}"),
+    };
+    let supervisor = session.supervisor().pid();
+    match session.wait(PATIENCE) {
+        Ok(WaitOutcome::Exit(exit)) => assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 }),
+        Ok(WaitOutcome::StillRunning) => panic!("the run must finish"),
+        Err(err) => panic!("wait must answer: {err}"),
+    }
+    // Away entirely: no client, a finished run, and nobody has said stop. This
+    // is the state the supervisor sits in for the whole idle grace, and the
+    // state the spin was in.
+    session.detach();
+
+    let before = cpu_millis(supervisor);
+    std::thread::sleep(SPIN_WINDOW);
+    let after = cpu_millis(supervisor);
+    let burned = after.saturating_sub(before);
+    assert!(
+        burned <= SPIN_BUDGET_MILLIS,
+        "a finished supervisor used {burned}ms of cpu in {}ms of doing nothing; \
+         it is spinning on a descriptor it has nothing to ask about",
+        SPIN_WINDOW.as_millis()
+    );
+
+    // And it is still a supervisor: the ring it kept after unplugging the
+    // terminal, and the end frame it owes an attaching client.
+    let reconnected = match store.attach_control(session_id) {
+        Ok(session) => session,
+        Err(err) => panic!("reconnection must succeed: {err}"),
+    };
+    let mut terminal = match reconnected.attach(WindowSize::new(24, 80)) {
+        Ok(terminal) => terminal,
+        Err(err) => panic!("attaching to a finished run must succeed: {err}"),
+    };
+    assert_eq!(terminal.ack().state(), LifecycleState::Exited);
+    let tail = read_until(&mut terminal, "done-and-gone", PATIENCE);
+    assert!(
+        tail.contains("done-and-gone"),
+        "the scrollback must outlive the master this run no longer needs: {tail:?}"
+    );
+    let ended = loop {
+        match terminal.read_event(Instant::now() + PATIENCE) {
+            Ok(TerminalEvent::Ended(end)) => break end,
+            Ok(TerminalEvent::Output(_) | TerminalEvent::Pong) => {}
+            Ok(TerminalEvent::Idle) => panic!("the end must still arrive promptly"),
+            Err(err) => panic!("the terminal must answer: {err}"),
+        }
+    };
+    assert_eq!(ended.state(), LifecycleState::Exited);
 
     let session = match terminal.detach() {
         Ok(session) => session,

@@ -992,3 +992,208 @@ applies.
 `BLOCKED_ROWS.json`, `HANDOFF.md`, `NONO_UPSTREAM_DELTA.md`, `THREAT_MODEL.md`,
 `WORKLOG.md` (modified); `docs/UPSTREAMING.md`, `scripts/stream-gates.sh`,
 `.github/workflows/stream-gates.yml` (new).
+
+## 2026-08-17 — Iteration 12: R20 — what the first Linux run actually found (delta F12)
+
+The ubuntu job went green on the Landlock and lifecycle gates
+(`linux-landlock-live` 122/0, `linux-lifecycle-live` 52/0), which proved the
+`cfg(linux)` code compiles and its guards hold. An independent audit of the same
+run then found two defects a macOS host could not have surfaced, and the run's
+own logs a third. All three are fixed here; two more items are a test's wrong
+assumption and a gate that was reporting on the wrong thing.
+
+### (a) The finished terminal that never left the poll set
+
+`terminal_interest` returned 0 once `terminal.ended`, and the descriptor stayed
+in the set anyway. **Linux reports `POLLHUP` for an entry whose `events` is
+zero** — `do_pollfd` masks the kernel's answer with `demangle_poll(events) |
+EPOLLERR | EPOLLHUP`, so those two are never masked out — and `n_tty_poll` sets
+`EPOLLHUP` permanently once the terminal's other end has closed. The master is
+not closed by `announce_end`; only `unplug` closes it, and that runs from
+`stop()`. So a detached interactive run that ended without being stopped left the
+supervisor returning from `poll` instantly, forever, until
+`IDLE_AFTER_TERMINAL_GRACE` (300 s) expired — 100% of a core, and the most likely
+cause of the CI timeout flakes. macOS's kqueue-backed `poll` synthesises nothing
+for an entry that asked for nothing, which is why five iterations of development
+on this host never saw it.
+
+Fixed twice, deliberately. `terminal_watch(&Terminal, has_room) -> Option<(RawFd,
+c_short)>` is a free function — the previous shape was a method that needed a
+whole running supervisor to reach, which is why it had no test — and it returns
+`None` when the interest is zero, so the descriptor leaves the set rather than
+sitting in it asking for nothing. That covers the ended case *and* the case a
+full client queue produces. `Terminal::retire` then closes the master outright
+once the run has ended and nothing is owed to it.
+
+Two things about `retire` are load-bearing and neither is tidiness. It drains
+first — `to_master` empty — because closing a master is a hang-up and every
+caller of `hang_up` already drains for the deadlock reason documented on it (a
+session leader holding an undrained controlling terminal cannot finish exiting,
+and the thread that would drain it is the thread about to block in `waitpid`).
+And the *supervisor* only calls it once the run has reached a terminal state,
+because `ended` means "the last slave closed", which a program that closed its
+own stdio and carried on also produces — hanging up on that program would be a
+new behaviour, whereas leaving its master unwatched costs nothing.
+
+### (b) The Linux mode mapping ignored file-vs-directory
+
+`mode_cap_access` called `landlock_map::compile(cap.modes, rights_available(abi))`
+and never consulted `cap.is_file`. macOS has always passed `cap.is_file` to
+`sbpl_map::compile`. The kernel refuses a `PATH_BENEATH` rule on a non-directory
+carrying any right outside `ACCESS_FILE` (`EXECUTE | WRITE_FILE | READ_FILE |
+TRUNCATE | IOCTL_DEV`) with `EINVAL`; `rust-landlock` knows this and *masks* those
+rights instead (`landlock-0.4.5 src/fs.rs:202` for the set, `:285-308` for the
+mask, whose own comment is "Linux would return EINVAL").
+
+So `allow_file_modes(f, {create})` — or `remove_file`, `rename`, `read_dir`,
+`remove_dir`, or `atomic_write`, three of whose four members are in that group —
+was, on Linux, either a rule dropped to nothing through `Sandbox::apply_*` or an
+`EINVAL` in the forked child through `prepare_seccomp_with_abi`'s raw path
+(`PreExecStage::SandboxApply`, errno 22). The first is a silent narrowing that
+reads as enforcement, which is the single thing this vocabulary exists to
+prevent.
+
+`compile` now takes `is_file` and refuses with a typed
+`RefusalReason::DirectoryOnlyRightOnFile { right }`, surfacing through
+`NonoError::ModeUnsupported` exactly as the two ABI gates already do. The ABI gate
+is checked first, so a kernel that does not carry `REFER` at all says so rather
+than blaming the path type — telling a caller to point at a directory instead
+would be advice that does not work there. `LandlockRightName::is_directory_only`
+matches exhaustively, so a right added to that enum has to be classified rather
+than defaulting to "a file may carry it". macOS output is byte-identical: the
+`sbpl_map` call site is untouched.
+
+The audit's note that this was uncovered by any test was correct —
+`lifecycle_modes_live.rs` is macOS-only and every Linux live test grants
+directories — so the five new tests in `landlock_map` (host-runnable, since the
+mapping takes rights-availability as data) and the two in `sandbox/linux.rs` are
+the first coverage.
+
+### (c) A dead client kept the one slot
+
+From the same run's logs: `a_session_outlives_the_process_that_prepared_it` failed
+on Linux with `another client is connected to this session`. The launcher
+subprocess prepares the session and exits; the kernel closes its control socket;
+the supervisor's `accept_one` read `self.client.is_some()` and answered `Busy` on
+behalf of a process that no longer existed — defeating the exact guarantee that
+test exists to prove. macOS passed it on scheduling: there the hang-up and the
+next connection land in different `poll` wakeups, so the client branch had already
+dropped the stale client before the accept ran.
+
+`client_is_gone(fd)` is now consulted at the top of every loop pass *and* inside
+`accept_one` before the slot decides anything. It reads `POLLHUP|POLLERR|POLLNVAL`
+or an end-of-file **peek** — `MSG_PEEK|MSG_DONTWAIT`, because a client that sent a
+request and then closed is still owed an answer and a read here would eat somebody
+else's frame.
+
+### (d) A test that was proving the wrong thing
+
+`a_resize_reaches_the_run_as_a_signal` ran `sh -c 'trap "stty size" WINCH; stty
+size; sleep 5'` and failed on Linux at `stop()` with `stop is not legal in state
+exited`. The library was right and the test was wrong, but not in the way the
+symptom suggested. **A shell runs a trap when the foreground command it is waiting
+on completes** — so the second `stty size` was printed when the five-second sleep
+ended, and the test had been asserting that a sleep expires, not that a resize is
+signalled. Lengthening the sleep made that visible immediately: it failed here
+with no output at all. The body is now a loop of tenth-second sleeps, so the trap
+is observed promptly *and* the run is still alive to be stopped. The
+already-exited outcome is accepted as a legitimate second answer, per instruction,
+without weakening the library's refusal — the arm matches
+`StopError::NotStoppable { state: Exited }` and nothing else.
+
+### (e) Two gates that were reporting on the wrong thing
+
+`clippy::useless_conversion` fires on `u32::from(mode_t)` on Linux and is correct
+to; on macOS `mode_t` is 16 bits and the conversion is required. `#[expect]`
+cannot express that — it would trade the Linux failure for an unfulfilled
+expectation on macOS — so both sites carry `#[allow]` with the platform split
+named. A crate-wide grep found no third site of the same shape.
+
+The miri gate failed on `clock_gettime with REALTIME` (the plan tests take
+timestamps) and its log named integration targets that fork and re-exec. It now
+runs with `MIRIFLAGS=-Zmiri-disable-isolation`, keeps `--lib` with a comment
+saying why that is part of the gate rather than a convenience, and — the part
+that matters — **counts the tests that ran**: a filter matching nothing exits
+zero, and a gate reporting PASS for zero tests is the exact shape of a check that
+has quietly stopped checking. Zero is now NOT_RUN with the reason named. Not
+verifiable here: this host has nightly but not the miri component, so the gate
+reports NOT_RUN locally and CI will answer.
+
+### Diagnostics, not a fix
+
+`read_contents_granted_reads_and_ungranted_is_denied` fails on the macos-latest
+runner (newer than this host) with only its label. The macOS mapping is
+deliberately untouched pending evidence; the assertion now prints the whole
+`SandboxExit` — which distinguishes a denial from a pre-`execve` refusal from a
+kill — plus the modes as written and what this platform compiled them into. If
+the next run shows a plain `Exited { code: 1 }` with the disclosure intact, the
+hypothesis to test is that newer macOS needs `file-read-metadata` alongside
+`file-read-data` for `open(2)`, which would be a disclosed bundle and not a
+silent one.
+
+### Removal detection
+
+Each guard was deleted, the tests were watched to fail, and the guard was
+restored.
+
+```
+# terminal_watch's zero-interest omission deleted
+a_terminal_that_has_ended_leaves_the_poll_set_entirely ... FAILED
+  a terminal that has said there is no more output must not be waited on
+a_terminal_with_nowhere_to_put_its_output_is_not_waited_on_either ... FAILED
+  with nowhere to put more output there is nothing to wait for
+test result: FAILED. 1 passed; 2 failed
+
+# Terminal::retire's close deleted
+a_finished_terminal_lets_go_of_the_master_and_keeps_the_ring ... FAILED
+  an ended, drained terminal must let go of the master
+test result: FAILED. 0 passed; 1 failed
+
+# landlock_map's is_file consult deleted
+a_directory_only_right_is_refused_on_a_file_rather_than_masked_away ... FAILED
+  left: []  right: [ModeRefusal { mode: ReadDir,
+                    why: DirectoryOnlyRightOnFile { right: ReadDir } }]
+atomic_write_on_a_file_is_refused_because_its_members_need_a_directory ... FAILED
+  left: []  right: [Create, RemoveFile, Rename]
+test result: FAILED. 14 passed; 2 failed
+```
+
+**The one that does not reproduce here, stated plainly.** With both
+`reap_lost_client` calls deleted, the live
+`a_client_that_died_without_a_goodbye_does_not_hold_the_slot` still passed five
+times out of five on macOS — because on this platform the supervisor wakes on the
+hang-up and drops the stale client before the next connection arrives, which is
+the same scheduling luck that hid the defect for five iterations. The deterministic
+evidence on this host is the pair of unit tests over `client_is_gone`
+(`a_connection_whose_peer_has_closed_is_read_as_gone`,
+`a_peek_leaves_the_bytes_where_it_found_them`); the ordering half is
+removal-detected by the ubuntu job, where
+`a_session_outlives_the_process_that_prepared_it` is currently red for exactly
+this reason. That gap is the honest statement, not a claim.
+
+### Gates
+
+`cargo test -p nono lifecycle` 244/0. `cargo test -p nono` 1023 + 40 + 29(+1
+ignored) + 25 + 14 + 16 + 11, 0 failed. `--test lifecycle_live` 25/0 ×3.
+`--test lifecycle_modes_live` 14/0 ×3. `--test lifecycle_detached` 29/0 ×3.
+`RUSTFLAGS='--cfg nono_loom' … --test loom_lifecycle --release` 7/0.
+`cargo test --workspace --no-fail-fast` exit 0. Strict clippy (workspace,
+all-targets) and its `nono_loom` variant both clean. `cargo fmt --all -- --check`
+clean. `scripts/lint-docs.sh` ok, `scripts/test-list-aliases.sh` ok (45 alias
+markers). `bash -n scripts/stream-gates.sh` ok. Doc tests 11/0. Miri: NOT_RUN,
+no miri component on this host.
+
+**Not run here, and the whole reason this iteration exists:** none of the Linux
+arms. The spin fix, the file-scope refusal and the slot fix are argued from the
+kernel's source and the crate's source and are tested through the seams a macOS
+host can reach; the ubuntu job is what turns that into evidence.
+
+### Left uncommitted, by instruction
+
+`crates/nono/src/lifecycle/supervisor.rs`, `crates/nono/src/lifecycle/support.rs`,
+`crates/nono/src/lifecycle/session_store.rs`,
+`crates/nono/src/capability_modes/mod.rs`,
+`crates/nono/src/capability_modes/landlock_map.rs`,
+`crates/nono/src/sandbox/linux.rs`, `crates/nono/tests/lifecycle_detached.rs`,
+`crates/nono/tests/lifecycle_modes_live.rs`, `scripts/stream-gates.sh`,
+`NONO_UPSTREAM_DELTA.md`, `PLATFORM_CAPABILITY_BASELINE.md`, `WORKLOG.md`.

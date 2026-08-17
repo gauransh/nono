@@ -2066,6 +2066,13 @@ fn record_mode() -> Mode {
 /// Widened to `u32` because `mode_t` is 16 bits on macOS and 32 on Linux, and
 /// an error message that reported a different width per platform would be a
 /// gratuitous difference.
+///
+/// The conversion is therefore *required* on macOS and a no-op on Linux, which
+/// is exactly the shape `clippy::useless_conversion` complains about — on one
+/// platform only. `#[expect]` cannot express that: it would trade the Linux
+/// failure for an "unfulfilled expectation" failure on macOS, which is the same
+/// problem facing the other way.
+#[allow(clippy::useless_conversion)]
 fn permission_bits(st_mode: libc::mode_t) -> u32 {
     u32::from(st_mode) & 0o7777
 }
@@ -2308,6 +2315,16 @@ mod tests {
             Ok(meta) => meta.permissions().mode() & 0o7777,
             Err(err) => panic!("{} must exist: {err}", path.display()),
         }
+    }
+
+    /// [`RECORD_MODE`] at the width [`mode_of`] reports in.
+    ///
+    /// Same platform split as [`permission_bits`]: `mode_t` is 16 bits on macOS
+    /// and 32 on Linux, so the widening is required there and useless here, and
+    /// only an `allow` can be true on both.
+    #[allow(clippy::useless_conversion)]
+    fn record_mode_bits() -> u32 {
+        u32::from(RECORD_MODE)
     }
 
     fn write_raw(store: &SessionStore, name: &str, contents: &str) {
@@ -2613,7 +2630,7 @@ mod tests {
             panic!("first write must succeed: {err}");
         }
         let path = store.inner.record_path(record.session_id());
-        assert_eq!(mode_of(&path), u32::from(RECORD_MODE), "after create");
+        assert_eq!(mode_of(&path), record_mode_bits(), "after create");
 
         record.observe(LifecycleState::Failed, None);
         if let Err(err) = store.inner.update(&record) {
@@ -2621,7 +2638,7 @@ mod tests {
         }
         assert_eq!(
             mode_of(&path),
-            u32::from(RECORD_MODE),
+            record_mode_bits(),
             "an update must not widen the record"
         );
     }
