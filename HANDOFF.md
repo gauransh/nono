@@ -389,13 +389,20 @@ convenience gap only — it is no longer on the path to Linux verification, and
 the gate script still reports the two Linux gates honestly as `NOT_RUN` with
 the operator action when run on a Docker-less macOS host.
 
-**One open item, not a blocker (see `BLOCKED_ROWS.json` R08):** on macOS 15
-(GitHub `macos-latest`) one mode pair fails —
-`read_contents_granted_reads_and_ungranted_is_denied`: `/bin/cat` exits 1
-although `CompiledModes` shows `ReadContents`+`ReadMetadata` enforced and
-activation `Observed`. The same test passes on macOS 14. 13 of 14 pairs pass on
-macOS 15. Under diagnosis; any additional SBPL operation the fix requires must
-be disclosed as a bundle rather than granted silently.
+**That open item is closed (delta F13; `BLOCKED_ROWS.json` R08 still needs its
+row flipped).** The runner is macOS 26.5.2 / Darwin 25.5.0, not macOS 15, and
+the pair that failed there was failing for something outside the grant: `cat(1)`
+sizes its copy buffer from `fstat(fileno(stdout))` and dies when that is
+refused, and macOS 26 evaluates `file-read-metadata` for an `fstat` of a
+descriptor the confined process merely *inherited* — which the harness's own
+stdout, a gate log file, always is. macOS 14 does not evaluate it at all. **No
+SBPL operation was added and nothing new is bundled:** `read_contents` is
+`file-read-data` + `file-map-executable` on both versions and enforces exactly
+that on both. The two pairs that read bytes now read with `/usr/bin/cmp -s`,
+which writes nothing and so needs only the mode under test. Evidence — the
+runner's own kernel log line and the probe matrix that isolated it — is in
+PLATFORM_CAPABILITY_BASELINE.md under "Version differences observed live"; all
+14 pairs are green on `macos-latest` in run 32058137420.
 
 ## 9. Integration instructions for leash-rs
 
