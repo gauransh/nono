@@ -29,6 +29,10 @@
 //!   enforce, per capability, with how each answer was established.
 //! - [`prepare`][self]: [`PreparedSandbox`], which forks a child, sandboxes it,
 //!   and holds it before `execve`.
+//! - [`probe`][self]: [`PreparedSandbox::probe_enforcement`], which asks the
+//!   *held child* to attempt one real operation and reports the kernel's own
+//!   `errno` — the one fact in this module that is not the library's own
+//!   account of what it did.
 //! - [`gate`][self]: [`ActivationHandle`] and the single-use release check.
 //! - `sync_core`: the state and the one-shot gate write behind a single lock,
 //!   so the activation compare-and-swap has an answer under concurrency rather
@@ -105,6 +109,7 @@ mod gate;
 mod identity;
 mod plan;
 mod prepare;
+mod probe;
 mod protocol;
 mod session_store;
 mod state;
@@ -141,6 +146,10 @@ pub use plan::{
     ValidatedPlan,
 };
 pub use prepare::{PrepareError, PreparedSandbox};
+pub use probe::{
+    EnforcementMechanism, ProbeError, ProbeId, ProbeIndeterminate, ProbeObservation, ProbeOp,
+    ProbeOutcome, ProbeRequest, ProbeScope, TransportProtocol,
+};
 pub use protocol::{
     CONTROL_PROTOCOL_VERSION, ControlRefusal, ControlReply, ControlRequest, FrameError,
     MAX_CONTROL_FRAME_BYTES, SessionStatus, WaitOutcome,

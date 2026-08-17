@@ -67,7 +67,27 @@ pub(crate) const GATE_MESSAGE_BYTES: usize = 16;
 pub(crate) struct GateSecrets {
     release: [u8; GATE_MESSAGE_BYTES],
     abort: [u8; GATE_MESSAGE_BYTES],
+    /// The message that asks the held child to attempt one probe and answer.
+    ///
+    /// **Derived, not drawn.** A third random value would have to travel with
+    /// the other two across the detached launcher's `execve`, widening a
+    /// bootstrap that carries start-button material; a one-way hash of the
+    /// release message needs no protocol change and is reconstructible by
+    /// exactly the parties that already hold the pair. It is still a secret in
+    /// the sense that matters: a stray copy of the gate descriptor without the
+    /// release message cannot compute this one, so it cannot make the child run
+    /// a syscall on its behalf. The implication in the other direction is
+    /// harmless — a party that knows the release message can already start the
+    /// program, which is strictly more than a probe.
+    probe: [u8; GATE_MESSAGE_BYTES],
 }
+
+/// Domain separator for the derived probe message.
+///
+/// Present so the hash cannot collide with any other use of these bytes: the
+/// value is the digest of *this string and this secret*, not of the secret
+/// alone.
+const PROBE_DERIVATION_DOMAIN: &[u8] = b"nono.gate.probe.v1";
 
 impl GateSecrets {
     /// Draw a fresh pair from the system CSPRNG.
@@ -76,7 +96,7 @@ impl GateSecrets {
         let mut abort = [0_u8; GATE_MESSAGE_BYTES];
         getrandom::fill(&mut release)?;
         getrandom::fill(&mut abort)?;
-        Ok(Self { release, abort })
+        Ok(Self::from_parts(release, abort))
     }
 
     /// Rebuild the pair a child was forked with, on the far side of an
@@ -91,7 +111,12 @@ impl GateSecrets {
         release: [u8; GATE_MESSAGE_BYTES],
         abort: [u8; GATE_MESSAGE_BYTES],
     ) -> Self {
-        Self { release, abort }
+        let probe = derive_probe(&release);
+        Self {
+            release,
+            abort,
+            probe,
+        }
     }
 
     pub(crate) fn release(&self) -> &[u8; GATE_MESSAGE_BYTES] {
@@ -100,6 +125,10 @@ impl GateSecrets {
 
     pub(crate) fn abort(&self) -> &[u8; GATE_MESSAGE_BYTES] {
         &self.abort
+    }
+
+    pub(crate) fn probe(&self) -> &[u8; GATE_MESSAGE_BYTES] {
+        &self.probe
     }
 
     /// Decide what a message that arrived on the gate means.
@@ -111,13 +140,37 @@ impl GateSecrets {
     pub(crate) fn classify(&self, message: &[u8; GATE_MESSAGE_BYTES]) -> GateDecision {
         let is_release = ct_eq(message, &self.release);
         let is_abort = ct_eq(message, &self.abort);
-        match (is_release, is_abort) {
-            (true, false) => GateDecision::Release,
-            (false, true) => GateDecision::Abort,
-            // Neither, or (impossibly) both: not a message this gate speaks.
+        let is_probe = ct_eq(message, &self.probe);
+        match (is_release, is_abort, is_probe) {
+            (true, false, false) => GateDecision::Release,
+            (false, true, false) => GateDecision::Abort,
+            (false, false, true) => GateDecision::Probe,
+            // None, or (impossibly) more than one: not a message this gate
+            // speaks.
             _ => GateDecision::Unknown,
         }
     }
+}
+
+/// The probe message for a given release message.
+///
+/// SHA-256 truncated to the gate's message length, which is the same
+/// construction [`token_digest`] uses for the activation token. One-way: a
+/// party that learns the probe message cannot recover the release message from
+/// it.
+fn derive_probe(release: &[u8; GATE_MESSAGE_BYTES]) -> [u8; GATE_MESSAGE_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update(PROBE_DERIVATION_DOMAIN);
+    hasher.update(release);
+    let digest = hasher.finalize();
+    let mut probe = [0_u8; GATE_MESSAGE_BYTES];
+    // The digest is 32 bytes and a gate message is 16, so this slice always
+    // exists; the `else` is what keeps a future change to either constant from
+    // being a panic.
+    if let Some(prefix) = digest.get(..GATE_MESSAGE_BYTES) {
+        probe.copy_from_slice(prefix);
+    }
+    probe
 }
 
 impl std::fmt::Debug for GateSecrets {
@@ -125,6 +178,7 @@ impl std::fmt::Debug for GateSecrets {
         f.debug_struct("GateSecrets")
             .field("release", &"<redacted>")
             .field("abort", &"<redacted>")
+            .field("probe", &"<redacted>")
             .finish()
     }
 }
@@ -136,6 +190,10 @@ pub(crate) enum GateDecision {
     Release,
     /// Stop without running anything.
     Abort,
+    /// Attempt one probe, answer on the status descriptor, and keep waiting.
+    ///
+    /// The only message that does not end the wait. See [`super::probe`].
+    Probe,
     /// Refused: whoever wrote this does not hold the gate's secrets.
     Unknown,
 }
@@ -514,6 +572,47 @@ mod tests {
             secrets.abort(),
             "release and abort must never be the same bytes"
         );
+    }
+
+    #[test]
+    fn the_probe_message_is_a_third_word_the_gate_speaks() {
+        let secrets = secrets();
+        assert_eq!(
+            secrets.classify(secrets.probe()),
+            GateDecision::Probe,
+            "the probe message must ask for a probe"
+        );
+        // Distinct from both, so a probe can never be mistaken for a start
+        // button or for a stop.
+        assert_ne!(secrets.probe(), secrets.release());
+        assert_ne!(secrets.probe(), secrets.abort());
+    }
+
+    #[test]
+    fn the_probe_message_is_derived_from_the_release_message() {
+        // Derived rather than drawn, so the detached launcher's bootstrap —
+        // which already carries the pair across an execve — needs no third
+        // field. The derivation must be a function of the release message and
+        // nothing else, or the supervisor and the child would disagree.
+        let release = [0x11_u8; GATE_MESSAGE_BYTES];
+        let abort = [0x22_u8; GATE_MESSAGE_BYTES];
+        let here = GateSecrets::from_parts(release, abort);
+        let there = GateSecrets::from_parts(release, [0x33_u8; GATE_MESSAGE_BYTES]);
+        assert_eq!(
+            here.probe(),
+            there.probe(),
+            "the same release message must yield the same probe message"
+        );
+
+        let other = GateSecrets::from_parts([0x44_u8; GATE_MESSAGE_BYTES], abort);
+        assert_ne!(
+            here.probe(),
+            other.probe(),
+            "two gates must not share a probe message"
+        );
+        // One-way: the probe message must not be the release message wearing a
+        // hat.
+        assert_ne!(here.probe().as_slice(), release.as_slice());
     }
 
     #[test]

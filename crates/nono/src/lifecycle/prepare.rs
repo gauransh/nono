@@ -20,6 +20,13 @@
 //! Nothing between step 3 and `execve` runs unconfined, and the customer's
 //! program never runs at all unless step 6 produced the release message.
 //!
+//! Step 6 is a loop, because one of the three messages the gate speaks does not
+//! end the wait: a *probe* asks the child to attempt one operation and answer
+//! on the status descriptor, after which it goes back to waiting — still
+//! confined, still before `execve`. That window is the only place in this
+//! library where the enforcement can be observed rather than assumed, which is
+//! why it exists. See [`super::probe`].
+//!
 //! Step 4 sits after the sandbox apply rather than before it because on Linux
 //! the prepared Landlock ruleset *is* a set of open path descriptors, and
 //! `apply_raw` needs them. It sits before step 5 so that by the time `prepare`
@@ -116,6 +123,7 @@ use super::gate::{
 };
 use super::identity::ProcessIdentity;
 use super::plan::{ResourceLimits, SessionMode, ValidatedPlan};
+use super::probe::{PROBE_REQUEST_BYTES, ProbeError, ProbeObservation, ProbeOutcome, ProbeRequest};
 use super::session_store::SessionHandle;
 use super::state::{LifecycleOp, LifecycleState, TransitionError};
 use super::sync_core::{SharedLifecycle, Transition};
@@ -123,7 +131,7 @@ use std::ffi::{CString, c_char};
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
@@ -405,6 +413,15 @@ pub struct PreparedSandbox {
     /// [`ActivatedSandbox`] this hands off to writes the same record rather
     /// than a second copy that could disagree with it.
     session: Option<Arc<SessionHandle>>,
+    /// Serialises the probe request/reply exchange with the held child.
+    ///
+    /// [`Self::probe_enforcement`] takes `&self`, so two threads could reach it
+    /// at once; the two channels it uses carry fixed-size records with no
+    /// sequence number, so two interleaved exchanges would each read the
+    /// other's answer. Every other operation on this type takes `&mut self`,
+    /// which is what stops a probe from interleaving with an activation or a
+    /// stop — this lock is only needed against a second probe.
+    probe_exchange: Mutex<()>,
 }
 
 /// A child forked by a launcher and inherited across an `execve`.
@@ -564,6 +581,7 @@ impl PreparedSandbox {
                     // only build the record once the identity and process group
                     // below are facts.
                     session: None,
+                    probe_exchange: Mutex::new(()),
                 };
 
                 // Drawn *after* the fork so the token never exists in the
@@ -653,6 +671,7 @@ impl PreparedSandbox {
             last_exit: None,
             events,
             session: None,
+            probe_exchange: Mutex::new(()),
         };
 
         let mut token = Zeroizing::new([0_u8; ACTIVATION_TOKEN_BYTES]);
@@ -982,6 +1001,138 @@ impl PreparedSandbox {
         Ok(verification)
     }
 
+    /// Ask the kernel what the child's *installed* enforcement does with one
+    /// operation.
+    ///
+    /// The held child attempts the operation with a single real syscall and the
+    /// kernel's own `errno` comes back. **The answer is never derived from the
+    /// plan's [`CapabilitySet`][crate::CapabilitySet], from a
+    /// [`QueryContext`][crate::query::QueryContext], or from anything else in
+    /// [`crate::query`] — a grant table is what the caller asked for, and this
+    /// method exists to find out what the kernel did with it.** The same note
+    /// that [`super::cleanup`] makes about signals applies here: a policy that
+    /// was applied without an error is not evidence that it is enforced, in
+    /// exactly the way a signal that was sent is not evidence that a process
+    /// died.
+    ///
+    /// No customer code runs. The child is the one this session forked, still
+    /// sandboxed and still blocked before `execve`; nothing on this path reads
+    /// [`ValidatedPlan::program`][super::ValidatedPlan::program], and the probe
+    /// is answered from the gate wait, which the child returns to afterwards.
+    ///
+    /// Nothing is memoised. Two identical requests are two exchanges with the
+    /// child and two syscalls; a cached answer would be a claim about a moment
+    /// that has passed.
+    ///
+    /// The operation really happens — see [`super::probe`] for what that means
+    /// for the operations that create or remove things.
+    ///
+    /// # Errors
+    ///
+    /// [`ProbeError::NotLegalInState`] unless the run is held at the gate: a
+    /// probe of the *installed* enforcement needs the installed child, and
+    /// outside [`LifecycleState::Prepared`] there is none to reach.
+    /// [`ProbeError::ChildUnreachable`] if the exchange could not be completed,
+    /// which on this path means the child died during it.
+    pub fn probe_enforcement(
+        &self,
+        request: &ProbeRequest,
+    ) -> Result<ProbeObservation, ProbeError> {
+        // A probe is only meaningful against the held child, and the state
+        // machine is the only thing that knows whether there still is one.
+        let observed = self.shared.state();
+        if observed != LifecycleState::Prepared {
+            return Err(ProbeError::NotLegalInState { state: observed });
+        }
+        let Some(mechanism) = super::probe::installed_mechanism() else {
+            // No mechanism means `PlatformSandbox::build` refused, so no child
+            // was ever forked. Unreachable in practice, and honest if it ever
+            // is not.
+            return Err(ProbeError::ChildUnreachable {
+                errno: libc::ENOSYS,
+            });
+        };
+
+        // Two answers are settled before the child is asked anything: an
+        // operation with no in-scope probe, and one the mechanism has no check
+        // for. Neither is sent, because in both cases whatever the child came
+        // back with would not be an answer to the question.
+        if let Some(reason) = super::probe::settled_before_asking(&request.op) {
+            return Ok(super::probe::observation(
+                request.id.clone(),
+                ProbeOutcome::Indeterminate { reason },
+                mechanism,
+            ));
+        }
+        let wire = match super::probe::encode_request(&request.op) {
+            Ok(wire) => wire,
+            // The request cannot cross the channel. Reported with the number
+            // the syscall would have produced, rather than as a refusal it
+            // never received.
+            Err(errno) => {
+                return Ok(super::probe::observation(
+                    request.id.clone(),
+                    ProbeOutcome::Indeterminate {
+                        reason: super::probe::ProbeIndeterminate::ProbeCouldNotRun { errno },
+                    },
+                    mechanism,
+                ));
+            }
+        };
+
+        // One exchange at a time. Nothing between the writes and the read can
+        // panic — raw I/O over fixed-size arrays — so a poisoned lock cannot
+        // mean a half-finished exchange; it is taken anyway rather than turning
+        // an unrelated panic into a permanent refusal.
+        let _exchange = match self.probe_exchange.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        let (Some(gate), Some(status), Some(secrets)) = (
+            self.gate.as_ref(),
+            self.status.as_ref(),
+            self.secrets.as_ref(),
+        ) else {
+            // The state check above already proves the gate is open, so this is
+            // defence against a future path that closes one without leaving
+            // `Prepared`.
+            return Err(ProbeError::ChildUnreachable { errno: libc::EPIPE });
+        };
+
+        // The secret first, then the record it announces. Both are written
+        // through `&PipeWriter`, which is what lets this method take `&self`;
+        // the exchange lock above is what makes that safe.
+        //
+        // A failure between the two leaves the child waiting for a record that
+        // will never arrive, which is safe in the only direction that matters:
+        // it waits at the gate, still confined and still pre-exec, until the
+        // gate closes and it exits. `write_all` on a pipe fails only when the
+        // far end is gone, so in practice the child is already dead by then.
+        let mut sink: &PipeWriter = gate;
+        write_probe(&mut sink, secrets.probe())?;
+        write_probe(&mut sink, &wire)?;
+
+        match read_status_record(status) {
+            Ok(Some((tag, errno))) => match super::probe::classify_reply(tag, errno) {
+                Some(outcome) => Ok(super::probe::observation(
+                    request.id.clone(),
+                    outcome,
+                    mechanism,
+                )),
+                // Not a reply: the child wrote a record because it was dying,
+                // not because it was answering. Its death is reported by the
+                // next operation that touches the child — this one refuses to
+                // dress a failure record up as a verdict.
+                None => Err(ProbeError::ChildUnreachable { errno }),
+            },
+            // EOF with nothing read: the child's copy of the status descriptor
+            // went away, which before `execve` means it died.
+            Ok(None) => Err(ProbeError::ChildUnreachable { errno: 0 }),
+            Err(errno) => Err(ProbeError::ChildUnreachable { errno }),
+        }
+    }
+
     /// Apply an observed fact, recording it and telling the sink.
     ///
     /// Every state change in this module goes through here or through
@@ -1254,6 +1405,14 @@ impl PreparedSandbox {
 /// winning path: it borrows the two fields the write touches and nothing else,
 /// so the shared core can be borrowed alongside them. Calling it from anywhere
 /// but inside that claim would be the bug the claim exists to prevent.
+///
+/// TODO(probe): post-activation scope. The `drop` below is the end of the probe
+/// channel: once the gate closes there is no way to reach the running child,
+/// and keeping the descriptor alive is not the answer — the customer's program
+/// would then be able to read it. A post-activation probe has to fork a fresh
+/// sibling and re-apply [`ValidatedPlan::capabilities`], which is
+/// [`super::ProbeScope::RederivedSibling`] and proves something strictly
+/// weaker. See [`super::probe`].
 fn release(gate: &mut Option<PipeWriter>, secrets: Option<&GateSecrets>) -> Result<(), i32> {
     let message = *secrets.ok_or(0)?.release();
     let mut gate = gate.take().ok_or(0)?;
@@ -1609,41 +1768,37 @@ pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
         unsafe { libc::_exit(PRE_EXEC_EXIT_CODE) }
     }
 
-    let mut message = [0_u8; GATE_MESSAGE_BYTES];
-    let mut filled: usize = 0;
-    while filled < GATE_MESSAGE_BYTES {
-        let remaining = GATE_MESSAGE_BYTES.saturating_sub(filled);
-        // SAFETY: `message` is a live 16-byte local and `filled < 16`, so the
-        // offset pointer and length stay inside it. `read` is
-        // async-signal-safe.
-        let count = unsafe {
-            libc::read(
-                context.gate_read,
-                message.as_mut_ptr().add(filled).cast::<libc::c_void>(),
-                remaining,
-            )
-        };
-        match usize::try_from(count) {
-            // Every writer is gone: the supervisor died while we waited. A
-            // partial message ends the same way — it can never complete.
-            Ok(0) => child_fail(context.status_write, PreExecStage::GateClosed, 0),
-            Ok(count) => filled = filled.saturating_add(count),
-            Err(_) => {
-                let errno = last_errno();
-                if errno != libc::EINTR {
-                    child_fail(context.status_write, PreExecStage::GateWait, errno);
+    // The wait is a loop rather than a single read because one of the three
+    // messages the gate speaks does not end it: a probe is answered and the
+    // child goes back to waiting, still confined and still pre-exec. The other
+    // two leave through `execve` or `child_fail`, so the loop has exactly one
+    // ordinary exit.
+    let mut request = [0_u8; PROBE_REQUEST_BYTES];
+    loop {
+        let mut message = [0_u8; GATE_MESSAGE_BYTES];
+        read_gate_exact(context, &mut message);
+
+        match context.secrets.classify(&message) {
+            GateDecision::Release => break,
+            GateDecision::Abort => child_fail(context.status_write, PreExecStage::GateAborted, 0),
+            GateDecision::Probe => {
+                read_gate_exact(context, &mut request);
+                let (tag, errno) = super::probe::run_probe_in_child(&request);
+                if !write_record(context.status_write, tag, errno) {
+                    // The answer cannot be delivered, so the supervisor is
+                    // waiting for something that will never arrive. Nothing can
+                    // be reported if the report channel itself is gone.
+                    // SAFETY: `_exit` is async-signal-safe and does not return.
+                    unsafe { libc::_exit(PRE_EXEC_EXIT_CODE) }
                 }
             }
+            // Whoever wrote this holds the descriptor but not the secret.
+            // Refuse rather than guess: a gate that starts a program for an
+            // unrecognised message is not a gate.
+            GateDecision::Unknown => {
+                child_fail(context.status_write, PreExecStage::GateProtocol, 0)
+            }
         }
-    }
-
-    match context.secrets.classify(&message) {
-        GateDecision::Release => {}
-        GateDecision::Abort => child_fail(context.status_write, PreExecStage::GateAborted, 0),
-        // Whoever wrote this holds the descriptor but not the secret. Refuse
-        // rather than guess: a gate that starts a program for an unrecognised
-        // message is not a gate.
-        GateDecision::Unknown => child_fail(context.status_write, PreExecStage::GateProtocol, 0),
     }
 
     if !context.working_dir.is_null() {
@@ -1669,6 +1824,44 @@ pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
     // parent, and the two vectors are NULL-terminated.
     unsafe { libc::execve(context.program, context.argv, context.envp) };
     child_fail(context.status_write, PreExecStage::Exec, last_errno())
+}
+
+/// Fill `buffer` from the gate descriptor, or die naming why it could not be.
+///
+/// The child's only reader. Never returns short: a partial message is a message
+/// that can never complete, so the two ways it can stop early — every writer
+/// gone, or a read error that is not an interruption — end the child with the
+/// same stages the single-message wait used before the loop existed.
+///
+/// Runs in a forked child, so it is syscalls over a caller-owned buffer only.
+fn read_gate_exact(context: &ChildContext<'_>, buffer: &mut [u8]) {
+    let wanted = buffer.len();
+    let mut filled: usize = 0;
+    while filled < wanted {
+        let remaining = wanted.saturating_sub(filled);
+        // SAFETY: `buffer` is live for the call and `filled < wanted`, so the
+        // offset pointer and length stay inside it. `read` is
+        // async-signal-safe.
+        let count = unsafe {
+            libc::read(
+                context.gate_read,
+                buffer.as_mut_ptr().add(filled).cast::<libc::c_void>(),
+                remaining,
+            )
+        };
+        match usize::try_from(count) {
+            // Every writer is gone: the supervisor died while we waited. A
+            // partial message ends the same way — it can never complete.
+            Ok(0) => child_fail(context.status_write, PreExecStage::GateClosed, 0),
+            Ok(count) => filled = filled.saturating_add(count),
+            Err(_) => {
+                let errno = last_errno();
+                if errno != libc::EINTR {
+                    child_fail(context.status_write, PreExecStage::GateWait, errno);
+                }
+            }
+        }
+    }
 }
 
 /// Close every descriptor this process inherited except the named keepers and
@@ -1854,12 +2047,30 @@ fn classify_prepare_record(
     }
 }
 
+/// Write one piece of a probe exchange, or say the child is gone.
+///
+/// `write_all` is what handles a short write on a record larger than the pipe's
+/// atomic size; the only thing this adds is the errno translation, so that a
+/// dead child on the far end reads as [`ProbeError::ChildUnreachable`] rather
+/// than as an I/O error the caller has to classify itself.
+fn write_probe(gate: &mut &PipeWriter, bytes: &[u8]) -> Result<(), ProbeError> {
+    gate.write_all(bytes)
+        .map_err(|err| ProbeError::ChildUnreachable {
+            errno: err.raw_os_error().unwrap_or(0),
+        })
+}
+
 /// Read one status record, or observe EOF.
 ///
 /// `Ok(None)` is a clean EOF with nothing read — the positive observation that
 /// `execve` happened. `Ok(Some(_))` is a record. `Err(errno)` is a failed read,
 /// which says nothing about the child.
-fn read_status_record(status: &mut PipeReader) -> Result<Option<(u8, i32)>, i32> {
+///
+/// Generic over the reader so the probe exchange, which holds the descriptor
+/// through `&self`, uses exactly the framing every other reader of this channel
+/// uses. Two readers with two ideas of what a record looks like would be two
+/// protocols.
+fn read_status_record<R: Read>(mut status: R) -> Result<Option<(u8, i32)>, i32> {
     let mut record = [0_u8; STATUS_RECORD_LEN];
     let mut filled: usize = 0;
     while filled < STATUS_RECORD_LEN {
