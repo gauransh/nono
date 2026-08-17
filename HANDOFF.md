@@ -17,7 +17,7 @@ is reference.
 ## 1. Branch and base
 
 - **Branch:** `parallel/nono-substrate-v1`
-- **Repository:** `/Users/gauranshtandon/Documents/Vedaya/nono` (local only)
+- **Repository:** local working checkout (see fork remote below)
 - **Upstream base (pin):** `nolabs-ai/nono` @
   `149579a7b0753ee413680169fa937eea82da46a0`
 - **HEAD convention:** the branch tip is authoritative. Each iteration's commit
@@ -354,7 +354,7 @@ software problem.**
 > docker ps
 > ```
 > ```
-> Cannot connect to the Docker daemon at unix:///Users/gauranshtandon/.docker/run/docker.sock.
+> Cannot connect to the Docker daemon at unix://$HOME/.docker/run/docker.sock.
 > Is the docker daemon running?
 > ```
 >

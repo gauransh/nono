@@ -883,7 +883,7 @@ less honest. Justified in the row rather than suppressed.
 
 Both blocker reproduce commands re-verified verbatim: `docker ps` still answers
 "Cannot connect to the Docker daemon at
-`unix:///Users/gauranshtandon/.docker/run/docker.sock`", and `which
+`unix://$HOME/.docker/run/docker.sock`", and `which
 x86_64-linux-gnu-gcc` still answers "not found" — while the
 `x86_64-unknown-linux-gnu` *target* is installed, which is the detail that makes
 the cross-compile dead end easy to re-walk if it is not written down.
