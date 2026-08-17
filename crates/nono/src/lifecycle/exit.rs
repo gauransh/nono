@@ -31,10 +31,12 @@
 //! see [`ActivationObservation`]. The library reports which of the three it
 //! can support and never rounds an ambiguity up to a certainty.
 
+use super::cleanup::{CleanupError, CleanupVerification, DeathObservation, verify_and_record};
 use super::events::{EventSink, LifecycleEvent, Observation};
+use super::gate::StopError;
 use super::identity::ProcessIdentity;
 use super::state::{LifecycleOp, LifecycleState};
-use super::sync_core::SharedLifecycle;
+use super::sync_core::{SharedLifecycle, Transition};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
@@ -63,6 +65,11 @@ pub(crate) const TAG_GATE_READY: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreExecStage {
+    /// Putting the child into its own process group failed, so a later stop
+    /// could not have reached everything the run started and cleanup
+    /// verification would have had no group to probe. The child dies here
+    /// rather than run without either guarantee.
+    ProcessGroup,
     /// Applying the platform sandbox to the child itself failed. Nothing ran
     /// unconfined: the child died instead.
     SandboxApply,
@@ -91,6 +98,7 @@ impl PreExecStage {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ProcessGroup => "process_group",
             Self::SandboxApply => "sandbox_apply",
             Self::GateWait => "gate_wait",
             Self::GateClosed => "gate_closed",
@@ -110,6 +118,11 @@ impl PreExecStage {
     #[must_use]
     pub(crate) fn as_tag(self) -> u8 {
         match self {
+            // Numbered below `SandboxApply` rather than appended after `Exec`:
+            // this stage happens *before* the sandbox apply, so the tags keep
+            // reading in sequence order. The existing tags are contract and
+            // could not be moved to make room.
+            Self::ProcessGroup => 0x0F,
             Self::SandboxApply => 0x10,
             Self::GateWait => 0x11,
             Self::GateClosed => 0x12,
@@ -126,6 +139,7 @@ impl PreExecStage {
     #[must_use]
     pub(crate) fn from_tag(tag: u8) -> Self {
         match tag {
+            0x0F => Self::ProcessGroup,
             0x10 => Self::SandboxApply,
             0x11 => Self::GateWait,
             0x12 => Self::GateClosed,
@@ -355,6 +369,11 @@ pub struct ReapError {
 /// the handoff and does not follow the run any further.
 pub struct ActivatedSandbox {
     identity: ProcessIdentity,
+    /// The process group the child leads, which is the child's own pid: the
+    /// child called `setpgid(0, 0)` before it did anything else. Everything
+    /// the customer's program forks lands here too unless it deliberately
+    /// leaves — see [`super::PreparedSandbox`].
+    process_group: i32,
     /// This handle's own core, started at the state the handoff observed.
     ///
     /// Deliberately not shared with the [`super::PreparedSandbox`] it came
@@ -370,12 +389,14 @@ pub struct ActivatedSandbox {
 impl ActivatedSandbox {
     pub(crate) fn new(
         identity: ProcessIdentity,
+        process_group: i32,
         state: LifecycleState,
         activation: ActivationObservation,
         event_sink: Option<Arc<dyn EventSink>>,
     ) -> Self {
         Self {
             identity,
+            process_group,
             shared: SharedLifecycle::new(state),
             activation,
             reaped: None,
@@ -441,6 +462,88 @@ impl ActivatedSandbox {
         Ok(exit)
     }
 
+    /// End the run now, and wait until the death is observed.
+    ///
+    /// `SIGKILL` goes to the whole process group, not just the child: the
+    /// customer's program may have forked, and killing only the process nono
+    /// happens to hold a pid for would leave those children running while the
+    /// run reported itself stopped. The child is then signalled by pid as well,
+    /// which covers the one case the group cannot — a program that made itself
+    /// a session leader and so left the group it was born in.
+    ///
+    /// The signal is not the result. This returns only after `waitpid` observes
+    /// the child's death, and the [`SandboxExit`] carries what that observation
+    /// said — a `SIGKILL` death is [`ExitOutcome::Signaled`], and a program that
+    /// happened to exit on its own first is reported as the exit it actually
+    /// had. Whether anything *else* survived is a separate question, answered by
+    /// [`Self::verify_cleanup`] and not assumed here.
+    ///
+    /// # Errors
+    ///
+    /// [`StopError::NotStoppable`] if the run already ended or was already
+    /// stopped; [`StopError::SignalFailed`] if the kill could not be delivered,
+    /// in which case nothing is claimed and nothing was reaped;
+    /// [`StopError::Reap`] if the death could not be observed.
+    pub fn stop(&mut self) -> Result<SandboxExit, StopError> {
+        // Through the shared core, like every other mutation: `begin_stop`
+        // refuses a run that already ended rather than sending a signal at a
+        // pid whose death was already recorded.
+        let change = self
+            .shared
+            .begin_stop()
+            .map_err(|err| StopError::NotStoppable { state: err.from })?;
+        self.report(change);
+
+        kill_group(self.process_group).map_err(|errno| StopError::SignalFailed {
+            target: self.process_group,
+            errno,
+        })?;
+        // The direct child by pid too. It is ours and unreaped, so the number
+        // cannot have been reissued; without this a child that called `setsid`
+        // would survive the group kill and leave the reap below waiting for a
+        // process nothing had signalled.
+        kill_pid(self.identity.pid()).map_err(|errno| StopError::SignalFailed {
+            target: self.identity.pid(),
+            errno,
+        })?;
+
+        let outcome = reap(self.identity.pid())?;
+        self.transition(LifecycleOp::StopObserved);
+        let exit = SandboxExit::new(outcome, self.activation, self.identity.clone());
+        self.reaped = Some(exit.clone());
+        Ok(exit)
+    }
+
+    /// Prove the run's processes are gone — or report honestly that they are
+    /// not.
+    ///
+    /// Legal only once the run's end has been observed: after [`Self::wait`]
+    /// returned, or after [`Self::stop`] completed. Before that there is
+    /// nothing to verify and the call is refused rather than answered.
+    ///
+    /// Only [`CleanupVerification::ConfirmedAbsent`] moves the run to
+    /// [`LifecycleState::CleanupVerified`]. A survivor or an unsettled probe
+    /// leaves the state exactly where it was, so the caller can act and verify
+    /// again — the library never launders "we tried" into "it is gone".
+    ///
+    /// # Errors
+    ///
+    /// [`CleanupError`] naming the state that refused: the run has not ended
+    /// yet, or its cleanup was already verified.
+    pub fn verify_cleanup(&mut self) -> Result<CleanupVerification, CleanupError> {
+        let death = if self.reaped.is_some() {
+            DeathObservation::Reaped
+        } else {
+            DeathObservation::NotReaped
+        };
+        let (verification, change) =
+            verify_and_record(&self.shared, &self.identity, self.process_group, death)?;
+        if let Some(change) = change {
+            self.report(change);
+        }
+        Ok(verification)
+    }
+
     /// Apply an observed fact and tell the sink, if there is one.
     ///
     /// A refused transition is a library bug rather than a caller error, and
@@ -449,7 +552,13 @@ impl ActivatedSandbox {
         let Ok(change) = self.shared.mark(op) else {
             return;
         };
-        // Outside the shared core's lock: the sink is consumer code.
+        self.report(change);
+    }
+
+    /// Tell the sink about a change that already happened.
+    ///
+    /// Always outside the shared core's lock: the sink is consumer code.
+    fn report(&self, change: Transition) {
         if let Some(sink) = &self.event_sink {
             sink.emit(&LifecycleEvent::StateChanged {
                 from: change.from,
@@ -465,6 +574,7 @@ impl std::fmt::Debug for ActivatedSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActivatedSandbox")
             .field("identity", &self.identity)
+            .field("process_group", &self.process_group)
             .field("state", &self.shared.state())
             .field("activation", &self.activation)
             .field("reaped", &self.reaped)
@@ -535,11 +645,53 @@ pub(crate) fn kill_and_reap(pid: i32) {
     let _ = kill_and_reap_observed(pid);
 }
 
+/// `SIGKILL` every member of a process group, reporting what the kernel said.
+///
+/// `ESRCH` — no member left — is success with nothing to do, not a failure:
+/// the caller wanted the group gone and it already is. Every other error is
+/// returned, because a stop that could not deliver its signal must not be
+/// reported as a stop.
+///
+/// A group id of 0, 1, or below is refused before the syscall: `kill(0, …)`
+/// signals the *caller's own* process group and `kill(-1, …)` signals
+/// everything the caller may signal. A corrupt record must never turn into
+/// either.
+pub(crate) fn kill_group(pgid: i32) -> Result<(), i32> {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    if pgid <= 1 {
+        return Err(libc::EINVAL);
+    }
+    match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(errno) => Err(errno as i32),
+    }
+}
+
+/// `SIGKILL` one process, reporting what the kernel said.
+///
+/// Same treatment of `ESRCH` as [`kill_group`], and the same refusal of pids
+/// that would name a group rather than a process.
+pub(crate) fn kill_pid(pid: i32) -> Result<(), i32> {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if pid <= 0 {
+        return Err(libc::EINVAL);
+    }
+    match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(errno) => Err(errno as i32),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL_STAGES: [PreExecStage; 8] = [
+    const ALL_STAGES: [PreExecStage; 9] = [
+        PreExecStage::ProcessGroup,
         PreExecStage::SandboxApply,
         PreExecStage::GateWait,
         PreExecStage::GateClosed,

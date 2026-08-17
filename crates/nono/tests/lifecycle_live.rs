@@ -20,9 +20,9 @@
 //! keeps the R03 hold proof meaningful.
 
 use nono::lifecycle::{
-    ActivationError, ActivationObservation, EventSink, ExitOutcome, GateConfig, LifecycleEvent,
-    LifecycleState, PreExecStage, PrepareError, PreparedSandbox, SandboxPlan, StopError,
-    ValidatedPlan,
+    AbsenceBasis, ActivationError, ActivationObservation, CleanupError, CleanupVerification,
+    EventSink, ExitOutcome, GateConfig, LifecycleEvent, LifecycleState, PreExecStage, PrepareError,
+    PreparedSandbox, SandboxPlan, StopError, SurvivorEvidence, ValidatedPlan,
 };
 use nono::{AccessMode, CapabilitySet};
 use std::path::Path;
@@ -81,6 +81,27 @@ fn wait_until_gone(pid: i32, timeout: Duration) -> bool {
         // SAFETY: signal 0 performs the permission and existence check without
         // delivering anything. `pid` is a plain integer; no memory is touched.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Whether every member of `pgid` is gone, polled until the timeout.
+///
+/// `kill(-pgid, 0)` returning `ESRCH` is the observation. A process that has
+/// died but not yet been reaped by its new parent still answers, which is why
+/// this polls rather than asking once.
+fn wait_until_group_gone(pgid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: signal 0 performs the existence and permission check without
+        // delivering anything. `pgid` is a plain integer; no memory is touched.
+        let alive = unsafe { libc::killpg(pgid, 0) } == 0;
         if !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             return true;
         }
@@ -701,6 +722,246 @@ fn the_event_sink_observes_every_state_change_including_the_exit() {
             (LifecycleState::Running, LifecycleState::Exited),
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// 15. R11: the child leads its own process group.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_prepared_child_leads_a_process_group_of_its_own() {
+    // Everything R11 rests on. Without the child's `setpgid(0, 0)` there is no
+    // group to signal on a stop and nothing to probe after the pid is reaped —
+    // the child would simply stay in the supervisor's own group, and the
+    // assertions below would see that.
+    let dir = temp_dir();
+    let (held, _handle) = prepared(plan(dir.path(), "/bin/echo", &["grouped"]));
+    let pid = held.identity().pid();
+
+    // SAFETY: `pid` is this process's live, unreaped child; `getpgid` only
+    // reads its process group.
+    let child_group = unsafe { libc::getpgid(pid) };
+    // SAFETY: `getpgrp` takes no arguments, touches no memory, and cannot fail.
+    let supervisor_group = unsafe { libc::getpgrp() };
+
+    assert_eq!(
+        child_group, pid,
+        "the held child must be its own group leader, so its group id is its pid"
+    );
+    assert_ne!(
+        child_group, supervisor_group,
+        "a child left in the supervisor's group would make a stop signal the supervisor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 16. R11: an observed exit is verified absent, exactly once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_observed_exit_verifies_absent_and_refuses_a_second_verification() {
+    let dir = temp_dir();
+    let (mut held, handle) = prepared(plan(dir.path(), "/bin/echo", &["verified"]));
+    // The group id is the child's pid: the child made itself the leader.
+    let pgid = held.identity().pid();
+
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => panic!("activation must succeed: {err}"),
+    };
+
+    // Before the exit is observed there is nothing to verify, and the library
+    // says so instead of probing a live run.
+    assert_eq!(
+        running.verify_cleanup().err(),
+        Some(CleanupError {
+            state: LifecycleState::Running
+        })
+    );
+
+    match running.wait() {
+        Ok(exit) => assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 }),
+        Err(err) => panic!("wait must observe the exit: {err}"),
+    }
+
+    assert_eq!(
+        running.verify_cleanup(),
+        Ok(CleanupVerification::ConfirmedAbsent {
+            basis: AbsenceBasis::ReapedAndGroupEmpty { pgid }
+        })
+    );
+    assert_eq!(running.state(), LifecycleState::CleanupVerified);
+
+    // A second verification is refused rather than absorbed: counting one proof
+    // twice is a caller bug worth seeing.
+    assert_eq!(
+        running.verify_cleanup().err(),
+        Some(CleanupError {
+            state: LifecycleState::CleanupVerified
+        })
+    );
+
+    // The prepared handle froze at the handoff and does not own this run's end,
+    // so it refuses too rather than answering about a run it stopped following.
+    assert_eq!(
+        held.verify_cleanup().err(),
+        Some(CleanupError {
+            state: LifecycleState::Running
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 17. R11: a survivor is reported, not killed and not rounded down.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_survivor_in_the_group_is_reported_until_it_is_really_gone() {
+    let dir = temp_dir();
+    // A shell, because the caller asked for one by name — nono runs the program
+    // it was given and still passes the arguments literally. This one exits
+    // immediately and leaves a child behind, which is the whole point: the
+    // process nono waited for is gone while the run is not.
+    let (mut held, handle) = prepared(plan(
+        dir.path(),
+        "/bin/sh",
+        &["-c", "/bin/sleep 30 & exit 0"],
+    ));
+    let pgid = held.identity().pid();
+
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => panic!("activation must succeed: {err}"),
+    };
+    match running.wait() {
+        Ok(exit) => assert_eq!(
+            exit.outcome(),
+            ExitOutcome::Exited { code: 0 },
+            "the shell itself exited cleanly"
+        ),
+        Err(err) => panic!("wait must observe the exit: {err}"),
+    }
+
+    // The direct child was reaped, so a pid-only check would report "gone".
+    // The group probe is what makes the answer honest.
+    assert_eq!(
+        running.verify_cleanup(),
+        Ok(CleanupVerification::StillPresent {
+            survivors: SurvivorEvidence::ProcessGroupMember { pgid }
+        })
+    );
+    assert_eq!(
+        running.state(),
+        LifecycleState::Exited,
+        "a survivor must never be recorded as verified cleanup"
+    );
+
+    // Verification observes; acting on what it found is the consumer's move.
+    // SAFETY: `pgid` is the group nono recorded for this run and the run's own
+    // leader is already reaped, so the signal reaches the run's leftovers.
+    assert_eq!(unsafe { libc::killpg(pgid, libc::SIGKILL) }, 0);
+    assert!(
+        wait_until_group_gone(pgid, GONE_TIMEOUT),
+        "the group survived a SIGKILL"
+    );
+
+    // Same call, different fact — because the world changed, not because the
+    // library gave up.
+    assert_eq!(
+        running.verify_cleanup(),
+        Ok(CleanupVerification::ConfirmedAbsent {
+            basis: AbsenceBasis::ReapedAndGroupEmpty { pgid }
+        })
+    );
+    assert_eq!(running.state(), LifecycleState::CleanupVerified);
+}
+
+// ---------------------------------------------------------------------------
+// 18. R11: stopping a running program ends the whole group.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stopping_a_running_program_kills_its_group_and_verifies_absent() {
+    let dir = temp_dir();
+    let (mut held, handle) = prepared(plan(dir.path(), "/bin/sleep", &["30"]));
+    let pgid = held.identity().pid();
+
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => panic!("activation must succeed: {err}"),
+    };
+
+    let exit = match running.stop() {
+        Ok(exit) => exit,
+        Err(err) => panic!("stop must end a running program: {err}"),
+    };
+    // The observed death, not the request: `SIGKILL` is reported as a signal
+    // and never as `Exited { code: 137 }`.
+    assert_eq!(exit.outcome(), ExitOutcome::Signaled { signal: 9 });
+    // A signal can land on either side of `execve`, so the activation question
+    // stays where activation left it rather than being sharpened by a kill.
+    assert_eq!(
+        exit.activation(),
+        ActivationObservation::ExecOrKilledPreExec
+    );
+    assert_eq!(running.state(), LifecycleState::Stopped);
+    assert!(
+        wait_until_group_gone(pgid, GONE_TIMEOUT),
+        "a stop must leave nothing in the run's process group"
+    );
+
+    // The run already ended, so a second stop is refused by the state machine
+    // rather than sending a signal at a reaped pid.
+    assert_eq!(
+        running.stop().err(),
+        Some(StopError::NotStoppable {
+            state: LifecycleState::Stopped
+        })
+    );
+
+    assert_eq!(
+        running.verify_cleanup(),
+        Ok(CleanupVerification::ConfirmedAbsent {
+            basis: AbsenceBasis::ReapedAndGroupEmpty { pgid }
+        })
+    );
+    assert_eq!(running.state(), LifecycleState::CleanupVerified);
+}
+
+// ---------------------------------------------------------------------------
+// 19. R11: a child stopped before activation is verifiable too.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_child_stopped_before_activation_verifies_absent() {
+    let dir = temp_dir();
+    let marker = dir.path().join("never-run-marker");
+    let marker_arg = marker.to_string_lossy().into_owned();
+
+    let (mut held, _handle) = prepared(plan(dir.path(), "/usr/bin/touch", &[&marker_arg]));
+    let pgid = held.identity().pid();
+
+    // Nothing may be claimed while the child is still held at the gate.
+    assert_eq!(
+        held.verify_cleanup().err(),
+        Some(CleanupError {
+            state: LifecycleState::Prepared
+        })
+    );
+
+    if let Err(err) = held.stop_before_activation() {
+        panic!("stop must succeed on a held child: {err}");
+    }
+    assert_eq!(held.state(), LifecycleState::Stopped);
+
+    assert_eq!(
+        held.verify_cleanup(),
+        Ok(CleanupVerification::ConfirmedAbsent {
+            basis: AbsenceBasis::ReapedAndGroupEmpty { pgid }
+        })
+    );
+    assert_eq!(held.state(), LifecycleState::CleanupVerified);
+    assert!(!marker.exists(), "a stopped child must never have run");
 }
 
 // ---------------------------------------------------------------------------

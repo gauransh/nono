@@ -106,3 +106,38 @@ Base: nolabs-ai/nono @ 149579a7b0753ee413680169fa937eea82da46a0
   under nono_loom); fmt clean; lint scripts green; loom gate 5/5.
 - Disk pressure recurred (~950 MiB free): parallel streams' builds; cleanup pass
   before next slice.
+
+## 2026-08-17 — Iteration 5: R11 typed cleanup verification (delta F6)
+
+- Foundation: child calls `setpgid(0, 0)` right after closing the parent's
+  channel ends, so the run is a process group and not just a pid; failure is the
+  new typed `PreExecStage::ProcessGroup` (tag 0x0F) through the existing status
+  record. Parent records the pgid (== child pid, made true before the "at the
+  gate" record is written).
+- lifecycle/cleanup.rs: `CleanupVerification` (closed enum) with typed evidence —
+  reaped runs probe `kill(-pgid, 0)`, unobserved deaths probe the identity. A
+  sent signal is never a basis; `is_same_process` deliberately not reused (its
+  fail-closed `false` would become a proof of absence). Decisions recorded:
+  boot-id change ⇒ `ConfirmedAbsent{BootIdChanged}` (a reboot destroys every
+  process; "Indeterminate" would be false modesty); pgid-reuse-after-reap caveat
+  kept visible in the type's docs and mitigated by the boot re-check; targets ≤ 1
+  refused before any syscall so a corrupt record cannot aim at the supervisor's
+  own group.
+- API: `ActivatedSandbox::{stop, verify_cleanup}`, `PreparedSandbox::verify_cleanup`,
+  `CleanupError`, `StopError::SignalFailed`. Only `ConfirmedAbsent` records
+  `CleanupConfirmed`; `StillPresent`/`Indeterminate` leave the state alone, and a
+  duplicate verification is refused by the state machine (matrix already locked
+  it). `stop()` kills the group *and* the child pid — a descendant that called
+  `setsid` would otherwise leave the reap waiting forever.
+- Gates: 126 unit (17 new) + 21 live (5 new) x3; loom 5/5 unchanged; workspace
+  3562/0/1; strict clippy clean; fmt clean; lint scripts green.
+- Removal detection: deleting the `setpgid` line fails the group test and makes
+  the survivor test report `ConfirmedAbsent` while `/bin/sleep 30` still runs —
+  the exact dishonesty the group discipline exists to prevent. Restored green.
+- Known dark spot (documented in prepare.rs, not silently accepted): a descendant
+  that calls `setsid`/`setpgid` leaves the group and is invisible to both stop and
+  verification; closing it needs a cgroup-class mechanism. Second consequence: a
+  terminal's Ctrl-C no longer reaches the run by accident.
+- Residual: `ActivatedSandbox`'s drop path still kills only the child pid, not the
+  group (unchanged from F4); a consumer that drops a running handle can leave
+  descendants behind. Candidate for the supervisor slice.

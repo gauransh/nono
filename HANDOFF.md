@@ -46,8 +46,17 @@ frozen-contract state of THIS repository only.
   rewired onto it. No public API change: same types, same signatures, same
   observable behavior; the 96 existing lifecycle unit tests and all 16 live
   tests pass unmodified. Proven by 5 Loom models (ADR-0001 §2).
+- Landed (iteration 5, macOS live-verified; Linux written-unverified):
+  `nono::lifecycle::{CleanupVerification, AbsenceBasis, SurvivorEvidence,
+  IndeterminateReason, UnsupportedReason, CleanupError}` plus
+  `ActivatedSandbox::{stop, verify_cleanup}` and
+  `PreparedSandbox::verify_cleanup`. The prepared child now leads its own
+  process group (`setpgid(0, 0)`, typed `PreExecStage::ProcessGroup` on
+  failure), so a stop signals the whole run and verification probes a group
+  rather than a pid `waitpid` already consumed. A sent signal is never a
+  basis; only `ConfirmedAbsent` moves the run to `CleanupVerified`.
 - Still being added: durable supervisor/session store, attach/detach/resize,
-  `CleanupVerification`, `SupportReport` (ADR-0001 §5-7).
+  `SupportReport` (ADR-0001 §6-7).
 
 ## Toolchain and platform requirements
 
@@ -67,6 +76,9 @@ frozen-contract state of THIS repository only.
 | `cargo test --workspace --no-fail-fast` (after F5, iteration 4) | 3540 passed / 0 failed / 1 ignored, 33 suites — reproduced on 2 runs |
 | `cargo test -p nono lifecycle` / `--test lifecycle_live` | 96 unit + 16 live; live suite clean on 10 consecutive runs |
 | same, after F5 (shared lifecycle core) | 109 unit (96 unchanged + 13 new `sync_core`) + 16 live, unmodified |
+| `cargo test --workspace --no-fail-fast` (after F6, iteration 5) | 3562 passed / 0 failed / 1 ignored, 33 suites |
+| `cargo test -p nono lifecycle` / `--test lifecycle_live` (after F6) | 126 unit (109 unchanged + 17 new `cleanup`) + 21 live (16 unchanged + 5 new: own-process-group, verify-after-exit + duplicate refusal, honest `StillPresent` survivor then `ConfirmedAbsent`, `stop()` kills the group, stopped-before-activation verify); live suite clean on 3 consecutive runs |
+| removal detection for the R11 foundation | deleting the child's `setpgid(0, 0)` fails 2 live tests: the group assertion (`getpgid(child) == child`) and — the load-bearing one — the survivor test, which then reports `ConfirmedAbsent{ReapedAndGroupEmpty}` while `/bin/sleep 30` is still running |
 | `RUSTFLAGS='--cfg nono_loom' cargo test -p nono --test loom_lifecycle --release` | 5 loom models pass (all interleavings); harness verified to fail when the activation CAS is weakened. Cfg name is `nono_loom`, not loom's own `loom`: RUSTFLAGS reaches every crate, and `--cfg loom` makes tokio compile out `tokio::net`, breaking hyper-util (transitive via sigstore-verify) |
 | `./scripts/lint-docs.sh`, `./scripts/test-list-aliases.sh` | exit 0 after F1 |
 | `cargo clippy --workspace --all-targets` | clean |

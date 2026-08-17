@@ -29,13 +29,16 @@
 //! - `sync_core`: the state and the one-shot gate write behind a single lock,
 //!   so the activation compare-and-swap has an answer under concurrency rather
 //!   than a race. Crate-internal; proven by `tests/loom_lifecycle.rs`.
-//! - [`exit`][self]: [`ActivatedSandbox`] and the typed [`SandboxExit`] facts.
+//! - [`exit`][self]: [`ActivatedSandbox`], the typed [`SandboxExit`] facts, and
+//!   the group-wide [`ActivatedSandbox::stop`].
 //! - [`identity`][self]: [`ProcessIdentity`], pid plus what makes it unique.
+//! - [`cleanup`][self]: [`CleanupVerification`], which probes after the fact
+//!   rather than treating a sent signal as proof.
 //!
 //! # What it does not contain yet
 //!
-//! The durable session store, the recoverable supervisor, attach, and cleanup
-//! verification all arrive in later slices. Until the durable store lands,
+//! The durable session store, the recoverable supervisor, and attach all arrive
+//! in later slices. Until the durable store lands,
 //! every prepared session is generation 1 and nothing survives its supervisor:
 //! dropping a [`PreparedSandbox`] or an [`ActivatedSandbox`] kills and reaps
 //! the child rather than leaving it running.
@@ -63,6 +66,7 @@
 //! # Ok::<(), nono::NonoError>(())
 //! ```
 
+mod cleanup;
 mod events;
 mod exit;
 mod gate;
@@ -80,6 +84,10 @@ pub mod sync_core;
 #[cfg(not(nono_loom))]
 mod sync_core;
 
+pub use cleanup::{
+    AbsenceBasis, CleanupError, CleanupVerification, IndeterminateReason, SurvivorEvidence,
+    UnsupportedReason,
+};
 pub use events::{EventSink, LifecycleEvent, Observation};
 pub use exit::{
     ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
@@ -128,6 +136,11 @@ pub enum LifecycleError {
     /// A child's death was never observed.
     #[error(transparent)]
     Reap(#[from] ReapError),
+
+    /// Cleanup verification was attempted where it has no meaning: before the
+    /// run's end was observed, or a second time after it was already proven.
+    #[error(transparent)]
+    Cleanup(#[from] CleanupError),
 }
 
 impl From<PlanError> for NonoError {
@@ -163,6 +176,12 @@ impl From<StopError> for NonoError {
 impl From<ReapError> for NonoError {
     fn from(err: ReapError) -> Self {
         Self::Lifecycle(LifecycleError::Reap(err))
+    }
+}
+
+impl From<CleanupError> for NonoError {
+    fn from(err: CleanupError) -> Self {
+        Self::Lifecycle(LifecycleError::Cleanup(err))
     }
 }
 

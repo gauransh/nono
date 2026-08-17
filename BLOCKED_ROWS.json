@@ -1,6 +1,6 @@
 {
   "run_id": "EF1A07E7-A38C-4C5E-98CA-9444CA7CFD5C",
-  "updated": "2026-08-17 (iteration 4)",
+  "updated": "2026-08-17 (iteration 5)",
   "legend": {
     "PASS": "verified green on this stream's gate matrix",
     "FAIL": "verified failing right now",
@@ -83,8 +83,8 @@
     {
       "row": "R11",
       "title": "Cleanup verification generation/PID-reuse safe",
-      "status": "TODO",
-      "evidence": "PID+start-time liveness exists (session.rs:469-573) but result is bool (unknown collapses to not-alive); run_stop SIGKILL path treats signal as proof (session_commands.rs:245-292); cgroup teardown verification swallowed into warn!; no boot_id; no typed ConfirmedAbsent/StillPresent/Indeterminate/Unsupported.",
+      "status": "IN_PROGRESS",
+      "evidence": "Iteration 5 (delta F6): typed CleanupVerification landed (ConfirmedAbsent{basis}/StillPresent{survivors}/Indeterminate{reason}/Unsupported{reason}, closed enum, typed evidence payloads; a sent signal is never a basis). Child leads its own process group (setpgid(0,0) in the trusted pre-exec sequence; failure = typed PreExecStage::ProcessGroup), so a reaped run probes kill(-pgid,0) and an unobserved death probes pid+start_time+boot_id. PID-reuse safe: alive-but-different start time => ConfirmedAbsent{IdentityMismatch}; boot change => ConfirmedAbsent{BootIdChanged} (checked before any probe); unreadable start time => Indeterminate, never a proof of absence; targets <= 1 refused before the syscall. Only ConfirmedAbsent records CleanupConfirmed; duplicate verification refused by the state machine. ActivatedSandbox::stop kills the group (and the child pid, for a setsid escapee) and reports the waitpid observation; StopError::SignalFailed is typed. Live-proven on macOS: verify-after-exit, honest StillPresent for a backgrounded grandchild then ConfirmedAbsent after the consumer kills the group, stop()-then-verify, stopped-before-activation verify; removing setpgid makes the survivor test report ConfirmedAbsent while /bin/sleep 30 still runs. 17 unit + 5 live tests. Pending: recovered-session verification (needs the durable store, R09); Linux verification (R07 blocker); documented dark spot - a descendant that calls setsid leaves the group (needs a cgroup-class mechanism).",
       "blocker": null
     },
     {

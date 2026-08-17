@@ -309,6 +309,20 @@ pub enum StopError {
         state: LifecycleState,
     },
 
+    /// The stop signal could not be delivered, so nothing was killed and
+    /// nothing is claimed about the run's processes.
+    ///
+    /// Reported rather than swallowed: a stop that could not signal is not a
+    /// stop, and continuing to the reap would block on a process nothing had
+    /// asked to die.
+    #[error("stop signal could not be delivered to {target}: errno {errno}")]
+    SignalFailed {
+        /// The pid or process group the signal was aimed at.
+        target: i32,
+        /// Platform error number from the signal.
+        errno: i32,
+    },
+
     /// The stop was requested but the child's death was never observed. A sent
     /// signal is not proof, so this is a failure, not a stop.
     #[error(transparent)]

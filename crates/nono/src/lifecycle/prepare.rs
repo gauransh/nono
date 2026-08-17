@@ -9,21 +9,46 @@
 //! # The child's sequence
 //!
 //! 1. close the parent's end of both channels
-//! 2. apply the platform sandbox to itself
-//! 3. close every other inherited descriptor
-//! 4. write the "at the gate" record to the status descriptor
-//! 5. block in `read()` on the gate descriptor
-//! 6. on the release message: enter the working directory, then `execve`
+//! 2. become the leader of a new process group
+//! 3. apply the platform sandbox to itself
+//! 4. close every other inherited descriptor
+//! 5. write the "at the gate" record to the status descriptor
+//! 6. block in `read()` on the gate descriptor
+//! 7. on the release message: enter the working directory, then `execve`
 //!
 //! Any failure writes a fixed-size record to the status descriptor and exits.
-//! Nothing between step 2 and `execve` runs unconfined, and the customer's
-//! program never runs at all unless step 5 produced the release message.
+//! Nothing between step 3 and `execve` runs unconfined, and the customer's
+//! program never runs at all unless step 6 produced the release message.
 //!
-//! Step 3 sits after the sandbox apply rather than before it because on Linux
+//! Step 4 sits after the sandbox apply rather than before it because on Linux
 //! the prepared Landlock ruleset *is* a set of open path descriptors, and
-//! `apply_raw` needs them. It sits before step 4 so that by the time `prepare`
+//! `apply_raw` needs them. It sits before step 5 so that by the time `prepare`
 //! returns, the held child holds nothing but its own two channel ends — see
 //! below.
+//!
+//! # The run is a process group, not a process
+//!
+//! Step 2 is `setpgid(0, 0)`: the child becomes the leader of a new process
+//! group whose id is its own pid. Everything the customer's program forks
+//! inherits that group, so a stop can signal the whole run
+//! ([`super::ActivatedSandbox::stop`]) and cleanup verification has a *set* to
+//! probe rather than a single pid that `waitpid` already consumed
+//! ([`super::CleanupVerification`]).
+//!
+//! Two consequences, both deliberate and neither hidden:
+//!
+//! - **A descendant that calls `setsid` — or `setpgid` on itself — leaves the
+//!   group and stops being visible to either mechanism.** Nothing in POSIX
+//!   prevents that, and no bookkeeping the parent does can follow it. It is a
+//!   dark spot of this design, not an oversight: a stop reports what it
+//!   signalled, and verification reports what it could still see, so an escapee
+//!   shows up as neither killed nor confirmed absent rather than as a silent
+//!   success. Closing it needs a container-level mechanism (a cgroup on Linux, a
+//!   job object equivalent elsewhere), which this slice does not build.
+//! - **The run is no longer in the supervisor's own process group**, so a
+//!   terminal's Ctrl-C — which signals the foreground *group* — no longer
+//!   reaches the customer's program by accident. A consumer that wants that
+//!   behaviour forwards the signal deliberately.
 //!
 //! # Descriptors
 //!
@@ -78,6 +103,7 @@
 //! program returns, and reading it back would mislabel that program's own exit.
 //! See [`super::exit`].
 
+use super::cleanup::{CleanupError, CleanupVerification, DeathObservation, verify_and_record};
 use super::events::{EventSink, LifecycleEvent, Observation};
 use super::exit::{
     ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
@@ -226,6 +252,16 @@ pub struct PreparedSandbox {
     session_id: Uuid,
     generation: u64,
     identity: ProcessIdentity,
+    /// The process group the child leads.
+    ///
+    /// Equal to the child's pid by construction: the child calls
+    /// `setpgid(0, 0)` before anything else, so the group id *is* that pid.
+    /// Recorded here rather than re-derived later because a reaped pid is a
+    /// number the kernel may reissue, while the group this run used is a fact
+    /// about the run. It is a *fact* by the time `prepare` returns: the child
+    /// writes its "at the gate" record only after the call succeeded, and a
+    /// failure kills the child with [`PreExecStage::ProcessGroup`] instead.
+    process_group: i32,
     /// The state and the one-shot gate write, behind one lock. Held by value
     /// rather than shared today — nothing else has a reference to this run —
     /// but every operation goes through `&self`, so the durable supervisor can
@@ -324,6 +360,10 @@ impl PreparedSandbox {
                     session_id,
                     generation: FIRST_GENERATION,
                     identity: ProcessIdentity::capture(child.as_raw()),
+                    // The child makes this true with `setpgid(0, 0)`; the
+                    // "at the gate" record the parent waits for below is what
+                    // confirms it did.
+                    process_group: child.as_raw(),
                     shared: SharedLifecycle::new(state),
                     gate: Some(gate_write),
                     status: Some(status_read),
@@ -504,6 +544,7 @@ impl PreparedSandbox {
                 self.zeroize_secrets();
                 Ok(ActivatedSandbox::new(
                     self.identity.clone(),
+                    self.process_group,
                     self.shared.state(),
                     ActivationObservation::ExecOrKilledPreExec,
                     self.event_sink.clone(),
@@ -553,6 +594,45 @@ impl PreparedSandbox {
         );
         self.last_exit = Some(exit.clone());
         Ok(exit)
+    }
+
+    /// Prove the child and everything it started are gone — or report honestly
+    /// that they are not.
+    ///
+    /// Legal only once the run's end has been observed here: after
+    /// [`Self::stop_before_activation`], or after a failure that ended the run
+    /// on this handle. A run that was successfully activated belongs to the
+    /// [`ActivatedSandbox`] and is verified there; this handle refuses, naming
+    /// the state it is frozen in.
+    ///
+    /// Which question is asked depends on what was observed. When the child was
+    /// reaped, `waitpid` already proved the child itself gone and the probe asks
+    /// about its process group. When the death was never observed — a stop whose
+    /// reap failed — the probe asks about the recorded identity instead, so a
+    /// reissued pid cannot pass as a survivor or as a proof of absence.
+    ///
+    /// Only [`CleanupVerification::ConfirmedAbsent`] moves the run to
+    /// [`LifecycleState::CleanupVerified`].
+    ///
+    /// # Errors
+    ///
+    /// [`CleanupError`] naming the state that refused: the run has not ended
+    /// here, or its cleanup was already verified.
+    pub fn verify_cleanup(&mut self) -> Result<CleanupVerification, CleanupError> {
+        // `child_owned` is exactly "we still hold an unreaped child": every
+        // path that reaps clears it, and the handoff to an `ActivatedSandbox`
+        // clears it too (that handle is then the one with a death to observe).
+        let death = if self.child_owned {
+            DeathObservation::NotReaped
+        } else {
+            DeathObservation::Reaped
+        };
+        let (verification, change) =
+            verify_and_record(&self.shared, &self.identity, self.process_group, death)?;
+        if let Some(change) = change {
+            self.report(change);
+        }
+        Ok(verification)
     }
 
     /// Apply an observed fact, recording it and telling the sink.
@@ -1019,6 +1099,25 @@ fn child_main(context: &ChildContext<'_>) -> ! {
     unsafe {
         libc::close(context.gate_write);
         libc::close(context.status_read);
+    }
+
+    // Lead a new process group, whose id is this child's own pid — the number
+    // the parent recorded at fork. Everything the customer's program forks
+    // lands in it, which is what makes a stop reach the whole run and gives
+    // cleanup verification a group to probe after `waitpid` has consumed the
+    // pid. Before the sandbox apply, so a policy that refuses the call fails
+    // here with its own stage rather than being mistaken for a sandbox
+    // failure; before the gate wait, so the group exists for the whole run.
+    // SAFETY: `setpgid` takes two integers, touches no memory, and is
+    // async-signal-safe. `(0, 0)` names "this process" and "a new group of its
+    // own"; a non-zero return is a plain failure with `errno` set, which the
+    // record written below carries.
+    if unsafe { libc::setpgid(0, 0) } != 0 {
+        child_fail(
+            context.status_write,
+            PreExecStage::ProcessGroup,
+            last_errno(),
+        );
     }
 
     if let Err((stage, errno)) = context.sandbox.apply_in_child() {

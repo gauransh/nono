@@ -263,7 +263,8 @@ impl NonoError {
                 crate::lifecycle::LifecycleError::Transition(_)
                 | crate::lifecycle::LifecycleError::Activation(_)
                 | crate::lifecycle::LifecycleError::Stop(_)
-                | crate::lifecycle::LifecycleError::Reap(_),
+                | crate::lifecycle::LifecycleError::Reap(_)
+                | crate::lifecycle::LifecycleError::Cleanup(_),
             ) => NonoDiagnosticCode::Other,
             Self::Io(_) | Self::CommandExecution(_) => NonoDiagnosticCode::IoError,
             Self::ConfigParse(_)

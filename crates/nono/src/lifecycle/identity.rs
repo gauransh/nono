@@ -53,6 +53,21 @@ impl ProcessIdentity {
         }
     }
 
+    /// Build an identity from parts, for tests that need one the platform
+    /// would never hand out — a reissued pid, an unrecorded start time, an
+    /// earlier boot.
+    ///
+    /// Test-only: outside tests an identity is always *captured*, so that
+    /// nothing can claim a fact the kernel did not supply.
+    #[cfg(test)]
+    pub(crate) fn from_parts(pid: i32, start_time: Option<u64>, boot_id: Option<String>) -> Self {
+        Self {
+            pid,
+            start_time,
+            boot_id,
+        }
+    }
+
     /// The recorded pid.
     #[must_use]
     pub fn pid(&self) -> i32 {
@@ -140,7 +155,7 @@ pub(crate) fn process_start_time(_pid: i32) -> Option<u64> {
 
 /// The identifier of the current boot, or `None` if the platform will not say.
 #[cfg(target_os = "linux")]
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -155,7 +170,7 @@ fn boot_id() -> Option<String> {
 /// equivalent — the wall-clock instant the kernel started, which changes on
 /// every boot.
 #[cfg(target_os = "macos")]
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     let mut boottime = libc::timeval {
         tv_sec: 0,
         tv_usec: 0,
@@ -182,7 +197,7 @@ fn boot_id() -> Option<String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     None
 }
 
