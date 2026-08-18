@@ -2380,6 +2380,21 @@ pub fn install_seccomp_block_network() -> Result<()> {
     install_static_network_filter(StaticNetworkFilter::BlockAll, "network block")
 }
 
+/// Install the block-all network filter without allocating or formatting.
+///
+/// Same program as [`install_seccomp_block_network`], reported as a
+/// [`RawSandboxError`] instead of a `NonoError`: the message that type carries
+/// is built with `format!`, which a forked pre-exec child must not run. The
+/// filter itself is a fixed-size array built on the stack, and the two
+/// syscalls take integers and a pointer to it, so the whole call is
+/// async-signal-safe.
+///
+/// `PR_SET_NO_NEW_PRIVS` is set by the installer, so this does not depend on a
+/// Landlock apply having already set it.
+pub(crate) fn install_seccomp_block_network_raw() -> std::result::Result<(), RawSandboxError> {
+    install_static_network_filter_raw(StaticNetworkFilter::BlockAll)
+}
+
 fn install_seccomp_tcp_only_network() -> Result<()> {
     install_static_network_filter(StaticNetworkFilter::TcpOnly, "TCP-only network baseline")
 }

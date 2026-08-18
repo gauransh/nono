@@ -308,24 +308,24 @@ impl std::fmt::Display for ProbeIndeterminate {
 
 /// Which kernel facility the answer came from.
 ///
-/// One value per platform on this path, because the lifecycle installs exactly
-/// one policy per platform: [`Self::Seatbelt`] on macOS, where
+/// One value per platform on this path: [`Self::Seatbelt`] on macOS, where
 /// `sandbox_init` is the only call made; [`Self::Landlock`] on Linux, where the
 /// ruleset is what expresses the plan's filesystem, exec, and — on ABI V4 and
 /// above — TCP port rights.
 ///
 /// [`Self::Seccomp`] and [`Self::SeccompUserNotify`] exist in this vocabulary
 /// but are never reported by a pre-activation probe, and the reason is worth
-/// stating rather than leaving to inference. The lifecycle's seccomp layer is a
-/// baseline that refuses to *create* socket families the policy excludes; a
-/// probe whose `socket(2)` is refused never reaches its `connect(2)`, so it is
-/// reported as [`ProbeIndeterminate::ProbeCouldNotRun`] and not as a refusal.
-/// Proxy-only mediation — the one arrangement that would install a
-/// user-notification listener — is refused outright at prepare time by
-/// `refuse_unsupported_fallback` in [`super::prepare`], so no held child on
-/// this path has one. This label therefore names the mechanism that expresses
-/// the operation in the installed ruleset; the kernel offers no per-syscall
-/// attribution and none is invented here.
+/// stating rather than leaving to inference. A Linux child can carry *two*
+/// layers at once: the Landlock ruleset, and — for a policy that blocks the
+/// network outright — a static seccomp filter that refuses to create the
+/// socket families the ruleset has no vocabulary for, UDP among them. Both
+/// answer with the same `EPERM`/`EACCES` and the kernel offers no per-syscall
+/// attribution, so this label names the mechanism that expresses the plan's
+/// rights, not the layer that happened to answer; guessing between them is
+/// exactly what this module refuses to do. Proxy-only mediation — the one
+/// arrangement that would install a user-notification listener — is refused
+/// outright at prepare time by `refuse_unsupported_fallback` in
+/// [`super::prepare`], so no held child on this path has one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementMechanism {
@@ -875,8 +875,19 @@ fn stat_probe(path: *const c_char) -> (u8, i32) {
 ///
 /// The `socket(2)` that has to come first is setup, not the operation under
 /// question, so a failure there is reported as
-/// [`ProbeIndeterminate::ProbeCouldNotRun`] rather than as a refusal of the
-/// connect that never happened.
+/// [`ProbeIndeterminate::ProbeCouldNotRun`] — `EMFILE`, `EAFNOSUPPORT` and the
+/// rest say nothing about enforcement — with one exception, and it is the
+/// exception this module exists for.
+///
+/// **A permission denial on the socket itself is a refusal.** On Linux a
+/// `block_network()` policy is enforced by a seccomp filter that answers
+/// `EPERM` to `socket(2)`, so the connect the caller asked about is refused
+/// *before* there is anything to attempt it on. Calling that "the probe could
+/// not run" would file a refusal that demonstrably happened as a shrug, and
+/// would make an enforced policy indistinguishable from an absent one. So the
+/// same rule applies here as everywhere else in this module: `EPERM`/`EACCES`
+/// is [`ProbeOutcome::Refused`], every other number is indeterminate. See
+/// [`classify_errno`].
 fn unix_connect_probe(path: *const c_char) -> (u8, i32) {
     let mut addr = zeroed_sockaddr_un();
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
@@ -891,7 +902,7 @@ fn unix_connect_probe(path: *const c_char) -> (u8, i32) {
 
     let fd = match open_socket(libc::AF_UNIX, libc::SOCK_STREAM) {
         Ok(fd) => fd,
-        Err(errno) => return (TAG_PROBE_COULD_NOT_RUN, errno),
+        Err(errno) => return classify_errno(errno),
     };
     // SAFETY: `fd` is a live socket this process owns, and the address is a
     // fully-initialised `sockaddr_un` in this frame.
@@ -955,6 +966,11 @@ fn socket_probe(wire: &ProbeWire, op: u8, protocol_tag: u8) -> (u8, i32) {
 }
 
 /// Create the socket, attempt the one operation, and close it again.
+///
+/// A socket the enforcement would not let the child create is a refusal of the
+/// operation that needed it, not a probe that could not run — see
+/// [`unix_connect_probe`] for why that distinction is the one this module is
+/// for. Every other `socket(2)` failure stays indeterminate.
 fn attempt_socket_op(
     domain: libc::c_int,
     socket_type: libc::c_int,
@@ -964,7 +980,7 @@ fn attempt_socket_op(
 ) -> (u8, i32) {
     let fd = match open_socket(domain, socket_type) {
         Ok(fd) => fd,
-        Err(errno) => return (TAG_PROBE_COULD_NOT_RUN, errno),
+        Err(errno) => return classify_errno(errno),
     };
     let answer = if op == OP_CONNECT {
         // SAFETY: `fd` is a live socket this process owns and `addr`/`length`
@@ -1843,6 +1859,51 @@ mod live {
                 addr: unreachable,
             },
         ));
+    }
+
+    /// The removal detector for the child's seccomp step.
+    ///
+    /// A datagram socket is the one network question Landlock cannot be asked:
+    /// its network rights are `LANDLOCK_ACCESS_NET_CONNECT_TCP` and
+    /// `LANDLOCK_ACCESS_NET_BIND_TCP` and there is no third. So on a kernel
+    /// whose Landlock *does* support networking — every kernel this is
+    /// expected to run on — a refusal here cannot have come from the ruleset.
+    /// It can only have come from the static seccomp filter
+    /// [`super::super::prepare::PlatformSandbox::apply_in_child`] installs,
+    /// which is why this test goes red the moment that step is dropped and why
+    /// it asserts the filter's own number rather than "either of the two".
+    ///
+    /// Linux-only on purpose: on macOS the same probe is refused by Seatbelt's
+    /// `(deny network*)`, which proves nothing about this step. That half is
+    /// covered by `a_blocked_network_refuses_what_an_open_one_permits`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn udp_is_refused_by_something_landlock_could_not_have_expressed() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        let dir = temp_dir();
+        let blocked = held(capabilities(dir.path()).block_network());
+        let observed = probe(
+            &blocked,
+            "udp-datagram",
+            ProbeOp::Connect {
+                protocol: TransportProtocol::Udp,
+                addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            },
+        );
+
+        match observed.outcome {
+            ProbeOutcome::Refused { errno } => assert_eq!(
+                errno,
+                libc::EPERM,
+                "the seccomp filter answers EPERM; EACCES would mean Landlock, \
+                 which has no datagram right to refuse with"
+            ),
+            other => panic!(
+                "a datagram socket in a block-network child must be refused, got {other:?} \
+                 — a permitted one means the child is carrying Landlock and nothing else"
+            ),
+        }
     }
 
     #[test]

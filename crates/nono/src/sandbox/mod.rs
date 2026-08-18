@@ -40,6 +40,13 @@ pub use linux::is_wsl2;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::abi_version_number;
 
+// The Linux pieces the lifecycle needs to install the block-all network
+// filter in a forked pre-exec child: the decision is made in the parent from
+// the capability set, the install happens in the child with raw syscalls.
+// Crate-internal — the public API stays `Sandbox::apply_auto`.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{install_seccomp_block_network_raw, seccomp_network_fallback_mode};
+
 // Re-export Linux seccomp-notify primitives for supervisor use
 #[cfg(target_os = "linux")]
 pub use linux::{

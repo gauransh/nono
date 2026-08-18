@@ -79,6 +79,13 @@ pub enum PreExecStage {
     /// Applying the platform sandbox to the child itself failed. Nothing ran
     /// unconfined: the child died instead.
     SandboxApply,
+    /// Installing the seccomp network filter failed, so a policy that asked
+    /// for the network to be blocked would have run with it open. Linux only:
+    /// it is the step that denies the socket families Landlock cannot express
+    /// — UDP among them — and a policy enforced only as far as Landlock
+    /// reaches is not the policy the caller asked for. The child dies here
+    /// rather than run partially confined.
+    NetworkFilter,
     /// Reading the gate descriptor failed for a reason other than EOF.
     GateWait,
     /// The gate reached EOF before a release message arrived: every writer is
@@ -107,6 +114,7 @@ impl PreExecStage {
             Self::ProcessGroup => "process_group",
             Self::ControllingTerminal => "controlling_terminal",
             Self::SandboxApply => "sandbox_apply",
+            Self::NetworkFilter => "network_filter",
             Self::GateWait => "gate_wait",
             Self::GateClosed => "gate_closed",
             Self::GateAborted => "gate_aborted",
@@ -142,6 +150,10 @@ impl PreExecStage {
             // existing tags are contract. So the numbers no longer read in
             // sequence order, and `as_tag` is the only place that matters.
             Self::ControllingTerminal => 0x17,
+            // Appended for the same reason: this stage runs immediately after
+            // `SandboxApply`, whose 0x10 neighbourhood is long since spoken
+            // for.
+            Self::NetworkFilter => 0x18,
             Self::Unknown => 0xFF,
         }
     }
@@ -160,6 +172,7 @@ impl PreExecStage {
             0x15 => Self::WorkingDirectory,
             0x16 => Self::Exec,
             0x17 => Self::ControllingTerminal,
+            0x18 => Self::NetworkFilter,
             _ => Self::Unknown,
         }
     }
@@ -275,7 +288,10 @@ pub enum ExitOutcome {
     /// The child could not apply its own sandbox and died instead of running
     /// unconfined.
     SandboxApplicationFailure {
-        /// Always [`PreExecStage::SandboxApply`]; carried so the two failure
+        /// Which step of the confinement did not go on:
+        /// [`PreExecStage::SandboxApply`] for the platform sandbox itself, or
+        /// [`PreExecStage::NetworkFilter`] for the seccomp network filter that
+        /// covers what Landlock cannot express. Carried so the two failure
         /// outcomes read alike.
         stage: PreExecStage,
         /// Platform error number. On macOS this is `sandbox_init`'s non-zero
@@ -846,10 +862,11 @@ pub(crate) fn kill_pid(pid: i32) -> Result<(), i32> {
 mod tests {
     use super::*;
 
-    const ALL_STAGES: [PreExecStage; 10] = [
+    const ALL_STAGES: [PreExecStage; 11] = [
         PreExecStage::ProcessGroup,
         PreExecStage::ControllingTerminal,
         PreExecStage::SandboxApply,
+        PreExecStage::NetworkFilter,
         PreExecStage::GateWait,
         PreExecStage::GateClosed,
         PreExecStage::GateAborted,

@@ -1286,11 +1286,7 @@ impl PreparedSandbox {
 
     /// Record a prepare-time child failure and name it.
     fn fail_prepare(&mut self, stage: PreExecStage, errno: i32) -> PrepareError {
-        let outcome = if stage == PreExecStage::SandboxApply {
-            ExitOutcome::SandboxApplicationFailure { stage, errno }
-        } else {
-            ExitOutcome::PreExecFailure { stage, errno }
-        };
+        let outcome = prepare_outcome(stage, errno);
         // The child's own record is how its death was observed here, so the
         // fact is reported before the transition it causes.
         self.events
@@ -2047,6 +2043,30 @@ fn classify_prepare_record(
     }
 }
 
+/// What a stage reported during `prepare` is, as an outcome.
+///
+/// Two stages mean the same thing — the confinement was never established, so
+/// nothing ran unconfined — and they are reported alike. Everything else is an
+/// ordinary pre-exec ending. Filing a refused network filter under
+/// [`ExitOutcome::PreExecFailure`] would hand the consumer a "your
+/// configuration is malformed" diagnostic for a security mechanism that did
+/// not go on.
+///
+/// Split out from [`PreparedSandbox::fail_prepare`] because no test can make
+/// the kernel refuse `seccomp(2)` for one child on demand, while the record
+/// such a child writes is fixed and what the parent must make of it is a pure
+/// function.
+fn prepare_outcome(stage: PreExecStage, errno: i32) -> ExitOutcome {
+    if matches!(
+        stage,
+        PreExecStage::SandboxApply | PreExecStage::NetworkFilter
+    ) {
+        ExitOutcome::SandboxApplicationFailure { stage, errno }
+    } else {
+        ExitOutcome::PreExecFailure { stage, errno }
+    }
+}
+
 /// Write one piece of a probe exchange, or say the child is gone.
 ///
 /// `write_all` is what handles a short write on a record larger than the pipe's
@@ -2100,6 +2120,14 @@ fn read_status_record<R: Read>(mut status: R) -> Result<Option<(u8, i32)>, i32> 
 /// prepared policy anyway would leave those syscalls unmediated — a policy the
 /// caller asked for, silently not enforced. Refusing is the fail-closed answer.
 #[cfg(target_os = "linux")]
+/// Refuse a policy this lifecycle cannot actually enforce.
+///
+/// Takes the mode the *capability set* asks for — via
+/// [`seccomp_network_fallback_mode`][m] — never a value derived from what the
+/// running kernel happens to support. A refusal that varies with the host is
+/// not a refusal; it is a silent downgrade on the hosts that lack the check.
+///
+/// [m]: crate::sandbox::seccomp_network_fallback_mode
 fn refuse_unsupported_fallback(
     fallback: &crate::sandbox::SeccompNetFallback,
 ) -> Result<(), PrepareError> {
@@ -2116,10 +2144,39 @@ fn refuse_unsupported_fallback(
     Ok(())
 }
 
+/// Whether this policy needs the block-all seccomp network filter.
+///
+/// Landlock is a filesystem-and-TCP mechanism: it has no vocabulary for UDP,
+/// for raw sockets, or for any other address family, so a kernel that supports
+/// [`AccessNet`][net] enforces a `block_network()` policy only as far as TCP
+/// connect and bind. Everything else stays open, which is the difference
+/// between a network that is blocked and a network that merely refuses two
+/// syscalls.
+///
+/// `BlockAll` is the one fallback mode the static filter expresses exactly —
+/// no supervisor, no notify descriptor, no per-call decision — so it is the
+/// one this decides on. `ProxyOnly` is refused earlier by
+/// [`refuse_unsupported_fallback`], and `None` (which includes every
+/// `AllowAll` policy and every blocked policy carrying port exceptions) gets
+/// no filter: installing one there would deny sockets the caller never asked
+/// to give up.
+///
+/// [net]: https://docs.kernel.org/userspace-api/landlock.html
+#[cfg(target_os = "linux")]
+fn needs_network_filter(caps: &crate::CapabilitySet) -> bool {
+    matches!(
+        crate::sandbox::seccomp_network_fallback_mode(caps),
+        crate::sandbox::SeccompNetFallback::BlockAll
+    )
+}
+
 /// The platform policy, fully built in the parent.
 #[cfg(target_os = "linux")]
 pub(super) struct PlatformSandbox {
     prepared: crate::sandbox::PreparedLandlockSandbox,
+    /// Decided here, in the parent, from the capability set — see
+    /// [`needs_network_filter`]. The child only reads the answer.
+    network_filter: bool,
 }
 
 /// The platform policy, fully built in the parent.
@@ -2152,8 +2209,21 @@ impl PlatformSandbox {
         .map_err(|err| PrepareError::SandboxSpec {
             reason: err.to_string(),
         })?;
-        refuse_unsupported_fallback(prepared.fallback())?;
-        Ok(Self { prepared })
+        // Asked about what the POLICY requested, not about `prepared.fallback()`.
+        // `prepare_with_abi_inner` assigns that field only when the kernel's
+        // Landlock ABI carries no network rights at all; on ABI V4 and above it
+        // stays `None`, so passing it here meant a proxy-only plan was never
+        // refused on a modern kernel — it was accepted and enforced by Landlock
+        // port rules alone, with no supervisor, no notify descriptor and no UDP
+        // restriction. What the caller asked for does not change with the
+        // kernel, so neither should the refusal.
+        refuse_unsupported_fallback(&crate::sandbox::seccomp_network_fallback_mode(
+            plan.capabilities(),
+        ))?;
+        Ok(Self {
+            prepared,
+            network_filter: needs_network_filter(plan.capabilities()),
+        })
     }
 
     /// Build the policy from the plan's capabilities.
@@ -2182,14 +2252,50 @@ impl PlatformSandbox {
     /// Apply the policy to the calling (child) process.
     ///
     /// Allocation-free on Linux: the ruleset descriptors and rule vectors were
-    /// built in the parent and are applied with raw syscalls.
+    /// built in the parent and are applied with raw syscalls. The seccomp
+    /// program is a fixed-size array built on the child's own stack, which is
+    /// the only shape a post-`fork` caller may build one in.
+    ///
+    /// **Two mechanisms, in this order.** Landlock first, then the filter:
+    ///
+    /// - `seccomp(SET_MODE_FILTER)` needs `CAP_SYS_ADMIN` or
+    ///   `PR_SET_NO_NEW_PRIVS`, and `apply_raw` sets no-new-privs before
+    ///   `landlock_restrict_self` — but the installer sets it again itself, so
+    ///   the order is not what makes the install legal, and reversing it would
+    ///   not break that.
+    /// - What the order does buy: the Landlock syscalls run before any filter
+    ///   of ours can mediate them. Today's program traps only `socket`,
+    ///   `socketpair`, and `io_uring_setup`, so it would not touch them either
+    ///   way; keeping the sequence in this order makes that a property of the
+    ///   sequence rather than of the program's current contents.
+    /// - It also matches [`PreparedLandlockSandbox::apply_raw`][raw], which
+    ///   installs its own static filter last for the same reason.
+    ///
+    /// Neither step degrades: a failure at either one returns, and the caller
+    /// ([`child_main`]) writes the record and `_exit`s. The child never reaches
+    /// the gate, so it can never be released, so the customer's program never
+    /// runs with half a policy.
+    ///
+    /// [raw]: crate::sandbox::PreparedLandlockSandbox::apply_raw
     #[cfg(target_os = "linux")]
     pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
         // The Landlock sub-stage (create/add-rule/restrict) is not carried in
         // the fixed-size record; the errno is.
         self.prepared
             .apply_raw()
-            .map_err(|err| (PreExecStage::SandboxApply, err.errno()))
+            .map_err(|err| (PreExecStage::SandboxApply, err.errno()))?;
+        if self.network_filter {
+            // On a kernel whose Landlock has no network support the prepared
+            // policy installs this same program itself, so the child ends up
+            // with two identical filters. That is deliberate: they are a few
+            // instructions each and both answer EPERM, whereas skipping this
+            // one on the strength of what the other module decided would make
+            // the enforcement depend on an inference instead of on the
+            // capability set.
+            crate::sandbox::install_seccomp_block_network_raw()
+                .map_err(|err| (PreExecStage::NetworkFilter, err.errno()))?;
+        }
+        Ok(())
     }
 
     /// Apply the policy to the calling (child) process.
@@ -2477,6 +2583,162 @@ mod tests {
         assert_eq!(
             refuse_unsupported_fallback(&SeccompNetFallback::BlockAll),
             Ok(())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proxy_only_policy_is_refused_by_build_not_merely_by_the_helper() {
+        use crate::capability::CapabilitySet;
+
+        // `a_policy_needing_a_supervisor_we_do_not_run_is_refused` calls
+        // `refuse_unsupported_fallback` directly with a synthetic value, so it
+        // proves the helper refuses `ProxyOnly` — not that anything ever asks
+        // it about a proxy-only plan. That gap was real: `build` passed
+        // `prepared.fallback()`, which `prepare_with_abi_inner` assigns only
+        // when the kernel's Landlock ABI provides no network rights at all.
+        // On ABI V4 and above it stays `None`, so the refusal never fired and
+        // a proxy-only policy was accepted and enforced by Landlock port rules
+        // alone: no supervisor, no notify descriptor, no UDP restriction. The
+        // caller asked for mediated networking and silently got something
+        // weaker, on precisely the kernels most likely to run this.
+        //
+        // The refusal must therefore be driven by what the policy asked for,
+        // which is ABI-independent, and this test goes through `build` so it
+        // cannot pass on a helper nobody consults.
+        let plan = sealed(
+            SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new().proxy_only(8080)),
+        );
+        match PlatformSandbox::build(&plan) {
+            Err(PrepareError::SandboxSpec { reason }) => assert!(
+                reason.contains("proxy-only"),
+                "the refusal must name what it refused: {reason}"
+            ),
+            Err(other) => panic!("refused, but for the wrong reason: {other:?}"),
+            Ok(_) => panic!("a proxy-only plan must be refused by build, but it was accepted"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_policy_that_blocks_the_network_is_not_applied_by_landlock_alone() {
+        use crate::capability::CapabilitySet;
+
+        // The gap this closes. Landlock has no vocabulary for UDP, for raw
+        // sockets, or for any family but TCP, so a kernel that supports
+        // `AccessNet` enforces `block_network()` as far as TCP connect and
+        // bind and no further. A held child carrying only the ruleset would
+        // report "network blocked" and still send datagrams.
+        assert!(
+            needs_network_filter(&CapabilitySet::new().block_network()),
+            "a blocked network must arm the filter"
+        );
+
+        // And it is armed in the built policy, not merely computable from the
+        // capability set: this is the field `apply_in_child` reads. Removing
+        // the seccomp step from that path leaves this true and the live UDP
+        // probe in `super::probe` red — the two tests fail at different ends
+        // of the same wire on purpose.
+        let plan = sealed(
+            SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new().block_network()),
+        );
+        match PlatformSandbox::build(&plan) {
+            Ok(sandbox) => assert!(
+                sandbox.network_filter,
+                "the built policy must carry the filter step"
+            ),
+            Err(err) => panic!("a block-network plan must build: {err}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_policy_that_did_not_ask_for_the_filter_does_not_get_one() {
+        use crate::capability::CapabilitySet;
+
+        // A filter nobody asked for is a capability silently taken away, which
+        // is the same class of error as one silently left in place.
+        assert!(
+            !needs_network_filter(&CapabilitySet::new()),
+            "an open policy must not be filtered"
+        );
+
+        // Blocked *with* port exceptions is not `BlockAll`: the static program
+        // cannot express "no sockets except these ports", so installing it
+        // would deny the ports the caller was granted. Landlock's V4 port
+        // allowlist is what enforces this policy, and what it does not cover
+        // (UDP, raw, other families) stays uncovered — see the report on this
+        // change.
+        let with_ports = CapabilitySet::new().block_network().allow_tcp_connect(443);
+        assert!(
+            !needs_network_filter(&with_ports),
+            "a port exception is not a block-all"
+        );
+
+        let plan = sealed(SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new()));
+        match PlatformSandbox::build(&plan) {
+            Ok(sandbox) => assert!(
+                !sandbox.network_filter,
+                "an open policy must build without the filter step"
+            ),
+            Err(err) => panic!("an open plan must build: {err}"),
+        }
+    }
+
+    #[test]
+    fn a_filter_that_could_not_be_installed_is_a_failed_confinement() {
+        // The child half of this cannot be simulated: making the install fail
+        // needs a kernel that refuses `seccomp(2)` for one process, and no
+        // scaffolding here can arrange that. What is testable is everything
+        // the parent does with the record such a child writes, and the first
+        // thing is that it is not a success — `prepare` returns the failure
+        // instead of a `PreparedSandbox`, so the gate is never opened and the
+        // program never runs.
+        assert_eq!(
+            classify_prepare_record(Ok(Some((
+                PreExecStage::NetworkFilter.as_tag(),
+                libc::EPERM
+            )))),
+            Err((PreExecStage::NetworkFilter, libc::EPERM))
+        );
+
+        // And it is reported as confinement that was never established, not as
+        // a malformed configuration — the same outcome a failed Landlock apply
+        // gets, because it is the same fact.
+        assert_eq!(
+            prepare_outcome(PreExecStage::NetworkFilter, libc::EPERM),
+            ExitOutcome::SandboxApplicationFailure {
+                stage: PreExecStage::NetworkFilter,
+                errno: libc::EPERM,
+            }
+        );
+        assert_eq!(
+            prepare_outcome(PreExecStage::SandboxApply, libc::ENOSYS),
+            ExitOutcome::SandboxApplicationFailure {
+                stage: PreExecStage::SandboxApply,
+                errno: libc::ENOSYS,
+            }
+        );
+        // A stage that is not about the confinement keeps the other outcome.
+        assert_eq!(
+            prepare_outcome(PreExecStage::GateAborted, 0),
+            ExitOutcome::PreExecFailure {
+                stage: PreExecStage::GateAborted,
+                errno: 0,
+            }
+        );
+
+        // Which the consumer sees as a sandbox failure rather than "your
+        // configuration is malformed".
+        let exit = SandboxExit::new(
+            prepare_outcome(PreExecStage::NetworkFilter, libc::EPERM),
+            ActivationObservation::NotActivated,
+            ProcessIdentity::capture(0),
+        );
+        let err: crate::NonoError = PrepareError::ChildFailed { exit }.into();
+        assert_eq!(
+            err.diagnostic_code(),
+            crate::diagnostic::NonoDiagnosticCode::SandboxDeniedPath
         );
     }
 
