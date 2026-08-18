@@ -5108,10 +5108,16 @@ mod tests {
 
     #[test]
     fn prepared_notify_filters_own_their_bpf_storage() {
+        // Lengths are expressed as prologue + body rather than as literals. Both
+        // programs begin with the 6-instruction architecture guard, and stating
+        // that relationship is what makes a future guard change show up here as a
+        // deliberate edit instead of a mystery number. The AF_UNIX literal `8`
+        // that used to sit here was the body alone, and it silently became wrong
+        // the moment that filter gained its guard.
         let proxy = prepare_seccomp_proxy_filter(true);
-        assert_eq!(proxy.filter.len(), 37);
+        assert_eq!(proxy.filter.len(), ARCH_GUARD_LEN + 31);
         let unix = prepare_seccomp_af_unix_filter();
-        assert_eq!(unix.filter.len(), 8);
+        assert_eq!(unix.filter.len(), ARCH_GUARD_LEN + 8);
     }
 
     #[test]
