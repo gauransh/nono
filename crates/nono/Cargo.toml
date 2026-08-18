@@ -13,17 +13,36 @@ keywords = ["sandbox", "security", "capability", "landlock", "seatbelt"]
 categories = ["os", "api-bindings"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "sigstore-trust"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Headless/container consumers opt out with default-features = false.
 system-keyring = ["dep:keyring"]
+# Enables Sigstore bundle verification and keyed signing (`trust::bundle`,
+# `trust::signing`, and the audit attestation bundle functions in `audit`).
+# On by default so existing consumers are unaffected. Consumers that only need
+# the sandbox lifecycle opt out with default-features = false: the sigstore
+# graph drags in reqwest/rustls/aws-lc-sys (a C build script that blocks
+# cross-compilation) plus MPL-2.0 and CDLA-licensed transitive crates that
+# stricter `cargo deny` license policies reject. The lifecycle module itself
+# has never touched sigstore.
+sigstore-trust = [
+    "dep:sigstore-verify",
+    "dep:sigstore-trust-root",
+    "dep:x509-cert",
+    "dep:der",
+]
 
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-zeroize.workspace = true
+# "derive" carries the #[derive(Zeroize, ZeroizeOnDrop)] on lifecycle::gate's
+# activation token. It is declared here rather than left to feature
+# unification: before sigstore became optional the derive feature arrived only
+# by accident through the sigstore dependency graph, so a default-features =
+# false build of this crate stopped compiling without it.
+zeroize = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 getrandom.workspace = true
 uuid.workspace = true
@@ -43,7 +62,8 @@ libc = "0.2"
 # backend to its defaults.
 keyring = { version = "3", optional = true, default-features = false }
 
-# Sigstore bundle verification.
+# Sigstore bundle verification (optional, behind the default-on
+# `sigstore-trust` feature — see [features] above).
 # `sigstore-trust-root` is pinned to 0.6.3 because 0.6.5 made
 # `TufSigningConfig::production()` async without bumping major,
 # breaking sigstore-sign 0.6.3 (which the sigstore-verify graph pulls
@@ -51,10 +71,12 @@ keyring = { version = "3", optional = true, default-features = false }
 # on sigstore-sign or sigstore-trust-root in our own code; this pin
 # exists purely to keep the resolver on a coherent 0.6.3-era set
 # until the upstream API churn settles.
-sigstore-verify = { version = "0.11.0", default-features = false }
-sigstore-trust-root = "=0.11.0"
-x509-cert = { version = "0.3", default-features = false }
-der = { version = "0.8", default-features = false }
+sigstore-verify = { version = "0.11.0", default-features = false, optional = true }
+sigstore-trust-root = { version = "=0.11.0", optional = true }
+# Only used by trust::bundle to decode Fulcio certificate extensions, so these
+# ride along with the sigstore feature rather than being unconditional.
+x509-cert = { version = "0.3", default-features = false, optional = true }
+der = { version = "0.8", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true

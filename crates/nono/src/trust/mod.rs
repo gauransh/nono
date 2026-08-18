@@ -18,8 +18,12 @@
 //! - **Digest** ([`digest`]): SHA-256 digest computation for files and byte slices
 //! - **Policy** ([`policy`]): Loading, merging, and evaluation of trust policies
 //! - **DSSE** ([`dsse`]): Dead Simple Signing Envelope parsing, PAE construction, in-toto statements
-//! - **Bundle** ([`bundle`]): Sigstore bundle loading, verification, and identity extraction
-//! - **Signing** ([`signing`]): Keyed ECDSA P-256 signing and Sigstore bundle construction
+//! - **Bundle** (`bundle`): Sigstore bundle loading, verification, and identity extraction
+//! - **Signing** (`signing`): Keyed ECDSA P-256 signing and Sigstore bundle construction
+//!
+//! `bundle` and `signing` are the only parts of this module that link Sigstore.
+//! They are gated behind the default-on `sigstore-trust` feature; the digest,
+//! DSSE, policy, and types primitives are always available.
 //!
 //! # Security
 //!
@@ -29,13 +33,16 @@
 //! - No TOFU: files must have valid signatures from trusted publishers on first encounter
 
 pub mod base64;
+#[cfg(feature = "sigstore-trust")]
 pub mod bundle;
 pub mod digest;
 pub mod dsse;
 pub mod policy;
+#[cfg(feature = "sigstore-trust")]
 pub mod signing;
 pub mod types;
 
+#[cfg(feature = "sigstore-trust")]
 pub use bundle::{
     Bundle, CertificateInfo, DerPublicKey, Sha256Hash, SigstoreVerificationResult, TrustedRoot,
     VerificationPolicy, bundle_path_for, extract_all_subjects, extract_bundle_digest,
@@ -55,6 +62,7 @@ pub use policy::{
     evaluate_file, find_included_files, find_included_files_with_skip_dirs, load_policy_from_file,
     load_policy_from_str, merge_policies,
 };
+#[cfg(feature = "sigstore-trust")]
 pub use signing::{
     KeyPair, MAX_MULTI_SUBJECT_FILES, SigningScheme, export_public_key, generate_signing_key,
     key_id_hex, public_key_id_hex, sign_bytes, sign_files, sign_instruction_file,
