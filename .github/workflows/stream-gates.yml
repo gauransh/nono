@@ -21,9 +21,9 @@ name: stream-gates
 
 on:
   push:
-    branches: ["parallel/**"]
+    branches: ["parallel/**", "integration/**"]
   pull_request:
-    branches: ["parallel/**"]
+    branches: ["parallel/**", "integration/**"]
   workflow_dispatch:
 
 permissions:
