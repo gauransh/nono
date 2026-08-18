@@ -32,7 +32,10 @@
 //! - [`probe`][self]: [`PreparedSandbox::probe_enforcement`], which asks the
 //!   *held child* to attempt one real operation and reports the kernel's own
 //!   `errno` — the one fact in this module that is not the library's own
-//!   account of what it did.
+//!   account of what it did. A detached run's held child is in the supervisor,
+//!   so the same question is put over the control socket by
+//!   [`DetachedSession::probe_enforcement`] and the observation comes back
+//!   unchanged.
 //! - [`gate`][self]: [`ActivationHandle`] and the single-use release check.
 //! - `sync_core`: the state and the one-shot gate write behind a single lock,
 //!   so the activation compare-and-swap has an answer under concurrency rather

@@ -64,10 +64,31 @@
 //! installable, not that this child is still confined.** A kernel that lost the
 //! original child's ruleset would still install a fresh one perfectly. Keeping
 //! the two labelled apart is the whole reason the enum has two variants.
+//!
+//! # Reaching a held child that is in another process
+//!
+//! A detached run's child is held by the supervisor, not by the caller, so the
+//! [`PreparedSandbox`][super::PreparedSandbox] that can ask it is unreachable
+//! from the caller's side. [`ControlRequest::ProbeEnforcement`][req] is the
+//! only way across, and it carries the request rather than an answer: the
+//! supervisor hands it to the same method the in-process path calls, and passes
+//! what comes back over the wire **unchanged**. It has no opinion to add. An
+//! [`ProbeOutcome::Indeterminate`] never becomes a refusal or a permission in
+//! transit, and [`ProbeObservation::denial_observed`] is never upgraded,
+//! because the supervisor observed nothing — the child did.
+//!
+//! Every type below is therefore serializable. That is a transport fact and not
+//! a licence to build an observation from parts: nothing outside this module
+//! constructs a [`ProbeObservation`], and the one constructor is
+//! [`observation`], which is where [`ProbeScope::InstalledChild`] is written
+//! down exactly once.
+//!
+//! [req]: super::ControlRequest::ProbeEnforcement
 
 use super::exit::STATUS_RECORD_LEN;
 use super::state::LifecycleState;
 use crate::capability_modes::FsMode;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
@@ -82,7 +103,16 @@ use thiserror::Error;
 /// Opaque to this library: nothing here parses it, matches on it, or gives it
 /// meaning. It exists so a caller that plants several probes can tell the
 /// answers apart without relying on ordering.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Unbounded, like every other caller-chosen string this library carries. On
+/// the detached path that is not a hole: a request whose encoded form would not
+/// fit [`MAX_CONTROL_FRAME_BYTES`][limit] is refused by the framing before a
+/// byte is written, so a long tag costs the caller its own request and nothing
+/// else — see [`DetachedSession::probe_enforcement`][probe].
+///
+/// [limit]: super::MAX_CONTROL_FRAME_BYTES
+/// [probe]: super::DetachedSession::probe_enforcement
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProbeId(String);
 
 impl ProbeId {
@@ -112,7 +142,8 @@ impl std::fmt::Display for ProbeId {
 /// describes a *policy* ("blocked", "allow all", "proxy only"), not the socket
 /// type an individual operation uses. Two values, because those are the two
 /// this library's network capabilities can name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TransportProtocol {
     /// A `SOCK_STREAM` socket.
     Tcp,
@@ -146,7 +177,12 @@ impl std::fmt::Display for TransportProtocol {
 /// vocabulary ([`FsMode`]) rather than in a second one invented here, so a
 /// caller that granted `allow_path_modes(path, [FsMode::Write])` can probe the
 /// same word it granted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// A path that is not UTF-8 cannot be encoded for the control socket, and is
+/// refused there rather than mangled into a different path: the same rule the
+/// child's own channel applies to an interior NUL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "probe_op", rename_all = "snake_case")]
 pub enum ProbeOp {
     /// Attempt one filesystem operation against a path.
     OpenPath {
@@ -180,7 +216,7 @@ pub enum ProbeOp {
 }
 
 /// One probe: what to attempt, and what to call the answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeRequest {
     /// The caller's tag, returned on the observation.
     pub id: ProbeId,
@@ -189,7 +225,8 @@ pub struct ProbeRequest {
 }
 
 /// What the kernel said.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ProbeOutcome {
     /// The syscall succeeded. The operation really happened.
     Permitted,
@@ -211,7 +248,8 @@ pub enum ProbeOutcome {
 }
 
 /// Why a probe established nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "indeterminate", rename_all = "snake_case")]
 pub enum ProbeIndeterminate {
     /// The mechanism has no check for this operation at all, so an answer from
     /// it would be meaningless rather than merely uncertain.
@@ -288,7 +326,8 @@ impl std::fmt::Display for ProbeIndeterminate {
 /// this path has one. This label therefore names the mechanism that expresses
 /// the operation in the installed ruleset; the kernel offers no per-syscall
 /// attribution and none is invented here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EnforcementMechanism {
     /// The Linux Landlock LSM.
     Landlock,
@@ -328,7 +367,8 @@ impl std::fmt::Display for EnforcementMechanism {
 }
 
 /// Which process the answer is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProbeScope {
     /// The probe ran inside the confined child itself.
     ///
@@ -366,7 +406,12 @@ impl std::fmt::Display for ProbeScope {
 }
 
 /// What one probe established.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because a detached run's held child is in the supervisor and
+/// the answer has to reach the caller, and for no other reason: the supervisor
+/// forwards what [`super::PreparedSandbox::probe_enforcement`] returned and
+/// changes nothing about it. See the module docs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProbeObservation {
     /// The caller's tag, returned unchanged.
     pub id: ProbeId,
@@ -400,7 +445,14 @@ pub struct ProbeObservation {
 /// Deliberately short. A probe that reached the child and got an answer always
 /// returns an observation, however unhelpful the answer; these two are the
 /// cases where there was no answer at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+///
+/// Serializable for the same reason [`ActivationError`][err] is: a probe asked
+/// for over a detached supervisor's control socket must be refused with the
+/// typed answer the in-process call would have given, not a string.
+///
+/// [err]: super::ActivationError
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "probe_error", rename_all = "snake_case")]
 pub enum ProbeError {
     /// The run is not being held, so there is no confined pre-exec child to ask.
     #[error("a probe is only legal while the child is held at the gate; run is {state}")]
@@ -439,7 +491,12 @@ pub(super) const TAG_PROBE_COULD_NOT_RUN: u8 = 0x04;
 /// `PATH_MAX` is 4096 on Linux and 1024 on macOS; the larger is used on both so
 /// the record has one shape. A path that does not fit is refused before
 /// anything is written, with the number the kernel would have given it anyway.
-const PROBE_PATH_BYTES: usize = 4096;
+///
+/// Visible to [`super::protocol`], which asserts at compile time that a path
+/// this long still fits a control frame even fully JSON-escaped: a path the
+/// child's own channel would accept must not be a path the supervisor cannot be
+/// asked about.
+pub(super) const PROBE_PATH_BYTES: usize = 4096;
 
 /// Offset of the operation tag.
 const OFFSET_OP: usize = 0;

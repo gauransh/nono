@@ -24,11 +24,11 @@
 
 use nono::lifecycle::{
     ActivationError, ActivationHandle, ActivationObservation, AttachAck, AttachTag,
-    AttachedTerminal, CleanupVerification, ControlRefusal, ControlReply, ControlRequest,
-    DetachedError, ExitOutcome, LifecycleError, LifecycleState, MAX_ATTACH_PAYLOAD_BYTES,
-    MAX_CONTROL_FRAME_BYTES, PrepareError, RecoveryDecision, SCROLLBACK_CAPACITY_BYTES,
-    SandboxPlan, SessionMode, SessionStore, StopError, SupervisorPresence, TerminalEvent,
-    ValidatedPlan, WaitOutcome, WindowSize,
+    AttachedTerminal, CONTROL_PROTOCOL_VERSION, CleanupVerification, ControlRefusal, ControlReply,
+    ControlRequest, DetachedError, ExitOutcome, LifecycleError, LifecycleState,
+    MAX_ATTACH_PAYLOAD_BYTES, MAX_CONTROL_FRAME_BYTES, PrepareError, RecoveryDecision,
+    SCROLLBACK_CAPACITY_BYTES, SandboxPlan, SessionMode, SessionStore, StopError,
+    SupervisorPresence, TerminalEvent, ValidatedPlan, WaitOutcome, WindowSize,
 };
 use nono::{AccessMode, CapabilitySet};
 use std::io::{Read, Write};
@@ -751,7 +751,7 @@ impl RawClient {
 
     /// Greet, then switch this connection into terminal framing.
     fn attach(&mut self, session_id: Uuid, window: WindowSize) -> AttachAck {
-        self.send(&Self::hello(session_id, 1, 1));
+        self.send(&Self::hello(session_id, 1, CONTROL_PROTOCOL_VERSION));
         match self.read_reply() {
             ControlReply::Hello { .. } => {}
             other => panic!("the hello must be accepted, got {other:?}"),
@@ -1090,7 +1090,7 @@ fn a_hello_from_another_protocol_version_is_refused() {
     assert_eq!(
         refusal(client.read_reply()),
         ControlRefusal::ProtocolVersion {
-            expected: 1,
+            expected: CONTROL_PROTOCOL_VERSION,
             supplied: 99
         }
     );
@@ -1106,7 +1106,7 @@ fn a_hello_for_another_session_or_generation_is_refused() {
 
     let mut wrong_session = RawClient::connect_free(&socket);
     let stranger = Uuid::now_v7();
-    wrong_session.send(&RawClient::hello(stranger, 1, 1));
+    wrong_session.send(&RawClient::hello(stranger, 1, CONTROL_PROTOCOL_VERSION));
     assert_eq!(
         refusal(wrong_session.read_reply()),
         ControlRefusal::WrongSession {
@@ -1117,7 +1117,7 @@ fn a_hello_for_another_session_or_generation_is_refused() {
     assert!(wrong_session.is_closed());
 
     let mut wrong_generation = RawClient::connect_free(&socket);
-    wrong_generation.send(&RawClient::hello(id, 999, 1));
+    wrong_generation.send(&RawClient::hello(id, 999, CONTROL_PROTOCOL_VERSION));
     assert_eq!(
         refusal(wrong_generation.read_reply()),
         ControlRefusal::WrongGeneration {

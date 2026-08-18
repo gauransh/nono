@@ -122,6 +122,7 @@ use super::prepare::{
     PreparedSandbox, child_main, close_inherited_descriptors, last_errno, open_channel,
     refuse_unsupported, resolve_program, write_record,
 };
+use super::probe::{ProbeRequest, ProbeScope};
 use super::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlRefusal, ControlReply, ControlRequest, FrameError,
     MAX_CONTROL_FRAME_BYTES, PollOutcome, SessionStatus, WaitOutcome, poll_fds, read_exact_by,
@@ -1883,6 +1884,7 @@ impl Supervisor {
                 status: Box::new(self.status()),
             },
             ControlRequest::VerifyCleanup => self.verify_cleanup(),
+            ControlRequest::ProbeEnforcement { request } => self.probe_enforcement(&request),
             ControlRequest::Attach { window } => self.attach(window),
             ControlRequest::Goodbye => ControlReply::Farewell,
         };
@@ -2127,6 +2129,45 @@ impl Supervisor {
             },
             Err(err) => ControlReply::Refused {
                 refusal: ControlRefusal::Cleanup { state: err.state },
+            },
+        }
+    }
+
+    /// Put one probe to the held child, or say why it cannot be put.
+    ///
+    /// The supervisor is the wire and not a second opinion. It decides exactly
+    /// one thing — whether there is a held child to ask — and everything else
+    /// comes back from [`PreparedSandbox::probe_enforcement`] untouched: the
+    /// outcome, the mechanism, the scope, and `denial_observed`. Nothing here
+    /// consults the plan's capabilities, and nothing here remembers a previous
+    /// answer, because either would turn a fact about the kernel into a fact
+    /// about this process's bookkeeping.
+    fn probe_enforcement(&self, request: &ProbeRequest) -> ControlReply {
+        let state = self.state();
+        // Post-activation the child is the customer's program and the gate
+        // descriptor is gone, so `ProbeScope::InstalledChild` is unreachable.
+        // The only probe left would be a fresh sibling with the capabilities
+        // re-applied — `ProbeScope::RederivedSibling`, which proves the
+        // mechanism is still installable rather than that this child is still
+        // confined — and this build does not fork one. Refused by name rather
+        // than answered from anything weaker.
+        if state == LifecycleState::Running {
+            return ControlReply::Refused {
+                refusal: ControlRefusal::ProbeAfterActivation {
+                    state,
+                    required_scope: ProbeScope::RederivedSibling,
+                },
+            };
+        }
+        // Every other state goes to the handle, which refuses with its own
+        // `NotLegalInState` naming the state it found. Deliberately not
+        // duplicated here: the legality rule belongs to the probe's contract,
+        // and a second copy of it in the supervisor is a second copy that can
+        // drift.
+        match self.prepared.probe_enforcement(request) {
+            Ok(observation) => ControlReply::ProbeObservation(observation),
+            Err(err) => ControlReply::Refused {
+                refusal: ControlRefusal::Probe(err),
             },
         }
     }
@@ -2977,23 +3018,43 @@ mod tests {
         // Each of these is something an unrelated environment could contain
         // under a name that happened to collide. None of them may be acted on:
         // every one names descriptors this process would then read or write.
-        for raw in [
-            "",
-            "1",
-            "1:7",
-            "1:7:8",
-            "1:7:8:9:10",
-            "2:7:8:9",
-            "1:x:8:9",
-            "1:-1:8:9",
+        //
+        // The version field is built from `CONTROL_PROTOCOL_VERSION` rather than
+        // hardcoded, so each case keeps failing for the reason it was written
+        // for. With a literal version these all still returned `None` after a
+        // protocol bump, but on the version check rather than on the malformed
+        // field under test — a test that passes for the wrong reason.
+        let v = CONTROL_PROTOCOL_VERSION;
+        let cases = [
+            String::new(),
+            format!("{v}"),
+            // Too few fields.
+            format!("{v}:7"),
+            format!("{v}:7:8"),
+            // Too many fields.
+            format!("{v}:7:8:9:10"),
+            // Not a descriptor number.
+            format!("{v}:x:8:9"),
+            format!("{v}:-1:8:9"),
             // Standard stream numbers: the intermediate points those at
             // /dev/null, so a marker naming one cannot have come from it.
-            "1:0:8:9",
-            "1:7:1:9",
-            "1:7:8:2",
-        ] {
+            format!("{v}:0:8:9"),
+            format!("{v}:7:1:9"),
+            format!("{v}:7:8:2"),
+        ];
+        for raw in &cases {
             assert_eq!(Marker::parse(raw), None, "{raw} must not parse");
         }
+
+        // A well-formed marker from a build speaking a different control
+        // protocol. This is the case the version check itself exists for, so it
+        // is asserted separately from the malformed ones above.
+        let foreign = format!("{}:7:8:9", v.wrapping_add(1));
+        assert_eq!(
+            Marker::parse(&foreign),
+            None,
+            "{foreign} names another build's protocol and must not parse"
+        );
     }
 
     #[test]

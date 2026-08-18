@@ -3,8 +3,9 @@
 //! [`DetachedSession`] is the caller's end of the control protocol: a connected
 //! Unix socket, a session id, a generation, and the identity of the supervisor
 //! on the other end. Everything it offers mirrors the in-process API —
-//! activate, wait, stop, status, verify cleanup — and every one of those goes
-//! over the wire to a *different process* that owns the child.
+//! activate, wait, stop, status, verify cleanup, probe enforcement — and every
+//! one of those goes over the wire to a *different process* that owns the
+//! child.
 //!
 //! # What is different from the in-process handles
 //!
@@ -42,6 +43,7 @@ use super::cleanup::CleanupVerification;
 use super::exit::SandboxExit;
 use super::gate::ActivationHandle;
 use super::identity::ProcessIdentity;
+use super::probe::{ProbeObservation, ProbeRequest};
 use super::protocol::{
     CONTROL_PROTOCOL_VERSION, ControlRefusal, ControlReply, ControlRequest, FrameError,
     SessionStatus, WaitOutcome, read_frame, set_nonblocking, write_frame,
@@ -366,6 +368,73 @@ impl DetachedSession {
         }
     }
 
+    /// Ask the held child what its installed enforcement does with one
+    /// operation.
+    ///
+    /// The mirror of [`super::PreparedSandbox::probe_enforcement`] for a run
+    /// this process does not own. The request crosses the socket, the
+    /// supervisor puts it to the child it is holding, the child attempts the
+    /// operation with a single real syscall, and the kernel's own `errno` comes
+    /// back. **The answer is never derived from the plan's
+    /// [`CapabilitySet`][crate::CapabilitySet] and never from a
+    /// [`QueryContext`][crate::query::QueryContext]** — a policy that applied
+    /// without an error is not evidence that it is enforced, in exactly the way
+    /// [`super::cleanup`] says a sent signal is not evidence that a process
+    /// died.
+    ///
+    /// **Nothing is memoised.** Two identical requests are two frames, two
+    /// exchanges with the child, and two syscalls; a remembered answer would be
+    /// a claim about a moment that has passed. The operation really happens
+    /// each time, so a `Create` probe that comes back
+    /// [`ProbeOutcome::Permitted`][ok] has created the file twice over — or,
+    /// the second time, told you the kernel said `EEXIST`. See
+    /// [`super::probe`].
+    ///
+    /// The observation crosses unchanged. The supervisor does not reinterpret
+    /// an outcome: an [`Indeterminate`][ind] stays indeterminate rather than
+    /// becoming a refusal or a permission, and
+    /// [`denial_observed`][denial] is never upgraded on the way past.
+    ///
+    /// Legal only while the run is held at the gate. Once it is
+    /// [`Running`][run] the child is the customer's program and the scope this
+    /// method reports — [`ProbeScope::InstalledChild`][scope] — is unreachable;
+    /// the refusal is [`ControlRefusal::ProbeAfterActivation`] and names the
+    /// weaker scope a post-activation probe would have to claim, rather than
+    /// answering with something re-derived.
+    ///
+    /// # Errors
+    ///
+    /// [`DetachedError::Refused`] carrying [`ControlRefusal::Probe`] with the
+    /// [`ProbeError`] the run produced, or
+    /// [`ControlRefusal::ProbeAfterActivation`] for a released run. A
+    /// supervisor that has died or stopped answering is a
+    /// [`DetachedError::Frame`] — a transport fact, never an observation this
+    /// side invented. A request whose encoded form would exceed
+    /// [`MAX_CONTROL_FRAME_BYTES`][limit] — an over-long
+    /// [`ProbeId`][id] or path, or a path that is not UTF-8 — is refused by the
+    /// framing with nothing written, so the connection survives it and the next
+    /// request is answered normally.
+    ///
+    /// [ok]: super::ProbeOutcome::Permitted
+    /// [ind]: super::ProbeOutcome::Indeterminate
+    /// [denial]: ProbeObservation::denial_observed
+    /// [run]: LifecycleState::Running
+    /// [scope]: super::ProbeScope::InstalledChild
+    /// [limit]: super::MAX_CONTROL_FRAME_BYTES
+    /// [id]: super::ProbeId
+    pub fn probe_enforcement(
+        &mut self,
+        request: &ProbeRequest,
+    ) -> Result<ProbeObservation, DetachedError> {
+        let frame = ControlRequest::ProbeEnforcement {
+            request: request.clone(),
+        };
+        match self.exchange(&frame, CONTROL_TIMEOUT)? {
+            ControlReply::ProbeObservation(observation) => Ok(observation),
+            other => Err(unexpected("probe_observation", &other)),
+        }
+    }
+
     /// Take over the run's terminal.
     ///
     /// Only an interactive run has one: a headless run's standard streams are
@@ -467,6 +536,7 @@ fn reply_name(reply: &ControlReply) -> &'static str {
         ControlReply::Stopped { .. } => "stopped",
         ControlReply::Status { .. } => "status",
         ControlReply::Cleanup { .. } => "cleanup",
+        ControlReply::ProbeObservation(_) => "probe_observation",
         ControlReply::AttachAck { .. } => "attach_ack",
         ControlReply::Farewell => "farewell",
         ControlReply::Refused { .. } => "refused",

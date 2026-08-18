@@ -1,4 +1,4 @@
-//! Control protocol v1: what a caller and a detached supervisor say to each
+//! Control protocol v2: what a caller and a detached supervisor say to each
 //! other, and how.
 //!
 //! A detached run is reached over a Unix socket in the session store's `0700`
@@ -60,6 +60,7 @@
 use super::cleanup::CleanupVerification;
 use super::exit::SandboxExit;
 use super::gate::{ACTIVATION_TOKEN_BYTES, ActivationError, StopError};
+use super::probe::{ProbeError, ProbeObservation, ProbeRequest, ProbeScope};
 use super::state::LifecycleState;
 use super::terminal::{AttachAck, WindowSize};
 use serde::de::DeserializeOwned;
@@ -71,7 +72,15 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// The protocol version this build speaks, and the only one it accepts.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+///
+/// Two, because [`ControlRequest::ProbeEnforcement`] and its reply were added
+/// to the vocabulary. The hello is where the disagreement is settled and it is
+/// settled by refusing: a v1 supervisor has no probe verb, so a v2 client that
+/// were allowed to talk to one would discover that as a malformed frame — a
+/// transport failure standing in for a missing feature. A caller that asks a
+/// supervisor for an answer it cannot give deserves to be told which of the two
+/// it is.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 /// Headroom the wire bound keeps over the record bound, in bytes.
 ///
@@ -104,6 +113,30 @@ const _: () = assert!(MAX_CONTROL_FRAME_BYTES > super::MAX_RECORD_BYTES);
 /// Compile-time check that the allowance is real headroom rather than a
 /// rounding artefact. An empty status envelope is a few dozen bytes.
 const _: () = assert!(CONTROL_ENVELOPE_ALLOWANCE >= 1024);
+
+/// Bytes JSON needs for one byte it has to escape as `\u00XX`.
+///
+/// The worst case, not the usual one: an ordinary path costs one byte per byte.
+const WORST_CASE_JSON_ESCAPE: usize = 6;
+
+/// Compile-time check that the longest path a probe can name still fits a
+/// frame, even if every byte of it has to be escaped.
+///
+/// A path is the largest thing [`ControlRequest::ProbeEnforcement`] carries, and
+/// the channel to the held child bounds it at
+/// [`PROBE_PATH_BYTES`][super::probe::PROBE_PATH_BYTES]. If the escaped worst
+/// case did not fit here, a path the child's own channel would have accepted
+/// could not be *asked about* over the socket — and the failure would land on
+/// the framing rather than on the bound that caused it. The caller's
+/// [`ProbeId`][id] is not in this sum because it is unbounded by design; a
+/// request that overruns the frame because of one is refused by
+/// [`write_frame`], with nothing written.
+///
+/// [id]: super::ProbeId
+const _: () = assert!(
+    super::probe::PROBE_PATH_BYTES * WORST_CASE_JSON_ESCAPE + CONTROL_ENVELOPE_ALLOWANCE
+        < MAX_CONTROL_FRAME_BYTES
+);
 
 /// Bytes of length prefix in front of every frame.
 const LENGTH_PREFIX_BYTES: usize = 4;
@@ -254,6 +287,37 @@ pub enum ControlRefusal {
         state: LifecycleState,
     },
 
+    /// The probe was refused, with the reason the run gave.
+    ///
+    /// The held child's own typed answer, carried across unchanged — the same
+    /// arrangement [`Self::Activation`] and [`Self::Stop`] use. A probe that
+    /// *reached* the child is never in here: it produced an observation,
+    /// however unhelpful.
+    #[error(transparent)]
+    Probe(ProbeError),
+
+    /// A probe was asked for once the child had left the gate.
+    ///
+    /// [`ProbeScope::InstalledChild`] is only reachable while the child is
+    /// held. After activation that process is the customer's program and the
+    /// gate descriptor is gone, so the only probe still available would be a
+    /// fresh sibling with the plan's capabilities re-applied — which is
+    /// [`ProbeScope::RederivedSibling`] and proves something strictly weaker:
+    /// that the mechanism is still *installable*, not that this child is still
+    /// confined. This build does not produce that scope, so the honest answer
+    /// is this refusal. A remembered or re-derived result wearing the stronger
+    /// label is the one lie the two scopes exist to prevent.
+    #[error(
+        "a probe after activation would be scope {required_scope}, which this build does not \
+         produce; run is {state}"
+    )]
+    ProbeAfterActivation {
+        /// The state that refused.
+        state: LifecycleState,
+        /// The strongest scope such a probe could honestly claim.
+        required_scope: ProbeScope,
+    },
+
     /// The run has no terminal to attach to.
     ///
     /// A headless run's standard streams are `/dev/null` and there is no PTY
@@ -318,6 +382,22 @@ pub enum ControlRequest {
     /// not.
     VerifyCleanup,
 
+    /// Ask the held child what its installed enforcement does with one
+    /// operation.
+    ///
+    /// The request travels, never an answer: the supervisor hands it to the
+    /// [`PreparedSandbox`][prepared] it already owns, the held child attempts
+    /// the operation with one real syscall, and the kernel's own `errno` comes
+    /// back. Nothing on the way reads the plan's capabilities, and nothing is
+    /// memoised — two identical frames are two syscalls, and the operation
+    /// really happens each time. See [`super::probe`].
+    ///
+    /// [prepared]: super::PreparedSandbox::probe_enforcement
+    ProbeEnforcement {
+        /// The operation to attempt, and the tag to return with the answer.
+        request: ProbeRequest,
+    },
+
     /// Take over this run's terminal, at this size.
     ///
     /// The last control frame the connection carries: the
@@ -365,6 +445,10 @@ impl std::fmt::Debug for ControlRequest {
             Self::Stop => f.write_str("Stop"),
             Self::Status => f.write_str("Status"),
             Self::VerifyCleanup => f.write_str("VerifyCleanup"),
+            Self::ProbeEnforcement { request } => f
+                .debug_struct("ProbeEnforcement")
+                .field("request", request)
+                .finish(),
             Self::Attach { window } => f.debug_struct("Attach").field("window", window).finish(),
             Self::Goodbye => f.write_str("Goodbye"),
         }
@@ -382,6 +466,7 @@ impl ControlRequest {
             Self::Stop => "stop",
             Self::Status => "status",
             Self::VerifyCleanup => "verify_cleanup",
+            Self::ProbeEnforcement { .. } => "probe_enforcement",
             Self::Attach { .. } => "attach",
             Self::Goodbye => "goodbye",
         }
@@ -500,6 +585,18 @@ pub enum ControlReply {
         /// The state the verdict left the run in.
         state: LifecycleState,
     },
+
+    /// The held child attempted the operation, and this is what the kernel
+    /// said.
+    ///
+    /// Carried whole and unchanged. The supervisor does not reinterpret an
+    /// outcome on the way past: an
+    /// [`Indeterminate`][super::ProbeOutcome::Indeterminate] stays
+    /// indeterminate, and
+    /// [`denial_observed`][super::ProbeObservation::denial_observed] stays
+    /// whatever the observation said — which on this fork is always `false`,
+    /// because no denial record was captured by anyone.
+    ProbeObservation(ProbeObservation),
 
     /// The attach was accepted, and this connection is now a terminal.
     ///
@@ -815,10 +912,15 @@ pub(super) fn set_nonblocking(fd: RawFd) -> Result<(), FrameError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::probe::{
+        EnforcementMechanism, ProbeId, ProbeIndeterminate, ProbeOp, ProbeOutcome,
+    };
     use super::*;
+    use crate::capability_modes::FsMode;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
-    use std::time::Duration;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
 
     fn soon() -> Instant {
         Instant::now() + Duration::from_secs(5)
@@ -1007,6 +1109,13 @@ mod tests {
             ControlRefusal::Cleanup {
                 state: LifecycleState::Running,
             },
+            ControlRefusal::Probe(ProbeError::NotLegalInState {
+                state: LifecycleState::Stopped,
+            }),
+            ControlRefusal::ProbeAfterActivation {
+                state: LifecycleState::Running,
+                required_scope: ProbeScope::RederivedSibling,
+            },
             ControlRefusal::NoTerminal,
             ControlRefusal::Unimplemented {
                 op: "reprepare".to_string(),
@@ -1080,6 +1189,176 @@ mod tests {
             }
             .as_str(),
             "activate"
+        );
+        assert_eq!(
+            ControlRequest::ProbeEnforcement {
+                request: probe_request(FsMode::ReadContents)
+            }
+            .as_str(),
+            "probe_enforcement"
+        );
+    }
+
+    /// One probe of `/etc/hosts`, for the frames that carry one.
+    fn probe_request(mode: FsMode) -> ProbeRequest {
+        ProbeRequest {
+            id: ProbeId::new("wire"),
+            op: ProbeOp::OpenPath {
+                path: PathBuf::from("/etc/hosts"),
+                mode,
+            },
+        }
+    }
+
+    #[test]
+    fn a_probe_and_its_observation_round_trip_over_a_socket() -> Result<(), FrameError> {
+        let (mut left, mut right) = pair();
+        set_nonblocking(left.as_raw_fd())?;
+        set_nonblocking(right.as_raw_fd())?;
+
+        let request = ControlRequest::ProbeEnforcement {
+            request: probe_request(FsMode::Write),
+        };
+        write_frame(&mut left, &request, soon())?;
+        assert_eq!(read_frame::<ControlRequest>(&mut right, soon())?, request);
+
+        // Every outcome, including the two an optimistic implementation would
+        // be tempted to round: `Indeterminate` must not arrive as a refusal or
+        // a permission, and the errno on a refusal is the kernel's own number
+        // rather than a flag.
+        for outcome in [
+            ProbeOutcome::Permitted,
+            ProbeOutcome::Refused {
+                errno: libc::EACCES,
+            },
+            ProbeOutcome::Indeterminate {
+                reason: ProbeIndeterminate::ProbeCouldNotRun {
+                    errno: libc::ENOENT,
+                },
+            },
+            ProbeOutcome::Indeterminate {
+                reason: ProbeIndeterminate::PlatformHasNoInScopeProbe,
+            },
+            ProbeOutcome::Indeterminate {
+                reason: ProbeIndeterminate::MechanismCannotExpress {
+                    mechanism: EnforcementMechanism::Landlock,
+                },
+            },
+        ] {
+            let sent = ControlReply::ProbeObservation(ProbeObservation {
+                id: ProbeId::new("wire"),
+                outcome,
+                mechanism: EnforcementMechanism::Seatbelt,
+                scope: ProbeScope::InstalledChild,
+                denial_observed: false,
+                observed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_755_000_000_123),
+            });
+            write_frame(&mut right, &sent, soon())?;
+            let received: ControlReply = read_frame(&mut left, soon())?;
+            assert_eq!(received, sent, "an observation must cross unchanged");
+            match received {
+                ControlReply::ProbeObservation(observation) => {
+                    assert_eq!(observation.outcome, outcome);
+                    assert!(
+                        !observation.denial_observed,
+                        "no denial record was captured by anyone, least of all the wire"
+                    );
+                    assert_eq!(observation.scope, ProbeScope::InstalledChild);
+                }
+                other => panic!("expected an observation, got {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused_rather_than_mangled() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        // JSON has no spelling for these bytes. The frame refuses rather than
+        // sending a *different* path, which is the same rule the child's own
+        // channel applies to an interior NUL.
+        let (mut left, _right) = pair();
+        if let Err(err) = set_nonblocking(left.as_raw_fd()) {
+            panic!("the test socket must go non-blocking: {err}");
+        }
+        let request = ControlRequest::ProbeEnforcement {
+            request: ProbeRequest {
+                id: ProbeId::new("not-utf8"),
+                op: ProbeOp::OpenPath {
+                    path: PathBuf::from(OsString::from_vec(vec![0xFF, 0xFE])),
+                    mode: FsMode::ReadContents,
+                },
+            },
+        };
+        let outcome = write_frame(&mut left, &request, soon());
+        assert!(
+            matches!(outcome, Err(FrameError::Malformed { .. })),
+            "expected a malformed refusal, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_request_too_large_for_a_frame_is_refused_with_nothing_written() {
+        // The caller's tag is unbounded by design, so this is the shape an
+        // over-long request has. Nothing must reach the socket: a truncated
+        // frame is a frame the peer would read as a *different* request, and a
+        // stream whose framing has slipped cannot be resynchronized.
+        let (mut left, mut right) = pair();
+        for stream in [&left, &right] {
+            if let Err(err) = set_nonblocking(stream.as_raw_fd()) {
+                panic!("the test sockets must go non-blocking: {err}");
+            }
+        }
+        let request = ControlRequest::ProbeEnforcement {
+            request: ProbeRequest {
+                id: ProbeId::new("x".repeat(MAX_CONTROL_FRAME_BYTES)),
+                op: ProbeOp::OpenPath {
+                    path: PathBuf::from("/etc/hosts"),
+                    mode: FsMode::ReadContents,
+                },
+            },
+        };
+        let outcome = write_frame(&mut left, &request, soon());
+        assert!(
+            matches!(outcome, Err(FrameError::TooLarge { .. })),
+            "expected an oversize refusal, got {outcome:?}"
+        );
+        // Not one byte on the wire, which is what makes the connection usable
+        // afterwards.
+        let after: Result<ControlRequest, FrameError> =
+            read_frame(&mut right, Instant::now() + Duration::from_millis(80));
+        assert_eq!(after.err(), Some(FrameError::Timeout));
+    }
+
+    #[test]
+    fn the_longest_probe_path_the_child_accepts_still_fits_a_frame() {
+        // The compile-time assertion beside `WORST_CASE_JSON_ESCAPE` covers the
+        // escaped worst case; this covers the ordinary one end to end, so that
+        // changing either bound without the other is caught here rather than by
+        // a caller whose path was legal for the child and too big for the wire.
+        let mut path = String::from("/");
+        while path.len() < super::super::probe::PROBE_PATH_BYTES.saturating_sub(1) {
+            path.push('a');
+        }
+        let request = ControlRequest::ProbeEnforcement {
+            request: ProbeRequest {
+                id: ProbeId::new("longest"),
+                op: ProbeOp::OpenPath {
+                    path: PathBuf::from(path),
+                    mode: FsMode::ReadContents,
+                },
+            },
+        };
+        let encoded = match serde_json::to_vec(&request) {
+            Ok(encoded) => encoded,
+            Err(err) => panic!("a request at the path bound must encode: {err}"),
+        };
+        assert!(
+            encoded.len() < MAX_CONTROL_FRAME_BYTES,
+            "a path the child would accept must fit a frame: {} bytes",
+            encoded.len()
         );
     }
 }
