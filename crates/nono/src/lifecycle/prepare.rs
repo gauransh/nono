@@ -141,7 +141,13 @@ use zeroize::{Zeroize, Zeroizing};
 ///
 /// Generations climb when a session is re-prepared, which needs the durable
 /// store; until that lands every prepared sandbox is generation 1.
-const FIRST_GENERATION: u64 = 1;
+/// The generation a plan carries when the caller does not choose one.
+///
+/// A caller that versions its policy sets its own with
+/// [`SandboxPlan::generation`][g]; this is only the default.
+///
+/// [g]: super::plan::SandboxPlan::generation
+pub(super) const FIRST_GENERATION: u64 = 1;
 
 /// Everything `prepare` can refuse to do.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -502,7 +508,7 @@ impl PreparedSandbox {
         let events = Arc::new(EventEmitter::new(
             plan.event_sink().cloned(),
             session_id,
-            FIRST_GENERATION,
+            plan.generation(),
         ));
         events.emit(LifecycleEventKind::PrepareStarted);
 
@@ -557,7 +563,7 @@ impl PreparedSandbox {
 
                 let mut prepared = Self {
                     session_id,
-                    generation: FIRST_GENERATION,
+                    generation: plan.generation(),
                     identity,
                     // The child makes this true with `setpgid(0, 0)`; the
                     // "at the gate" record the parent waits for below is what
@@ -598,7 +604,7 @@ impl PreparedSandbox {
                 prepared.observe_prepare()?;
                 Ok((
                     prepared,
-                    ActivationHandle::new(session_id, FIRST_GENERATION, *token),
+                    ActivationHandle::new(session_id, plan.generation(), *token),
                 ))
             }
         }
@@ -2757,13 +2763,22 @@ mod tests {
 
     /// A held `/bin/echo` with read access to the whole filesystem.
     fn held_child() -> (PreparedSandbox, ActivationHandle) {
+        held_child_at(FIRST_GENERATION)
+    }
+
+    fn held_child_at(generation: u64) -> (PreparedSandbox, ActivationHandle) {
         use crate::capability::{AccessMode, CapabilitySet};
 
         let caps = match CapabilitySet::new().allow_path("/", AccessMode::Read) {
             Ok(caps) => caps,
             Err(err) => panic!("test capabilities must build: {err}"),
         };
-        let plan = sealed(SandboxPlan::new("/bin/echo").arg("held").capabilities(caps));
+        let plan = sealed(
+            SandboxPlan::new("/bin/echo")
+                .arg("held")
+                .capabilities(caps)
+                .generation(generation),
+        );
         match PreparedSandbox::prepare(plan) {
             Ok(pair) => pair,
             Err(err) => panic!("prepare must succeed: {err}"),
@@ -2799,6 +2814,43 @@ mod tests {
             }
             Err(err) => panic!("the genuine handle must still work: {err}"),
         }
+    }
+
+    #[test]
+    fn the_generation_compared_on_release_is_the_one_the_caller_chose() {
+        // `a_handle_for_another_generation_is_refused` only ever exercises the
+        // default, so it passes whether or not the plan's generation is read at
+        // all: the comparison is `1 != 2` either way. Before `SandboxPlan::
+        // generation` existed the field was hardcoded to FIRST_GENERATION, so
+        // the check was `1 != 1` for every real caller -- present, and deciding
+        // nothing.
+        const CHOSEN: u64 = 7;
+        let (mut held, handle) = held_child_at(CHOSEN);
+
+        // The caller's generation reached the handle, rather than the default.
+        assert_eq!(handle.generation(), CHOSEN);
+        assert_ne!(handle.generation(), FIRST_GENERATION);
+
+        // A handle from the generation before this one -- the shape a stale
+        // control-plane release actually takes -- is refused, and the error
+        // names the caller's generation rather than the default.
+        let stale = ActivationHandle::new(
+            handle.session_id(),
+            CHOSEN.saturating_sub(1),
+            *handle.token(),
+        );
+        assert_eq!(
+            held.activate(&stale).err(),
+            Some(ActivationError::WrongGeneration {
+                expected: CHOSEN,
+                supplied: CHOSEN - 1,
+            })
+        );
+        assert_eq!(held.state(), LifecycleState::Prepared);
+
+        // And the genuine handle still activates: the binding refuses the wrong
+        // generation without refusing the right one.
+        assert!(held.activate(&handle).is_ok());
     }
 
     #[test]

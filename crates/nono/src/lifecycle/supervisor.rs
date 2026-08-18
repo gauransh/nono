@@ -468,7 +468,11 @@ pub(super) fn launch(
     let supervisor_image = current_image()?;
 
     let session_id = Uuid::now_v7();
-    let generation = FIRST_DETACHED_GENERATION;
+    // The caller's, not a constant. This is the path a control plane actually
+    // takes -- leash-rs prepares every session detached -- so hardcoding it
+    // here would leave the generation check deciding nothing on the only path
+    // that matters, however carefully the in-process path binds it.
+    let generation = plan.generation();
     let socket_path = store.control_socket_path(session_id);
     // Bound *before* the fork, deliberately. The alternative — the supervisor
     // binds, the launcher retries a connect until it appears — is a race with
@@ -517,12 +521,6 @@ pub(super) fn launch(
         ActivationHandle::new(session_id, generation, ready.token),
     ))
 }
-
-/// The generation a freshly detached session starts at.
-///
-/// One, like every other session: re-preparing into an existing session's slot
-/// is what increments a generation, and nothing in this slice does that.
-const FIRST_DETACHED_GENERATION: u64 = 1;
 
 /// The fork, the exec, and the wait for readiness.
 ///

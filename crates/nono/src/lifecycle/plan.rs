@@ -23,6 +23,7 @@
 //! guarantee.
 
 use super::events::EventSink;
+use super::prepare::FIRST_GENERATION;
 use crate::capability::{CapabilitySet, NetworkMode};
 use serde::{Deserialize, Serialize};
 use std::num::{NonZeroU32, NonZeroU64};
@@ -208,6 +209,7 @@ pub struct SandboxPlan {
     capabilities: CapabilitySet,
     resource_limits: ResourceLimits,
     session_mode: SessionMode,
+    generation: u64,
     detached: bool,
     gate: GateConfig,
     metadata: Vec<u8>,
@@ -229,6 +231,7 @@ impl SandboxPlan {
             capabilities: CapabilitySet::new(),
             resource_limits: ResourceLimits::default(),
             session_mode: SessionMode::default(),
+            generation: FIRST_GENERATION,
             detached: false,
             gate: GateConfig::default(),
             metadata: Vec::new(),
@@ -315,6 +318,24 @@ impl SandboxPlan {
     #[must_use]
     pub fn detached(mut self, detached: bool) -> Self {
         self.detached = detached;
+        self
+    }
+
+    /// Bind this run to a caller-chosen policy generation.
+    ///
+    /// The generation travels into the [`ActivationHandle`] and is compared on
+    /// release, so a handle minted under one generation cannot activate a
+    /// sandbox prepared under another. Defaults to [`FIRST_GENERATION`].
+    ///
+    /// Callers that version their policy — a control plane that reissues on
+    /// every policy change — need this to be theirs. Before it existed the
+    /// field was always `FIRST_GENERATION`, so the comparison on release was
+    /// `1 != 1` and could not fail: the check was present but decided nothing.
+    /// The activation token is still the primary binding; this is the layer
+    /// that makes a *stale-generation* release refusable on its own terms.
+    #[must_use]
+    pub const fn generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
         self
     }
 
@@ -483,6 +504,12 @@ impl ValidatedPlan {
     #[must_use]
     pub fn is_detached(&self) -> bool {
         self.plan.detached
+    }
+
+    /// The policy generation this run is bound to.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.plan.generation
     }
 
     /// The activation gate configuration.
