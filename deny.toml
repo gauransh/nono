@@ -1,0 +1,77 @@
+# cargo-deny configuration for the Crystal Nono substrate fork.
+#
+# Run: `cargo deny check`
+#
+# This workspace is Apache-2.0. The allow-list below enumerates the permissive
+# licenses actually present in the resolved dependency graph — it is an explicit
+# allow-list, never a blanket allow, and every entry names why it is there.
+
+[advisories]
+# RustSec advisory database. Vulnerabilities and unsound advisories are always
+# denied by cargo-deny; unmaintained crates are flagged across the whole graph
+# and yanked crates are denied.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+# An ignore must carry an id and a written rationale. Empty means we hide
+# nothing: a suppressed advisory is a decision, not a default.
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+# Every entry is justified by a real dependency:
+#   Apache-2.0            workspace license + the aws-sdk / sigstore families
+#   MIT                   majority of the graph (most are dual MIT/Apache)
+#   MIT-0                 borrow-or-share
+#   ISC                   ring (Apache-2.0 AND ISC), untrusted, rustls-webpki
+#   BSD-3-Clause          subtle
+#   CDLA-Permissive-2.0   webpki-roots, webpki-root-certs (Mozilla's root
+#                         program data — a data license, no code obligations)
+#   Unicode-3.0           the icu_* family, via idna
+#   Zlib                  foldhash
+#   Unlicense             aho-corasick / walkdir / jiff family (dual with MIT)
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+]
+
+# MPL-2.0 is weak copyleft and is deliberately NOT in the list above. It is
+# granted per crate instead, so a new MPL dependency fails this check and gets
+# a decision rather than inheriting one.
+#
+# The obligation MPL-2.0 imposes is file-level: it reaches modifications to the
+# MPL-licensed files themselves, not the work that merely depends on them. All
+# three are used unmodified, so nothing here requires this workspace to change
+# its own license. If any of them is ever forked or patched in-tree, that fork
+# carries MPL-2.0 and this entry must be revisited.
+#
+#   cbindgen     build-time only: generates bindings/c/nono.h. It is not linked
+#                into any shipped artifact and does not run on a user's machine.
+#   colored      terminal colouring in the CLI.
+#   option-ext   small Option helper, transitive via `directories`.
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "cbindgen" },
+    { allow = ["MPL-2.0"], crate = "colored" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
+
+[bans]
+# Duplicate versions are surfaced as a warning so graph bloat is visible without
+# failing the build over an unavoidable transitive double-version.
+multiple-versions = "warn"
+wildcards = "allow"
+deny = []
+
+[sources]
+# Only the public crates.io registry is trusted. This fork has no git
+# dependencies; adding one must be a reviewable change here, not a silent edge.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

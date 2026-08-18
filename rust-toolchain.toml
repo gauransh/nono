@@ -1,0 +1,11 @@
+# Pinned so a build is reproducible across developer machines and CI.
+#
+# 1.97.1 is what leash-rs pins, and this fork is consumed by leash-rs as a git
+# dependency — a toolchain skew between the two would show up as a build that
+# works in one repository and not the other, for reasons neither records.
+#
+# Note that a Homebrew-installed cargo/rustc is not a rustup shim and ignores
+# this file; it is honoured by rustup, which is what CI uses.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
