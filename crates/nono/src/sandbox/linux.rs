@@ -2894,6 +2894,44 @@ pub struct SockaddrInfo {
     pub unix_path: Option<PathBuf>,
 }
 
+/// Take a copy of descriptor `child_fd` out of process `child_pid`.
+///
+/// `pidfd_open` + `pidfd_getfd` (Linux 5.6+). Used to receive a seccomp-notify
+/// listener the child created: the child reports the *number*, and this pulls
+/// the descriptor across the process boundary.
+///
+/// It is done this way rather than with `SCM_RIGHTS` because the filter the
+/// child has just installed traps `sendmsg`, so a socket handoff would be
+/// mediated by the very listener nobody is servicing yet — a deadlock at the
+/// first step of enforcement.
+///
+/// # Errors
+///
+/// The `errno` of whichever syscall failed. Both are reported the same way
+/// because the caller's response is the same either way: the listener could not
+/// be taken, so the run must not proceed.
+pub fn steal_child_fd(child_pid: i32, child_fd: RawFd) -> std::result::Result<OwnedFd, i32> {
+    // SAFETY: `pidfd_open` takes a pid and a flag word and returns a new
+    // descriptor or -1. No memory is touched.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid as libc::pid_t, 0_u32) };
+    if pidfd < 0 {
+        return Err(raw_errno());
+    }
+    // SAFETY: `pidfd_open` returned a fresh descriptor this process now owns,
+    // so wrapping it hands ownership to the guard that closes it on return.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+
+    // SAFETY: `pidfd_getfd` takes two descriptors and a flag word and returns a
+    // new descriptor or -1. No memory is touched. `pidfd` is live for the call.
+    let taken = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), child_fd, 0_u32) };
+    if taken < 0 {
+        return Err(raw_errno());
+    }
+    // SAFETY: `pidfd_getfd` returned a fresh descriptor duplicated out of the
+    // child, owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(taken as RawFd) })
+}
+
 /// The kind of trapped syscall a Linux syscall number denotes, if this
 /// supervisor mediates it.
 ///

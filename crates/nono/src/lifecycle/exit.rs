@@ -58,6 +58,20 @@ pub(crate) const STATUS_RECORD_LEN: usize = 5;
 /// record the parent hopes to read during `prepare`.
 pub(crate) const TAG_GATE_READY: u8 = 0x01;
 
+/// The child is handing the parent a seccomp-notify listener.
+///
+/// The `errno` slot of the record carries the descriptor *number* in the
+/// child's table, not an error. The number is useless to anyone who cannot
+/// reach that table, and the parent turns it into a descriptor of its own with
+/// `pidfd_getfd`. Sending it this way rather than over `SCM_RIGHTS` is forced:
+/// the filter the child just installed traps `sendmsg`, so passing a descriptor
+/// through a socket would be mediated by the very listener nobody is servicing
+/// yet.
+///
+/// Written before [`TAG_GATE_READY`], so a parent that sees the gate record has
+/// already seen this one if there was one.
+pub(crate) const TAG_NOTIFY_FD: u8 = 0x05;
+
 /// How far the child got before it gave up.
 ///
 /// Each variant is a point in the child's fixed pre-exec sequence, in order.

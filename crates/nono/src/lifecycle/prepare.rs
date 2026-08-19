@@ -114,7 +114,7 @@ use super::cleanup::{CleanupError, CleanupVerification, DeathObservation, verify
 use super::events::{ActivationOutcome, EventEmitter, LifecycleEventKind};
 use super::exit::{
     ActivatedSandbox, ActivationObservation, ExitOutcome, PRE_EXEC_EXIT_CODE, PreExecStage,
-    STATUS_RECORD_LEN, SandboxExit, SupervisorStage, TAG_GATE_READY, kill_and_reap,
+    STATUS_RECORD_LEN, SandboxExit, SupervisorStage, TAG_GATE_READY, TAG_NOTIFY_FD, kill_and_reap,
     kill_and_reap_observed, reap,
 };
 use super::gate::{
@@ -397,6 +397,18 @@ pub struct PreparedSandbox {
     shared: SharedLifecycle,
     gate: Option<PipeWriter>,
     status: Option<PipeReader>,
+    /// The proxy-only rule the notification servicer answers from.
+    ///
+    /// `None` when the plan asked for no proxy mediation, in which case no
+    /// listener is ever reported either. A listener arriving without one is a
+    /// refusal, not a default: answering from a policy nobody wrote is the
+    /// failure this field exists to make impossible.
+    proxy_policy: Option<crate::sandbox::ProxyOnlyPolicy>,
+    /// What the notification servicer has decided, for the run's evidence.
+    ///
+    /// A run reporting zero decisions and zero refusals did not have a working
+    /// listener, and nothing else about it would say so.
+    notify_stats: std::sync::Arc<crate::sandbox::ProxyNotifyStats>,
     token_digest: [u8; TOKEN_DIGEST_BYTES],
     /// The release/abort pair this child will accept. Dropped — and so
     /// zeroized — as soon as the gate closes.
@@ -485,6 +497,7 @@ impl PreparedSandbox {
         let program = resolve_program(plan.program())?;
         let image = ExecImage::build(&program, &plan)?;
         let sandbox = PlatformSandbox::build(&plan)?;
+        let proxy_policy = proxy_policy_for(&plan);
         let (argv_ptrs, envp_ptrs) = image.pointers();
 
         // Both pairs are moved above the standard stream numbers if they
@@ -572,6 +585,8 @@ impl PreparedSandbox {
                     shared: SharedLifecycle::new(state),
                     gate: Some(gate_write),
                     status: Some(status_read),
+                    proxy_policy: proxy_policy.clone(),
+                    notify_stats: std::sync::Arc::default(),
                     // Replaced two lines down. A digest of all zeros matches no
                     // token anyone can present, so the gate is shut for the
                     // moment it holds this value; if the draw below fails,
@@ -666,6 +681,10 @@ impl PreparedSandbox {
             shared: SharedLifecycle::new(state),
             gate: Some(gate),
             status: Some(status),
+            // An adopted run is already past its prepare, so no listener will
+            // arrive for it and there is nothing to answer from.
+            proxy_policy: None,
+            notify_stats: std::sync::Arc::default(),
             // Replaced immediately below; a digest of all zeros matches no
             // token anyone can present, so the gate is shut for the moment it
             // holds this value.
@@ -1214,9 +1233,23 @@ impl PreparedSandbox {
 
     /// Wait for the child's "sandbox applied, at the gate" record.
     fn observe_prepare(&mut self) -> Result<(), PrepareError> {
+        // A listener record, if the policy needed one, arrives before the gate
+        // record. Reading it here rather than treating it as an unexpected tag
+        // is what turns "the child installed a filter" into "the parent holds
+        // the descriptor that answers it".
         let record = match self.status.as_mut() {
             Some(status) => read_status_record(status),
             None => Err(0),
+        };
+        let record = match record {
+            Ok(Some((TAG_NOTIFY_FD, raw))) => {
+                self.adopt_notify_listener(raw)?;
+                match self.status.as_mut() {
+                    Some(status) => read_status_record(status),
+                    None => Err(0),
+                }
+            }
+            other => other,
         };
         match classify_prepare_record(record) {
             Ok(()) => {
@@ -1231,6 +1264,91 @@ impl PreparedSandbox {
             }
             Err((stage, errno)) => Err(self.fail_prepare(stage, errno)),
         }
+    }
+
+    /// Take the child's seccomp-notify listener into this process.
+    ///
+    /// `pidfd_getfd` rather than `SCM_RIGHTS`: the filter the child installed
+    /// traps `sendmsg`, so a socket handoff would be mediated by the listener
+    /// nobody is servicing yet. The number alone is useless without access to
+    /// the child's descriptor table, which is what makes sending it in the
+    /// clear acceptable.
+    ///
+    /// A failure here fails `prepare`. The alternative is a confined child
+    /// whose every network syscall blocks against a listener nobody reads,
+    /// which is a hang rather than a refusal — and a hang is the one outcome
+    /// that tells an operator nothing.
+    #[cfg(target_os = "linux")]
+    fn adopt_notify_listener(&mut self, raw: i32) -> Result<(), PrepareError> {
+        let listener = crate::sandbox::steal_child_fd(self.process_group, raw).map_err(|errno| {
+            self.fail_prepare(PreExecStage::NetworkFilter, errno);
+            PrepareError::SandboxSpec {
+                reason: format!(
+                    "could not take the child's seccomp-notify listener (fd {raw} in pid {}): {}",
+                    self.process_group,
+                    std::io::Error::from_raw_os_error(errno)
+                ),
+            }
+        })?;
+
+        let Some(policy) = self.proxy_policy.clone() else {
+            // A listener with no policy to answer from would block the child on
+            // its first network syscall for ever. Refusing is the only outcome
+            // that is not a hang.
+            self.fail_prepare(PreExecStage::NetworkFilter, libc::EINVAL);
+            return Err(PrepareError::SandboxSpec {
+                reason: "the child installed a seccomp-notify listener for a plan that carries no \
+                         proxy-only policy; there would be nothing to answer it with"
+                    .to_string(),
+            });
+        };
+
+        // Serviced on its own thread for the run's whole life. The thread owns
+        // the listener and returns when the child is gone, so nothing has to
+        // remember to stop it — and nothing can hold a listener without
+        // answering it, which is the arrangement that turns a hang into a
+        // decision.
+        let stats = std::sync::Arc::clone(&self.notify_stats);
+        std::thread::Builder::new()
+            .name("nono-proxy-notify".to_string())
+            .spawn(move || {
+                crate::sandbox::serve_proxy_notifications(&listener, &policy, &stats);
+            })
+            .map_err(|error| PrepareError::SandboxSpec {
+                reason: format!("could not start the proxy notification servicer: {error}"),
+            })?;
+        Ok(())
+    }
+
+    /// No listener is ever reported on a platform that installs none.
+    #[cfg(not(target_os = "linux"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "mirrors the Linux signature, which is fallible"
+    )]
+    fn adopt_notify_listener(&mut self, _raw: i32) -> Result<(), PrepareError> {
+        Ok(())
+    }
+
+    /// The proxy-only confinement in force for this run, if any.
+    ///
+    /// A caller that wants to know whether egress is mediated asks here rather
+    /// than inferring it from the capability set: this is what the supervisor
+    /// is actually answering from.
+    #[must_use]
+    pub fn proxy_mediation(&self) -> Option<&crate::sandbox::ProxyOnlyPolicy> {
+        self.proxy_policy.as_ref()
+    }
+
+    /// How many trapped network syscalls this run has decided, and how many it
+    /// refused.
+    ///
+    /// Evidence rather than decoration. A run under proxy mediation that
+    /// reports zero decisions did not have a working listener, and nothing else
+    /// about it would say so.
+    #[must_use]
+    pub fn network_mediation_stats(&self) -> (u64, u64) {
+        (self.notify_stats.decided(), self.notify_stats.denied())
     }
 
     /// Whether the gate's configured lifetime has run out.
@@ -1747,8 +1865,22 @@ pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
         );
     }
 
-    if let Err((stage, errno)) = context.sandbox.apply_in_child() {
-        child_fail(context.status_write, stage, errno);
+    let notify_fd = match context.sandbox.apply_in_child() {
+        Ok(fd) => fd,
+        Err((stage, errno)) => child_fail(context.status_write, stage, errno),
+    };
+
+    // Hand the listener to the parent by number. It has to travel before the
+    // descriptor sweep below, and it cannot travel through a socket: the filter
+    // just installed traps `sendmsg`, so an `SCM_RIGHTS` handoff would be
+    // mediated by the very listener nobody is servicing yet.
+    if let Some(fd) = notify_fd
+        && !write_record(context.status_write, TAG_NOTIFY_FD, fd)
+    {
+        // The listener exists and the parent will never learn of it, so every
+        // network syscall would block for ever against a listener nobody reads.
+        // SAFETY: `_exit` is async-signal-safe and does not return.
+        unsafe { libc::_exit(PRE_EXEC_EXIT_CODE) }
     }
 
     // Everything else this process inherited goes now — after the sandbox
@@ -1758,7 +1890,15 @@ pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
     // A failure here is not reportable and not fatal: the sweep is
     // best-effort per descriptor, and the ones that matter are the ones the
     // parent knows about.
-    let mut keep = [context.gate_read, context.status_write];
+    // The listener stays open through the sweep: the parent reaches it with
+    // `pidfd_getfd`, which needs the descriptor to still be in this table when
+    // it looks. It is `O_CLOEXEC`, so `execve` closes it a moment later — by
+    // which time the parent holds its own.
+    let mut keep = [
+        context.gate_read,
+        context.status_write,
+        notify_fd.unwrap_or(-1),
+    ];
     close_inherited_descriptors(&mut keep);
 
     // Confined, holding nothing spare, and about to wait. This record is what
@@ -2118,38 +2258,6 @@ fn read_status_record<R: Read>(mut status: R) -> Result<Option<(u8, i32)>, i32> 
     Ok(Some((record[0], errno)))
 }
 
-/// Refuse a Linux policy whose enforcement this slice cannot complete.
-///
-/// Proxy-only network mediation is not self-contained: the kernel traps
-/// `connect`/`bind` to a seccomp-notify descriptor that *some supervisor* must
-/// poll and answer, and this slice creates no such supervisor. Applying the
-/// prepared policy anyway would leave those syscalls unmediated — a policy the
-/// caller asked for, silently not enforced. Refusing is the fail-closed answer.
-#[cfg(target_os = "linux")]
-/// Refuse a policy this lifecycle cannot actually enforce.
-///
-/// Takes the mode the *capability set* asks for — via
-/// [`seccomp_network_fallback_mode`][m] — never a value derived from what the
-/// running kernel happens to support. A refusal that varies with the host is
-/// not a refusal; it is a silent downgrade on the hosts that lack the check.
-///
-/// [m]: crate::sandbox::seccomp_network_fallback_mode
-fn refuse_unsupported_fallback(
-    fallback: &crate::sandbox::SeccompNetFallback,
-) -> Result<(), PrepareError> {
-    if matches!(
-        fallback,
-        crate::sandbox::SeccompNetFallback::ProxyOnly { .. }
-    ) {
-        return Err(PrepareError::SandboxSpec {
-            reason: "proxy-only network mediation requires a supervisor-held seccomp-notify \
-                     descriptor, which the lifecycle does not yet provide"
-                .to_string(),
-        });
-    }
-    Ok(())
-}
-
 /// Which static seccomp network filter this policy needs, if any.
 ///
 /// Landlock is a filesystem-and-TCP mechanism: it has no vocabulary for UDP,
@@ -2179,6 +2287,24 @@ fn required_network_filter(caps: &crate::CapabilitySet) -> crate::sandbox::Stati
     crate::sandbox::required_static_network_filter(caps)
 }
 
+/// The proxy-only rule this plan asks for, if any.
+///
+/// Derived from the capability set rather than from what the kernel turned out
+/// to support, for the same reason the filter is: what the caller asked for
+/// does not change with the host, so neither does what has to answer for it.
+fn proxy_policy_for(plan: &ValidatedPlan) -> Option<crate::sandbox::ProxyOnlyPolicy> {
+    match plan.capabilities().network_mode() {
+        crate::NetworkMode::ProxyOnly { port, bind_ports } => {
+            Some(crate::sandbox::ProxyOnlyPolicy {
+                proxy_port: *port,
+                bind_ports: bind_ports.clone(),
+                bind_port_ranges: plan.capabilities().localhost_port_ranges().to_vec(),
+            })
+        }
+        crate::NetworkMode::Blocked | crate::NetworkMode::AllowAll => None,
+    }
+}
+
 /// The platform policy, fully built in the parent.
 #[cfg(target_os = "linux")]
 pub(super) struct PlatformSandbox {
@@ -2187,6 +2313,13 @@ pub(super) struct PlatformSandbox {
     /// [`required_network_filter`]. The child only reads the answer, and
     /// `StaticNetworkFilter` is `Copy`, so reading it allocates nothing.
     network_filter: crate::sandbox::StaticNetworkFilter,
+    /// The seccomp-notify program for proxy-only egress, built in the parent.
+    ///
+    /// Built here for the same reason everything else is: the child's apply has
+    /// to be a fixed sequence of syscalls, and assembling a BPF program is not
+    /// one. `install_raw` in the child is a single `seccomp(2)` call over
+    /// memory the parent already laid out.
+    proxy_notify: Option<crate::sandbox::PreparedSeccompNotifyFilter>,
 }
 
 /// The platform policy, fully built in the parent.
@@ -2222,17 +2355,29 @@ impl PlatformSandbox {
         // Asked about what the POLICY requested, not about `prepared.fallback()`.
         // `prepare_with_abi_inner` assigns that field only when the kernel's
         // Landlock ABI carries no network rights at all; on ABI V4 and above it
-        // stays `None`, so passing it here meant a proxy-only plan was never
-        // refused on a modern kernel — it was accepted and enforced by Landlock
-        // port rules alone, with no supervisor, no notify descriptor and no UDP
+        // stays `None`, so asking it meant a proxy-only plan behaved differently
+        // on a modern kernel — accepted and enforced by Landlock port rules
+        // alone, with no supervisor, no notify descriptor and no UDP
         // restriction. What the caller asked for does not change with the
-        // kernel, so neither should the refusal.
-        refuse_unsupported_fallback(&crate::sandbox::seccomp_network_fallback_mode(
-            plan.capabilities(),
-        ))?;
+        // kernel, so neither does what gets installed.
+        //
+        // Landlock cannot express proxy-only on *any* kernel: its network
+        // rights are per-port, so "only port P" permits reaching every host in
+        // the world on port P, and the workload picks the port it dials. Only a
+        // supervisor that reads the destination address can answer this, which
+        // is what the notify listener is for.
+        let proxy_notify = match crate::sandbox::seccomp_network_fallback_mode(plan.capabilities())
+        {
+            crate::sandbox::SeccompNetFallback::ProxyOnly { bind_ports, .. } => Some(
+                crate::sandbox::prepare_seccomp_proxy_filter(!bind_ports.is_empty()),
+            ),
+            crate::sandbox::SeccompNetFallback::BlockAll
+            | crate::sandbox::SeccompNetFallback::None => None,
+        };
         Ok(Self {
             prepared,
             network_filter: required_network_filter(plan.capabilities()),
+            proxy_notify,
         })
     }
 
@@ -2288,7 +2433,7 @@ impl PlatformSandbox {
     ///
     /// [raw]: crate::sandbox::PreparedLandlockSandbox::apply_raw
     #[cfg(target_os = "linux")]
-    pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
+    pub(super) fn apply_in_child(&self) -> Result<Option<RawFd>, (PreExecStage, i32)> {
         // The Landlock sub-stage (create/add-rule/restrict) is not carried in
         // the fixed-size record; the errno is.
         self.prepared
@@ -2315,7 +2460,24 @@ impl PlatformSandbox {
                     .map_err(|err| (PreExecStage::NetworkFilter, err.errno()))?;
             }
         }
-        Ok(())
+
+        // Last, so that everything above it is already in force if this one
+        // fails. The listener is returned rather than kept: this process is
+        // about to be confined by it, and the only useful holder is the parent.
+        //
+        // The static filter above and this one stack. Their combination is the
+        // whole policy: the static one refuses every address family that is not
+        // TCP, and this one asks a supervisor about the TCP destinations that
+        // remain. Neither is sufficient alone — the static filter cannot read a
+        // `sockaddr`, and the listener would never see a UDP socket the static
+        // filter had already refused to create.
+        match self.proxy_notify.as_ref() {
+            None => Ok(None),
+            Some(filter) => filter
+                .install_raw()
+                .map(Some)
+                .map_err(|err| (PreExecStage::NetworkFilter, err.errno())),
+        }
     }
 
     /// Apply the policy to the calling (child) process.
@@ -2331,13 +2493,15 @@ impl PlatformSandbox {
     /// The `errno` reported is `sandbox_init`'s return value, which is not an
     /// `errno(3)` code on this platform.
     #[cfg(target_os = "macos")]
-    pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
+    pub(super) fn apply_in_child(&self) -> Result<Option<RawFd>, (PreExecStage, i32)> {
         // SAFETY: the profile is a NUL-terminated C string owned by the parent
         // and still mapped here. The call is made once, in a freshly forked
         // child that has run nothing else.
         let result = unsafe { crate::sandbox::sandbox_init_raw(self.profile.as_ptr()) };
         if result == 0 {
-            Ok(())
+            // Seatbelt needs no supervisor: the profile expresses "only this
+            // localhost port" directly, so there is no listener to hand back.
+            Ok(None)
         } else {
             Err((PreExecStage::SandboxApply, result))
         }
@@ -2345,7 +2509,7 @@ impl PlatformSandbox {
 
     /// Apply the policy to the calling (child) process.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    pub(super) fn apply_in_child(&self) -> Result<(), (PreExecStage, i32)> {
+    pub(super) fn apply_in_child(&self) -> Result<Option<RawFd>, (PreExecStage, i32)> {
         // Unreachable: `build` refuses on this platform, so no child exists.
         Err((PreExecStage::SandboxApply, libc::ENOSYS))
     }
@@ -2581,61 +2745,75 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_policy_needing_a_supervisor_we_do_not_run_is_refused() {
-        use crate::sandbox::SeccompNetFallback;
-
-        // Proxy-only mediation without a notify-descriptor poller would leave
-        // connect/bind unmediated. Fail closed instead.
-        let refused = refuse_unsupported_fallback(&SeccompNetFallback::ProxyOnly {
-            proxy_port: 8080,
-            bind_ports: vec![],
-        });
-        assert!(
-            matches!(refused, Err(PrepareError::SandboxSpec { .. })),
-            "proxy-only must be refused, got {refused:?}"
-        );
-
-        // The self-contained policies still pass.
-        assert_eq!(
-            refuse_unsupported_fallback(&SeccompNetFallback::None),
-            Ok(())
-        );
-        assert_eq!(
-            refuse_unsupported_fallback(&SeccompNetFallback::BlockAll),
-            Ok(())
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_proxy_only_policy_is_refused_by_build_not_merely_by_the_helper() {
+    fn a_proxy_only_policy_prepares_the_supervisor_it_needs() {
         use crate::capability::CapabilitySet;
 
-        // `a_policy_needing_a_supervisor_we_do_not_run_is_refused` calls
-        // `refuse_unsupported_fallback` directly with a synthetic value, so it
-        // proves the helper refuses `ProxyOnly` — not that anything ever asks
-        // it about a proxy-only plan. That gap was real: `build` passed
-        // `prepared.fallback()`, which `prepare_with_abi_inner` assigns only
-        // when the kernel's Landlock ABI provides no network rights at all.
-        // On ABI V4 and above it stays `None`, so the refusal never fired and
-        // a proxy-only policy was accepted and enforced by Landlock port rules
-        // alone: no supervisor, no notify descriptor, no UDP restriction. The
-        // caller asked for mediated networking and silently got something
-        // weaker, on precisely the kernels most likely to run this.
-        //
-        // The refusal must therefore be driven by what the policy asked for,
-        // which is ABI-independent, and this test goes through `build` so it
-        // cannot pass on a helper nobody consults.
+        // Proxy-only mediation is not self-contained: the kernel traps
+        // connect/bind/send to a listener that somebody must answer. This slice
+        // used to refuse such a policy outright, because it created no such
+        // supervisor. It now builds one, and the filter is prepared in the
+        // parent so the child's install is a single syscall.
         let plan = sealed(
             SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new().proxy_only(8080)),
         );
-        match PlatformSandbox::build(&plan) {
-            Err(PrepareError::SandboxSpec { reason }) => assert!(
-                reason.contains("proxy-only"),
-                "the refusal must name what it refused: {reason}"
-            ),
-            Err(other) => panic!("refused, but for the wrong reason: {other:?}"),
-            Ok(_) => panic!("a proxy-only plan must be refused by build, but it was accepted"),
+        let sandbox = PlatformSandbox::build(&plan).expect("a proxy-only plan must now build");
+        assert!(
+            sandbox.proxy_notify.is_some(),
+            "a proxy-only plan must carry the listener that answers for it; \
+             without one the child blocks on its first network syscall"
+        );
+
+        let policy = proxy_policy_for(&plan).expect("the rule the supervisor answers from");
+        assert_eq!(policy.proxy_port, 8080);
+        assert!(
+            policy.bind_ports.is_empty(),
+            "nothing asked to listen, so nothing may"
+        );
+    }
+
+    /// The listener is prepared from what the *policy* asked for, never from
+    /// what the kernel turned out to support.
+    ///
+    /// This was a real hole, in the other direction. `build` used to consult
+    /// `prepared.fallback()`, which `prepare_with_abi_inner` assigns only when
+    /// the kernel's Landlock ABI carries no network rights at all. On ABI V4
+    /// and above it stays `None`, so on precisely the kernels most likely to
+    /// run this, a proxy-only policy was enforced by Landlock port rules alone:
+    /// no supervisor, no notify descriptor, no UDP restriction. Landlock's
+    /// network rights are per-port, so "only port P" permits reaching every
+    /// host in the world on port P — and the workload picks the port it dials.
+    ///
+    /// What the caller asked for does not change with the kernel, so neither
+    /// does what gets installed to answer for it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listener_is_prepared_from_the_policy_not_from_the_kernel() {
+        use crate::capability::CapabilitySet;
+
+        let mediated = sealed(
+            SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new().proxy_only(8080)),
+        );
+        assert!(
+            PlatformSandbox::build(&mediated)
+                .expect("build")
+                .proxy_notify
+                .is_some()
+        );
+
+        // The shapes that need no supervisor prepare none: a listener nobody
+        // needs is a thread nobody stops and a descriptor nobody closes.
+        for capabilities in [
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().block_network().allow_tcp_connect(443),
+        ] {
+            let plan = sealed(SandboxPlan::new("/bin/echo").capabilities(capabilities));
+            assert!(
+                PlatformSandbox::build(&plan)
+                    .expect("build")
+                    .proxy_notify
+                    .is_none()
+            );
+            assert!(proxy_policy_for(&plan).is_none());
         }
     }
 

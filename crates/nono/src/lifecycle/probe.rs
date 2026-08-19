@@ -322,10 +322,14 @@ impl std::fmt::Display for ProbeIndeterminate {
 /// answer with the same `EPERM`/`EACCES` and the kernel offers no per-syscall
 /// attribution, so this label names the mechanism that expresses the plan's
 /// rights, not the layer that happened to answer; guessing between them is
-/// exactly what this module refuses to do. Proxy-only mediation — the one
-/// arrangement that would install a user-notification listener — is refused
-/// outright at prepare time by `refuse_unsupported_fallback` in
-/// [`super::prepare`], so no held child on this path has one.
+/// exactly what this module refuses to do. Proxy-only mediation adds a third
+/// mechanism — a user-notification listener answered by the supervisor — and it
+/// is reported as [`Self::Seccomp`] as well, because it is a seccomp filter
+/// that expresses it. A caller that needs to know whether egress is *mediated*
+/// rather than merely filtered asks
+/// [`PreparedSandbox::proxy_mediation`](super::prepare::PreparedSandbox::proxy_mediation),
+/// which answers from the policy rather than from a guess about which layer
+/// replied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementMechanism {

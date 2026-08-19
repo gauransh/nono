@@ -13,6 +13,7 @@
 //! Linux CI run ever reads.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What a supervisor should do with a trapped network syscall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +137,31 @@ impl fmt::Display for ProxyOnlyPolicy {
             )?;
         }
         Ok(())
+    }
+}
+
+/// How many notifications a run may have refused, and how many it answered.
+///
+/// Counted rather than logged, because a count is checkable: a run that reports
+/// zero refusals and zero decisions did not have a working listener, and
+/// nothing else about it would say so.
+#[derive(Debug, Default)]
+pub struct ProxyNotifyStats {
+    pub(super) decided: AtomicU64,
+    pub(super) denied: AtomicU64,
+}
+
+impl ProxyNotifyStats {
+    /// Notifications answered, of any verdict.
+    #[must_use]
+    pub fn decided(&self) -> u64 {
+        self.decided.load(Ordering::Relaxed)
+    }
+
+    /// Notifications refused.
+    #[must_use]
+    pub fn denied(&self) -> u64 {
+        self.denied.load(Ordering::Relaxed)
     }
 }
 

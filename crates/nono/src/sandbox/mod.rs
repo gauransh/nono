@@ -57,7 +57,14 @@ pub(crate) use linux::{
 /// exists.
 pub mod proxy_only;
 
-pub use proxy_only::{Destination, NetSyscall, NetVerdict, ProxyOnlyPolicy};
+pub use proxy_only::{Destination, NetSyscall, NetVerdict, ProxyNotifyStats, ProxyOnlyPolicy};
+
+/// Servicing a seccomp-notify listener for proxy-only egress.
+#[cfg(target_os = "linux")]
+pub mod proxy_notify;
+
+#[cfg(target_os = "linux")]
+pub use proxy_notify::serve as serve_proxy_notifications;
 
 // Re-export Linux seccomp-notify primitives for supervisor use
 #[cfg(target_os = "linux")]
@@ -70,7 +77,7 @@ pub use linux::{
     install_seccomp_proxy_filter, net_syscall_kind, notif_id_valid, prepare_seccomp_af_unix_filter,
     prepare_seccomp_proxy_filter, prepare_seccomp_with_abi, probe_seccomp_block_network_support,
     read_mmsghdr_dests, read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how,
-    recv_notif, resolve_notif_path, respond_notif_errno, validate_openat2_size,
+    recv_notif, resolve_notif_path, respond_notif_errno, steal_child_fd, validate_openat2_size,
 };
 
 /// Information about sandbox support on this platform
