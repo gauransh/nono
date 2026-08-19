@@ -399,6 +399,15 @@ struct Bootstrap {
     pty_fd: Option<RawFd>,
     /// The plan's activation expiry, in milliseconds.
     expiry_millis: Option<u64>,
+    /// The proxy-only rule the supervisor answers notifications from.
+    ///
+    /// Carried across the exec because the supervisor is the process that
+    /// services the listener and it never sees the plan. Without it, a detached
+    /// run under proxy mediation adopts a listener it has no rule to answer —
+    /// which is a refusal, and was: the supervisor failed to adopt and the
+    /// launcher saw only `ECHILD`.
+    #[serde(default)]
+    proxy_policy: Option<crate::sandbox::ProxyOnlyPolicy>,
     /// The message that releases the held child.
     release: [u8; GATE_MESSAGE_BYTES],
     /// The message that tells it to give up.
@@ -577,6 +586,7 @@ fn launch_inner(
             .gate()
             .activation_expiry
             .map(|expiry| u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX)),
+        proxy_policy: super::prepare::proxy_policy_for(plan),
         release: *secrets.release(),
         abort: *secrets.abort(),
     };
@@ -1254,11 +1264,20 @@ fn serve(
         status,
         secrets: GateSecrets::from_parts(bootstrap.blob.release, bootstrap.blob.abort),
         expiry: bootstrap.blob.expiry_millis.map(Duration::from_millis),
+        proxy_policy: bootstrap.blob.proxy_policy.clone(),
         events: Arc::clone(&events),
     };
     let child_identity = adopted.identity.clone();
     let process_group = adopted.process_group;
-    let (mut prepared, handle) = PreparedSandbox::adopt(adopted).map_err(|_| libc::ECHILD)?;
+    // The handshake carries an errno and nothing else, so the mapping is the
+    // only diagnosis the launcher ever gets. `ECHILD` for every failure is what
+    // "no child processes" meant when the real cause was a run whose proxy
+    // policy never crossed the exec — a true statement about nothing that had
+    // happened.
+    let (mut prepared, handle) = PreparedSandbox::adopt(adopted).map_err(|error| match error {
+        PrepareError::SandboxSpec { .. } => libc::EINVAL,
+        _ => libc::ECHILD,
+    })?;
 
     let mut record = SessionRecord::new(
         bootstrap.blob.session_id,

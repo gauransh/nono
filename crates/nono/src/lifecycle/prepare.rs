@@ -470,6 +470,9 @@ pub(super) struct AdoptedChild {
     pub(super) secrets: GateSecrets,
     /// The gate's configured lifetime, from the plan.
     pub(super) expiry: Option<Duration>,
+    /// The proxy-only rule to answer notifications from, if the plan asked for
+    /// mediated egress.
+    pub(super) proxy_policy: Option<crate::sandbox::ProxyOnlyPolicy>,
     /// The emitter this run reports through, already carrying the supervisor's
     /// own ring sink.
     pub(super) events: Arc<EventEmitter>,
@@ -659,6 +662,7 @@ impl PreparedSandbox {
             status,
             secrets,
             expiry,
+            proxy_policy,
             events,
         } = adopted;
 
@@ -681,9 +685,9 @@ impl PreparedSandbox {
             shared: SharedLifecycle::new(state),
             gate: Some(gate),
             status: Some(status),
-            // An adopted run is already past its prepare, so no listener will
-            // arrive for it and there is nothing to answer from.
-            proxy_policy: None,
+            // Carried across the exec in the bootstrap blob: this process is
+            // the one that services the listener, and it never sees the plan.
+            proxy_policy,
             notify_stats: std::sync::Arc::default(),
             // Replaced immediately below; a digest of all zeros matches no
             // token anyone can present, so the gate is shut for the moment it
@@ -2292,7 +2296,7 @@ fn required_network_filter(caps: &crate::CapabilitySet) -> crate::sandbox::Stati
 /// Derived from the capability set rather than from what the kernel turned out
 /// to support, for the same reason the filter is: what the caller asked for
 /// does not change with the host, so neither does what has to answer for it.
-fn proxy_policy_for(plan: &ValidatedPlan) -> Option<crate::sandbox::ProxyOnlyPolicy> {
+pub(super) fn proxy_policy_for(plan: &ValidatedPlan) -> Option<crate::sandbox::ProxyOnlyPolicy> {
     match plan.capabilities().network_mode() {
         crate::NetworkMode::ProxyOnly { port, bind_ports } => {
             Some(crate::sandbox::ProxyOnlyPolicy {

@@ -61,7 +61,7 @@ pub struct Destination {
 /// destination plus whatever the workload may listen on. Which *hosts* are
 /// permitted is a question this layer cannot answer — it sees an address, and
 /// the policy names a name.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProxyOnlyPolicy {
     /// The loopback port the proxy listens on.
     pub proxy_port: u16,
