@@ -50,6 +50,15 @@ pub(crate) use linux::{
     required_static_network_filter, seccomp_network_fallback_mode,
 };
 
+/// The rule a proxy-mediated sandbox applies to trapped network syscalls.
+///
+/// Portable on purpose: it is the security-critical half of proxy-only
+/// mediation, and it is tested on every host rather than only where seccomp
+/// exists.
+pub mod proxy_only;
+
+pub use proxy_only::{Destination, NetSyscall, NetVerdict, ProxyOnlyPolicy};
+
 // Re-export Linux seccomp-notify primitives for supervisor use
 #[cfg(target_os = "linux")]
 pub use linux::{
@@ -58,7 +67,7 @@ pub use linux::{
     SYS_SENDTO, SeccompData, SeccompNetFallback, SeccompNotif, SeccompOpts, SockaddrInfo,
     UnixSocketKind, classify_access_from_flags, classify_af_unix, continue_notif, deny_notif,
     inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
-    install_seccomp_proxy_filter, notif_id_valid, prepare_seccomp_af_unix_filter,
+    install_seccomp_proxy_filter, net_syscall_kind, notif_id_valid, prepare_seccomp_af_unix_filter,
     prepare_seccomp_proxy_filter, prepare_seccomp_with_abi, probe_seccomp_block_network_support,
     read_mmsghdr_dests, read_msghdr_dest, read_notif_path, read_notif_sockaddr, read_open_how,
     recv_notif, resolve_notif_path, respond_notif_errno, validate_openat2_size,

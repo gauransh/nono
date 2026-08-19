@@ -734,47 +734,30 @@ pub(super) fn decide_network_notification(
         return NetworkDecision::Allow;
     }
 
-    match syscall {
-        SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
-            // Allow connect/sendto/sendmsg/sendmmsg only to loopback + proxy port.
-            // sendto/sendmsg/sendmmsg with a destination address is semantically
-            // equivalent to connect for network reach-out (issue #1089).
-            if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
-                debug!(
-                    "Proxy seccomp: allowing network syscall nr={} to loopback:{}",
-                    syscall, sockaddr.port
-                );
-                NetworkDecision::Allow
-            } else {
-                debug!(
-                    "Proxy seccomp: denying network syscall nr={} to family={} port={} loopback={}",
-                    syscall, sockaddr.family, sockaddr.port, sockaddr.is_loopback
-                );
-                NetworkDecision::Deny
-            }
+    // The rule lives in the library (`nono::sandbox::proxy_only`) so that this
+    // supervisor and the lifecycle's answer "may this packet leave" the same
+    // way. Two implementations of that is one more than can be kept honest.
+    let policy = nono::sandbox::ProxyOnlyPolicy {
+        proxy_port: config.proxy_port,
+        bind_ports: config.proxy_bind_ports.to_vec(),
+        bind_port_ranges: config.proxy_bind_port_ranges.to_vec(),
+    };
+    let Some(kind) = nono::sandbox::net_syscall_kind(syscall) else {
+        warn!("Unexpected syscall {syscall} in proxy seccomp handler, denying");
+        return NetworkDecision::Deny;
+    };
+    match policy.decide(kind, sockaddr.destination()) {
+        nono::sandbox::NetVerdict::Allow => {
+            debug!(
+                "Proxy seccomp: allowing network syscall nr={} to port={} loopback={}",
+                syscall, sockaddr.port, sockaddr.is_loopback
+            );
+            NetworkDecision::Allow
         }
-        SYS_BIND => {
-            let port = sockaddr.port;
-            let allowed = config.proxy_bind_ports.contains(&port)
-                || config
-                    .proxy_bind_port_ranges
-                    .iter()
-                    .any(|&(s, e)| port >= s && port <= e);
-            if allowed {
-                debug!("Proxy seccomp: allowing bind on port {}", port);
-                NetworkDecision::Allow
-            } else {
-                debug!(
-                    "Proxy seccomp: denying bind on port {} (allowed ports: {:?}, ranges: {:?})",
-                    port, config.proxy_bind_ports, config.proxy_bind_port_ranges
-                );
-                NetworkDecision::Deny
-            }
-        }
-        other => {
-            warn!(
-                "Unexpected syscall {} in proxy seccomp handler, denying",
-                other
+        nono::sandbox::NetVerdict::Deny => {
+            debug!(
+                "Proxy seccomp: denying network syscall nr={} to family={} port={} loopback={}",
+                syscall, sockaddr.family, sockaddr.port, sockaddr.is_loopback
             );
             NetworkDecision::Deny
         }

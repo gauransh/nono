@@ -2894,6 +2894,36 @@ pub struct SockaddrInfo {
     pub unix_path: Option<PathBuf>,
 }
 
+/// The kind of trapped syscall a Linux syscall number denotes, if this
+/// supervisor mediates it.
+///
+/// The mapping is here, beside the numbers, and the *rule* is in
+/// [`crate::sandbox::proxy_only`] where it can be read and tested on any host.
+/// `None` means the filter trapped something the rule does not classify, which
+/// a caller must treat as a denial: the two have drifted apart, and that is not
+/// a state in which to guess.
+#[must_use]
+pub const fn net_syscall_kind(syscall: i32) -> Option<crate::sandbox::NetSyscall> {
+    match syscall {
+        SYS_CONNECT | SYS_SENDTO | SYS_SENDMSG | SYS_SENDMMSG => {
+            Some(crate::sandbox::NetSyscall::ReachOut)
+        }
+        SYS_BIND => Some(crate::sandbox::NetSyscall::Bind),
+        _ => None,
+    }
+}
+
+impl SockaddrInfo {
+    /// The part of this address the proxy-only rule reads.
+    #[must_use]
+    pub const fn destination(&self) -> crate::sandbox::Destination {
+        crate::sandbox::Destination {
+            port: self.port,
+            is_loopback: self.is_loopback,
+        }
+    }
+}
+
 /// Seccomp network fallback mode determined during sandbox apply.
 ///
 /// When Landlock ABI lacks `AccessNet`, the sandbox cannot enforce network
