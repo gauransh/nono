@@ -696,9 +696,7 @@ pub(super) fn decide_network_notification(
     sockaddr: &nono::sandbox::SockaddrInfo,
     config: &SupervisorConfig<'_>,
 ) -> NetworkDecision {
-    use nono::sandbox::{
-        SYS_BIND, SYS_CONNECT, SYS_SENDMMSG, SYS_SENDMSG, SYS_SENDTO, UnixSocketKind,
-    };
+    use nono::sandbox::UnixSocketKind;
 
     // AF_UNIX: allow only filesystem-backed (pathname) sockets that match an
     // explicit socket capability. Abstract/unnamed sockets bypass pathname

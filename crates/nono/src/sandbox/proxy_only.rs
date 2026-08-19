@@ -100,15 +100,21 @@ impl ProxyOnlyPolicy {
     /// long as you use this number".
     #[must_use]
     pub fn decide(&self, syscall: NetSyscall, destination: Destination) -> NetVerdict {
-        // A proxy on port 0 is not a proxy. Without this, a default-constructed
-        // policy would match a connect to port 0 and let it through — a way out
-        // opened by forgetting to fill a field in, which is the worst way for
-        // one to appear.
-        if self.proxy_port == 0 {
-            return NetVerdict::Deny;
-        }
         match syscall {
             NetSyscall::ReachOut => {
+                // A proxy on port 0 is not a proxy. Without this check a policy
+                // whose port was never filled in would match a connect to port
+                // 0 and let it through — a way out opened by forgetting to set
+                // a field, which is the worst way for one to appear.
+                //
+                // Only this arm. `Bind` consults an explicit list, so it is
+                // already closed by default, and a policy that grants binds
+                // while mediating no egress is a real configuration: the
+                // supervisor that answers AF_UNIX notifications uses exactly
+                // that shape.
+                if self.proxy_port == 0 {
+                    return NetVerdict::Deny;
+                }
                 if destination.is_loopback && destination.port == self.proxy_port {
                     NetVerdict::Allow
                 } else {
