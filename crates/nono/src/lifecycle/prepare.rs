@@ -2150,30 +2150,33 @@ fn refuse_unsupported_fallback(
     Ok(())
 }
 
-/// Whether this policy needs the block-all seccomp network filter.
+/// Which static seccomp network filter this policy needs, if any.
 ///
 /// Landlock is a filesystem-and-TCP mechanism: it has no vocabulary for UDP,
 /// for raw sockets, or for any other address family, so a kernel that supports
-/// [`AccessNet`][net] enforces a `block_network()` policy only as far as TCP
-/// connect and bind. Everything else stays open, which is the difference
-/// between a network that is blocked and a network that merely refuses two
-/// syscalls.
+/// [`AccessNet`][net] enforces a network policy only as far as TCP connect and
+/// bind. Everything else stays open, which is the difference between a network
+/// that is restricted and one that merely refuses two syscalls.
 ///
-/// `BlockAll` is the one fallback mode the static filter expresses exactly —
-/// no supervisor, no notify descriptor, no per-call decision — so it is the
-/// one this decides on. `ProxyOnly` is refused earlier by
-/// [`refuse_unsupported_fallback`], and `None` (which includes every
-/// `AllowAll` policy and every blocked policy carrying port exceptions) gets
-/// no filter: installing one there would deny sockets the caller never asked
-/// to give up.
+/// Both restrictive shapes therefore need a filter, and asking only about the
+/// first is what left DEF-04 open:
+///
+/// * `block_network()` with no exceptions -> `BlockAll`: no internet sockets at
+///   all.
+/// * `block_network()` **with TCP port exceptions** -> `TcpOnly`: Landlock
+///   enforces the port allowlist, and this denies every family it cannot
+///   express. Without it a policy granting TCP:443 left UDP entirely
+///   unmediated, which is a usable exfiltration path out of a sandbox that
+///   reported the network as blocked.
+///
+/// `AllowAll` with no port rules needs nothing. The selection itself is
+/// `sandbox::required_static_network_filter`, which already handled every case
+/// correctly and was simply unreachable from here.
 ///
 /// [net]: https://docs.kernel.org/userspace-api/landlock.html
 #[cfg(target_os = "linux")]
-fn needs_network_filter(caps: &crate::CapabilitySet) -> bool {
-    matches!(
-        crate::sandbox::seccomp_network_fallback_mode(caps),
-        crate::sandbox::SeccompNetFallback::BlockAll
-    )
+fn required_network_filter(caps: &crate::CapabilitySet) -> crate::sandbox::StaticNetworkFilter {
+    crate::sandbox::required_static_network_filter(caps)
 }
 
 /// The platform policy, fully built in the parent.
@@ -2181,8 +2184,9 @@ fn needs_network_filter(caps: &crate::CapabilitySet) -> bool {
 pub(super) struct PlatformSandbox {
     prepared: crate::sandbox::PreparedLandlockSandbox,
     /// Decided here, in the parent, from the capability set — see
-    /// [`needs_network_filter`]. The child only reads the answer.
-    network_filter: bool,
+    /// [`required_network_filter`]. The child only reads the answer, and
+    /// `StaticNetworkFilter` is `Copy`, so reading it allocates nothing.
+    network_filter: crate::sandbox::StaticNetworkFilter,
 }
 
 /// The platform policy, fully built in the parent.
@@ -2228,7 +2232,7 @@ impl PlatformSandbox {
         ))?;
         Ok(Self {
             prepared,
-            network_filter: needs_network_filter(plan.capabilities()),
+            network_filter: required_network_filter(plan.capabilities()),
         })
     }
 
@@ -2290,16 +2294,26 @@ impl PlatformSandbox {
         self.prepared
             .apply_raw()
             .map_err(|err| (PreExecStage::SandboxApply, err.errno()))?;
-        if self.network_filter {
-            // On a kernel whose Landlock has no network support the prepared
-            // policy installs this same program itself, so the child ends up
-            // with two identical filters. That is deliberate: they are a few
-            // instructions each and both answer EPERM, whereas skipping this
-            // one on the strength of what the other module decided would make
-            // the enforcement depend on an inference instead of on the
-            // capability set.
-            crate::sandbox::install_seccomp_block_network_raw()
-                .map_err(|err| (PreExecStage::NetworkFilter, err.errno()))?;
+        // On a kernel whose Landlock has no network support the prepared policy
+        // installs the same program itself, so the child can end up with two
+        // identical filters. That is deliberate: they are a few instructions
+        // each and both answer EPERM, whereas skipping this on the strength of
+        // what the other module decided would make enforcement depend on an
+        // inference instead of on the capability set.
+        //
+        // The match is exhaustive with no wildcard: a new filter variant must
+        // be handled here rather than silently installing nothing, which is the
+        // shape of the bug this replaced.
+        match self.network_filter {
+            crate::sandbox::StaticNetworkFilter::None => {}
+            crate::sandbox::StaticNetworkFilter::BlockAll => {
+                crate::sandbox::install_seccomp_block_network_raw()
+                    .map_err(|err| (PreExecStage::NetworkFilter, err.errno()))?;
+            }
+            crate::sandbox::StaticNetworkFilter::TcpOnly => {
+                crate::sandbox::install_seccomp_tcp_only_network_raw()
+                    .map_err(|err| (PreExecStage::NetworkFilter, err.errno()))?;
+            }
         }
         Ok(())
     }
@@ -2627,33 +2641,50 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_policy_that_blocks_the_network_is_not_applied_by_landlock_alone() {
+    fn every_restrictive_network_policy_arms_the_filter_it_needs() {
         use crate::capability::CapabilitySet;
+        use crate::sandbox::StaticNetworkFilter;
 
-        // The gap this closes. Landlock has no vocabulary for UDP, for raw
-        // sockets, or for any family but TCP, so a kernel that supports
-        // `AccessNet` enforces `block_network()` as far as TCP connect and
-        // bind and no further. A held child carrying only the ruleset would
-        // report "network blocked" and still send datagrams.
-        assert!(
-            needs_network_filter(&CapabilitySet::new().block_network()),
-            "a blocked network must arm the filter"
+        // Landlock has no vocabulary for UDP, for raw sockets, or for any
+        // family but TCP, so a kernel that supports `AccessNet` enforces a
+        // network policy as far as TCP connect and bind and no further. A held
+        // child carrying only the ruleset would report "network blocked" and
+        // still send datagrams.
+        //
+        // Both restrictive shapes therefore need a filter. Asking only about
+        // the first is what left DEF-04 open, and this test now covers both.
+        assert_eq!(
+            required_network_filter(&CapabilitySet::new().block_network()),
+            StaticNetworkFilter::BlockAll,
+            "a blocked network with no exceptions must deny every socket"
+        );
+        assert_eq!(
+            required_network_filter(&CapabilitySet::new().block_network().allow_tcp_connect(443)),
+            StaticNetworkFilter::TcpOnly,
+            "a TCP port exception must still deny every family Landlock cannot \
+             express -- otherwise granting TCP:443 leaves UDP wide open"
         );
 
-        // And it is armed in the built policy, not merely computable from the
-        // capability set: this is the field `apply_in_child` reads. Removing
-        // the seccomp step from that path leaves this true and the live UDP
-        // probe in `super::probe` red — the two tests fail at different ends
+        // And they are armed in the built policy, not merely computable from
+        // the capability set: this is the field `apply_in_child` reads.
+        // Removing the seccomp step from that path leaves these true and the
+        // live probes in `super::probe` red — the tests fail at different ends
         // of the same wire on purpose.
-        let plan = sealed(
-            SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new().block_network()),
-        );
-        match PlatformSandbox::build(&plan) {
-            Ok(sandbox) => assert!(
-                sandbox.network_filter,
-                "the built policy must carry the filter step"
+        for (caps, expected) in [
+            (
+                CapabilitySet::new().block_network(),
+                StaticNetworkFilter::BlockAll,
             ),
-            Err(err) => panic!("a block-network plan must build: {err}"),
+            (
+                CapabilitySet::new().block_network().allow_tcp_connect(443),
+                StaticNetworkFilter::TcpOnly,
+            ),
+        ] {
+            let plan = sealed(SandboxPlan::new("/bin/echo").capabilities(caps));
+            match PlatformSandbox::build(&plan) {
+                Ok(sandbox) => assert_eq!(sandbox.network_filter, expected),
+                Err(err) => panic!("a restrictive plan must build: {err}"),
+            }
         }
     }
 
@@ -2661,30 +2692,21 @@ mod tests {
     #[test]
     fn a_policy_that_did_not_ask_for_the_filter_does_not_get_one() {
         use crate::capability::CapabilitySet;
+        use crate::sandbox::StaticNetworkFilter;
 
         // A filter nobody asked for is a capability silently taken away, which
         // is the same class of error as one silently left in place.
-        assert!(
-            !needs_network_filter(&CapabilitySet::new()),
+        assert_eq!(
+            required_network_filter(&CapabilitySet::new()),
+            StaticNetworkFilter::None,
             "an open policy must not be filtered"
-        );
-
-        // Blocked *with* port exceptions is not `BlockAll`: the static program
-        // cannot express "no sockets except these ports", so installing it
-        // would deny the ports the caller was granted. Landlock's V4 port
-        // allowlist is what enforces this policy, and what it does not cover
-        // (UDP, raw, other families) stays uncovered — see the report on this
-        // change.
-        let with_ports = CapabilitySet::new().block_network().allow_tcp_connect(443);
-        assert!(
-            !needs_network_filter(&with_ports),
-            "a port exception is not a block-all"
         );
 
         let plan = sealed(SandboxPlan::new("/bin/echo").capabilities(CapabilitySet::new()));
         match PlatformSandbox::build(&plan) {
-            Ok(sandbox) => assert!(
-                !sandbox.network_filter,
+            Ok(sandbox) => assert_eq!(
+                sandbox.network_filter,
+                StaticNetworkFilter::None,
                 "an open policy must build without the filter step"
             ),
             Err(err) => panic!("an open plan must build: {err}"),

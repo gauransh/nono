@@ -1906,6 +1906,60 @@ mod live {
         }
     }
 
+    /// A TCP port exception must not open the datagram door (DEF-04).
+    ///
+    /// Landlock can express "block the network except TCP:443" and nothing
+    /// else — it has no datagram right at all. Before this, such a policy
+    /// installed no static filter, so UDP, raw, SCTP and netlink were entirely
+    /// unmediated while the policy read as a network restriction. An agent
+    /// granted TCP:443 could exfiltrate over UDP to any port.
+    ///
+    /// The control matters as much as the assertion: the *granted* TCP port
+    /// must still work. A filter that denied everything would satisfy the UDP
+    /// half while destroying the policy it was meant to complete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tcp_port_exception_does_not_leave_datagrams_unmediated() {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+        let dir = temp_dir();
+        let held = held(
+            capabilities(dir.path())
+                .block_network()
+                .allow_tcp_connect(443),
+        );
+
+        let udp = probe(
+            &held,
+            "udp-under-port-exception",
+            ProbeOp::Connect {
+                protocol: TransportProtocol::Udp,
+                addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1)),
+            },
+        );
+        assert!(
+            matches!(udp.outcome, ProbeOutcome::Refused { .. }),
+            "a datagram must be refused under a TCP-port-excepting policy; got {:?}",
+            udp.outcome
+        );
+
+        // The granted port still works: this is a completion of the policy,
+        // not a replacement of it.
+        let tcp = probe(
+            &held,
+            "granted-tcp-port",
+            ProbeOp::Connect {
+                protocol: TransportProtocol::Tcp,
+                addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443)),
+            },
+        );
+        assert!(
+            !matches!(tcp.outcome, ProbeOutcome::Refused { .. }),
+            "the granted TCP port must remain reachable; got {:?}",
+            tcp.outcome
+        );
+    }
+
     #[test]
     fn a_probe_really_does_what_it_says_except_where_it_says_otherwise() {
         // The two ends of "a probe is not a simulation". `RemoveFile` really

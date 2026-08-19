@@ -116,7 +116,7 @@ struct PreparedNetRule {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaticNetworkFilter {
+pub(crate) enum StaticNetworkFilter {
     None,
     BlockAll,
     TcpOnly,
@@ -2393,6 +2393,28 @@ pub fn install_seccomp_block_network() -> Result<()> {
 /// Landlock apply having already set it.
 pub(crate) fn install_seccomp_block_network_raw() -> std::result::Result<(), RawSandboxError> {
     install_static_network_filter_raw(StaticNetworkFilter::BlockAll)
+}
+
+/// Install the TCP-only baseline in an already-forked child, allocation-free.
+///
+/// The counterpart to [`install_seccomp_block_network_raw`] for a policy that
+/// blocks the network *except* for named TCP ports. Landlock can express the
+/// port allowlist and nothing else: it has no datagram right, so without this
+/// filter such a policy leaves UDP, raw, SCTP and netlink wide open while
+/// looking like a network restriction. This denies every family but TCP and
+/// keeps `AF_UNIX` for local IPC.
+pub(crate) fn install_seccomp_tcp_only_network_raw() -> std::result::Result<(), RawSandboxError> {
+    install_static_network_filter_raw(StaticNetworkFilter::TcpOnly)
+}
+
+/// Which static network filter this capability set requires, if any.
+///
+/// Exposes the existing baseline selection to the lifecycle. The selection
+/// logic already handled every case correctly; it was simply unreachable from
+/// `prepare`, which only ever asked "block everything?" and so installed
+/// nothing for a policy with port exceptions.
+pub(crate) fn required_static_network_filter(caps: &CapabilitySet) -> StaticNetworkFilter {
+    static_network_baseline_filter(caps)
 }
 
 fn install_seccomp_tcp_only_network() -> Result<()> {

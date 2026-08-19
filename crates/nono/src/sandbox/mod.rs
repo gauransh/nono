@@ -45,7 +45,10 @@ pub(crate) use linux::abi_version_number;
 // the capability set, the install happens in the child with raw syscalls.
 // Crate-internal — the public API stays `Sandbox::apply_auto`.
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{install_seccomp_block_network_raw, seccomp_network_fallback_mode};
+pub(crate) use linux::{
+    StaticNetworkFilter, install_seccomp_block_network_raw, install_seccomp_tcp_only_network_raw,
+    required_static_network_filter, seccomp_network_fallback_mode,
+};
 
 // Re-export Linux seccomp-notify primitives for supervisor use
 #[cfg(target_os = "linux")]
