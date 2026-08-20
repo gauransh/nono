@@ -148,6 +148,17 @@ pub enum AbsenceBasis {
         pgid: i32,
     },
 
+    /// `waitpid` reaped the direct child, *and* the cgroup the run was placed
+    /// in has no members left, *and* the boot id still matches.
+    ///
+    /// Strictly stronger than [`Self::ReapedAndGroupEmpty`], and the difference
+    /// is the whole reason this variant exists. A process can leave its process
+    /// group with `setsid(2)`, so an empty group proves only that nothing which
+    /// stayed is left. It cannot leave its cgroup, and everything the run
+    /// forked inherited that cgroup, so an empty cgroup is a proof about the
+    /// run rather than about the part of it that did not walk away.
+    ReapedAndCgroupEmpty,
+
     /// A probe of the pid returned `ESRCH`: no process bears that number.
     PidAbsent {
         /// The pid that was probed.
@@ -185,6 +196,20 @@ pub enum SurvivorEvidence {
         pgid: i32,
     },
 
+    /// The run's cgroup still has members.
+    ///
+    /// Unlike a process-group answer this one is not open to the "the number
+    /// was reissued" reading: the cgroup was created for this run and removed
+    /// with it, so anything inside it belongs to the run.
+    CgroupMember {
+        /// How many processes are still in it.
+        ///
+        /// A count rather than a path: which cgroup it was is already the
+        /// run's, and how many are left is the fact a caller cannot get any
+        /// other way.
+        members: u32,
+    },
+
     /// The pid is alive and its start time still matches the recorded one, so
     /// it is the same process the identity was captured from.
     IdentityMatch {
@@ -207,6 +232,18 @@ pub enum IndeterminateReason {
     UnprobableProcessGroup {
         /// The value that was refused.
         pgid: i32,
+    },
+
+    /// The run's cgroup could not be read.
+    ///
+    /// Deliberately not answered by falling back to the process-group probe.
+    /// An empty process group is precisely what is *not* proof of absence when
+    /// a descendant may have left it, so substituting the weaker proof because
+    /// the stronger one was unavailable would report exactly the confidence
+    /// this variant exists to withhold.
+    CgroupUnreadable {
+        /// What the kernel said, as an errno.
+        errno: i32,
     },
 
     /// The recorded pid is not a number that may be probed, for the same
@@ -308,6 +345,7 @@ pub(crate) fn verify_and_record(
     shared: &SharedLifecycle,
     identity: &ProcessIdentity,
     pgid: i32,
+    #[cfg(target_os = "linux")] cgroup: Option<&std::path::Path>,
     death: DeathObservation,
 ) -> Result<(CleanupVerification, Option<Transition>), CleanupError> {
     // Advisory, and deliberately the same pure function the recording below
@@ -320,7 +358,12 @@ pub(crate) fn verify_and_record(
     }
 
     let verification = match death {
-        DeathObservation::Reaped => verify_after_reap(identity, pgid),
+        DeathObservation::Reaped => verify_after_reap(
+            identity,
+            pgid,
+            #[cfg(target_os = "linux")]
+            cgroup,
+        ),
         DeathObservation::NotReaped => verify_identity(identity),
     };
     if !verification.is_confirmed_absent() {
@@ -351,10 +394,48 @@ pub(crate) fn probe_identity(identity: &ProcessIdentity) -> CleanupVerification 
 /// `waitpid` already settled the child itself: a reaped pid names no process.
 /// What remains is whatever it forked, which shares its process group because
 /// the child made itself a group leader before it ran anything.
-fn verify_after_reap(identity: &ProcessIdentity, pgid: i32) -> CleanupVerification {
+fn verify_after_reap(
+    identity: &ProcessIdentity,
+    pgid: i32,
+    #[cfg(target_os = "linux")] cgroup: Option<&std::path::Path>,
+) -> CleanupVerification {
     if let Some(rebooted) = rebooted_since_capture(identity) {
         return rebooted;
     }
+
+    // The cgroup answers first when the run had one, and its answer is final.
+    //
+    // It is the stronger proof: a process can leave its process group with
+    // `setsid(2)`, so an empty group shows only that nothing which stayed is
+    // left, while everything the run forked inherited its cgroup and could not
+    // leave it. Falling back to the group probe when the cgroup cannot be read
+    // would substitute exactly the weaker proof this exists to replace, so an
+    // unreadable cgroup is indeterminate instead.
+    #[cfg(target_os = "linux")]
+    if let Some(cgroup) = cgroup {
+        return match std::fs::read_to_string(cgroup.join("cgroup.procs")) {
+            Ok(text) => {
+                let members = text.lines().filter(|line| !line.trim().is_empty()).count();
+                if members == 0 {
+                    CleanupVerification::ConfirmedAbsent {
+                        basis: AbsenceBasis::ReapedAndCgroupEmpty,
+                    }
+                } else {
+                    CleanupVerification::StillPresent {
+                        survivors: SurvivorEvidence::CgroupMember {
+                            members: u32::try_from(members).unwrap_or(u32::MAX),
+                        },
+                    }
+                }
+            }
+            Err(error) => CleanupVerification::Indeterminate {
+                reason: IndeterminateReason::CgroupUnreadable {
+                    errno: error.raw_os_error().unwrap_or(0),
+                },
+            },
+        };
+    }
+
     if pgid <= 1 {
         return CleanupVerification::Indeterminate {
             reason: IndeterminateReason::UnprobableProcessGroup { pgid },
@@ -690,11 +771,17 @@ mod tests {
         // SAFETY: as above.
         let own_group = unsafe { libc::getpgrp() };
 
-        let (verdict, change) =
-            match verify_and_record(&shared, &live, own_group, DeathObservation::Reaped) {
-                Ok(pair) => pair,
-                Err(err) => panic!("verification must be legal in Exited: {err}"),
-            };
+        let (verdict, change) = match verify_and_record(
+            &shared,
+            &live,
+            own_group,
+            #[cfg(target_os = "linux")]
+            None,
+            DeathObservation::Reaped,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => panic!("verification must be legal in Exited: {err}"),
+        };
         assert!(matches!(verdict, CleanupVerification::StillPresent { .. }));
         assert_eq!(change, None, "a survivor must not move the machine");
         assert_eq!(shared.state(), LifecycleState::Exited);
@@ -705,11 +792,17 @@ mod tests {
         let shared = SharedLifecycle::new(LifecycleState::Stopped);
         let absent = ProcessIdentity::from_parts(i32::MAX, Some(1), boot_id());
 
-        let (verdict, change) =
-            match verify_and_record(&shared, &absent, i32::MAX, DeathObservation::Reaped) {
-                Ok(pair) => pair,
-                Err(err) => panic!("verification must be legal in Stopped: {err}"),
-            };
+        let (verdict, change) = match verify_and_record(
+            &shared,
+            &absent,
+            i32::MAX,
+            #[cfg(target_os = "linux")]
+            None,
+            DeathObservation::Reaped,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => panic!("verification must be legal in Stopped: {err}"),
+        };
         assert!(verdict.is_confirmed_absent());
         assert_eq!(
             change,
@@ -722,7 +815,14 @@ mod tests {
         // The second attempt is refused by the machine, not absorbed: counting
         // one proof twice is a caller bug worth seeing.
         assert_eq!(
-            verify_and_record(&shared, &absent, i32::MAX, DeathObservation::Reaped),
+            verify_and_record(
+                &shared,
+                &absent,
+                i32::MAX,
+                #[cfg(target_os = "linux")]
+                None,
+                DeathObservation::Reaped
+            ),
             Err(CleanupError {
                 state: LifecycleState::CleanupVerified
             })
@@ -745,6 +845,8 @@ mod tests {
                     &shared,
                     &live_identity(),
                     i32::MAX,
+                    #[cfg(target_os = "linux")]
+                    None,
                     DeathObservation::NotReaped
                 ),
                 Err(CleanupError { state }),
@@ -761,11 +863,17 @@ mod tests {
         // ignored the distinction would answer the wrong one.
         let live = live_identity();
         let shared = SharedLifecycle::new(LifecycleState::Failed);
-        let (reaped, _) =
-            match verify_and_record(&shared, &live, i32::MAX, DeathObservation::Reaped) {
-                Ok(pair) => pair,
-                Err(err) => panic!("verification must be legal in Failed: {err}"),
-            };
+        let (reaped, _) = match verify_and_record(
+            &shared,
+            &live,
+            i32::MAX,
+            #[cfg(target_os = "linux")]
+            None,
+            DeathObservation::Reaped,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => panic!("verification must be legal in Failed: {err}"),
+        };
         assert_eq!(
             reaped,
             CleanupVerification::ConfirmedAbsent {
@@ -774,11 +882,17 @@ mod tests {
         );
 
         let shared = SharedLifecycle::new(LifecycleState::Failed);
-        let (not_reaped, _) =
-            match verify_and_record(&shared, &live, i32::MAX, DeathObservation::NotReaped) {
-                Ok(pair) => pair,
-                Err(err) => panic!("verification must be legal in Failed: {err}"),
-            };
+        let (not_reaped, _) = match verify_and_record(
+            &shared,
+            &live,
+            i32::MAX,
+            #[cfg(target_os = "linux")]
+            None,
+            DeathObservation::NotReaped,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => panic!("verification must be legal in Failed: {err}"),
+        };
         assert_eq!(
             not_reaped,
             CleanupVerification::StillPresent {
@@ -856,6 +970,7 @@ mod tests {
         // if a "signalled" basis is ever added.
         let bases = [
             AbsenceBasis::ReapedAndGroupEmpty { pgid: 2 },
+            AbsenceBasis::ReapedAndCgroupEmpty,
             AbsenceBasis::PidAbsent { pid: 2 },
             AbsenceBasis::IdentityMismatch { pid: 2 },
             AbsenceBasis::BootIdChanged,
@@ -863,6 +978,7 @@ mod tests {
         for basis in bases {
             match basis {
                 AbsenceBasis::ReapedAndGroupEmpty { .. }
+                | AbsenceBasis::ReapedAndCgroupEmpty
                 | AbsenceBasis::PidAbsent { .. }
                 | AbsenceBasis::IdentityMismatch { .. }
                 | AbsenceBasis::BootIdChanged => {}

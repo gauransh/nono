@@ -671,8 +671,14 @@ impl ActivatedSandbox {
         } else {
             DeathObservation::NotReaped
         };
-        let (verification, change) =
-            verify_and_record(&self.shared, &self.identity, self.process_group, death)?;
+        let (verification, change) = verify_and_record(
+            &self.shared,
+            &self.identity,
+            self.process_group,
+            #[cfg(target_os = "linux")]
+            self.cgroup.as_ref().map(super::cgroup::RunCgroup::path),
+            death,
+        )?;
         // Every verdict, not only a proof of absence: a survivor is a fact a
         // consumer has to act on, and one it would never hear about if only
         // successes were reported.

@@ -1070,8 +1070,16 @@ impl PreparedSandbox {
         } else {
             DeathObservation::Reaped
         };
-        let (verification, change) =
-            verify_and_record(&self.shared, &self.identity, self.process_group, death)?;
+        let (verification, change) = verify_and_record(
+            &self.shared,
+            &self.identity,
+            self.process_group,
+            // A run that never activated was never placed in a cgroup:
+            // placement happens as the gate opens.
+            #[cfg(target_os = "linux")]
+            None,
+            death,
+        )?;
         // Every verdict is reported, not only a proof of absence: "something is
         // still there" is exactly as much a fact as "nothing is".
         self.events.emit(LifecycleEventKind::CleanupVerdict {
