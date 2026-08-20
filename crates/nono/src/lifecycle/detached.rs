@@ -150,9 +150,28 @@ pub struct DetachedSession {
     /// The state the supervisor reported when this connection opened. Not
     /// followed afterwards: [`Self::status`] asks.
     opened_in: LifecycleState,
+    /// The cgroup the run was placed in, learned at activation.
+    ///
+    /// `None` before activation because the placement happens as the gate
+    /// opens, and `None` afterwards on a host that would not give the
+    /// supervisor a cgroup. Both mean "there is no cgroup to attach to", which
+    /// is the only thing a consumer can act on.
+    cgroup: Option<String>,
 }
 
 impl DetachedSession {
+    /// The cgroup the run was placed in, if any.
+    ///
+    /// Learned from the activation reply, so it answers `None` before the run
+    /// is activated as well as on a host that would not give the supervisor a
+    /// cgroup. A consumer attaching its own enforcement to the run needs the
+    /// cgroup the workload is actually in; deriving a path from the session id
+    /// would be guessing at this library's naming.
+    #[must_use]
+    pub fn cgroup(&self) -> Option<&str> {
+        self.cgroup.as_deref()
+    }
+
     /// Connect and exchange hellos.
     ///
     /// The hello is not a formality: it is where the protocol version, the
@@ -177,6 +196,8 @@ impl DetachedSession {
             supervisor,
             stream,
             opened_in: LifecycleState::Planning,
+            // Not known until activation, which is when the placement happens.
+            cgroup: None,
         };
         let hello = ControlRequest::Hello {
             protocol: CONTROL_PROTOCOL_VERSION,
@@ -277,7 +298,10 @@ impl DetachedSession {
             token.zeroize();
         }
         match outcome? {
-            ControlReply::Activated { state } => Ok(state),
+            ControlReply::Activated { state, cgroup } => {
+                self.cgroup = cgroup;
+                Ok(state)
+            }
             other => Err(unexpected("activated", &other)),
         }
     }

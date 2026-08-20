@@ -2010,9 +2010,16 @@ impl Supervisor {
 
         let reply = match self.prepared.activate(&handle) {
             Ok(activated) => {
+                // Read before the handle is stored, from the activated run
+                // itself rather than derived from anything: it is the cgroup
+                // the placement actually used.
+                let cgroup = activated
+                    .cgroup_path()
+                    .map(|path| path.display().to_string());
                 self.activated = Some(activated);
                 ControlReply::Activated {
                     state: self.state(),
+                    cgroup,
                 }
             }
             Err(err) => ControlReply::Refused {

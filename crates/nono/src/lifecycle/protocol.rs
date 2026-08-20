@@ -73,14 +73,20 @@ use zeroize::Zeroizing;
 
 /// The protocol version this build speaks, and the only one it accepts.
 ///
-/// Two, because [`ControlRequest::ProbeEnforcement`] and its reply were added
-/// to the vocabulary. The hello is where the disagreement is settled and it is
+/// Three, because [`ControlReply::Activated`] now carries the cgroup the run
+/// was placed in. A v2 supervisor's `Activated` has no such field, so a v3
+/// client talking to one would meet a malformed frame — a transport failure
+/// standing in for a missing fact, which is the same mistake the bump to two
+/// was made to avoid.
+///
+/// Two was because [`ControlRequest::ProbeEnforcement`] and its reply were
+/// added to the vocabulary. The hello is where the disagreement is settled and it is
 /// settled by refusing: a v1 supervisor has no probe verb, so a v2 client that
 /// were allowed to talk to one would discover that as a malformed frame — a
 /// transport failure standing in for a missing feature. A caller that asks a
 /// supervisor for an answer it cannot give deserves to be told which of the two
 /// it is.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 /// Headroom the wire bound keeps over the record bound, in bytes.
 ///
@@ -553,6 +559,20 @@ pub enum ControlReply {
     Activated {
         /// The state the release moved the run to.
         state: LifecycleState,
+        /// The cgroup the run was placed in, if the host allowed one.
+        ///
+        /// Reported here because this is the moment it becomes true and the
+        /// moment a consumer can act on it: the placement happens as the gate
+        /// opens, and a consumer attaching its own enforcement to the run —
+        /// cgroup-scoped BPF programs, most obviously — needs the cgroup the
+        /// workload is actually in.
+        ///
+        /// `None` means the run has process-group containment only: macOS
+        /// always, and Linux where the host would not give the supervisor a
+        /// cgroup. A consumer must read that as "not available here" rather
+        /// than derive a path from the session id, which would be guessing at
+        /// this library's naming and would break the moment it changed.
+        cgroup: Option<String>,
     },
 
     /// The wait finished, one way or the other.
