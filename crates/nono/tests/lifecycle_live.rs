@@ -1342,9 +1342,19 @@ fn a_program_that_is_not_an_absolute_path_is_refused_before_forking() {
 /// Mutation check: delete the `cgroup_parent` plumbing and the run lands at
 /// `/sys/fs/cgroup/nono-<uuid>`, the directory under the parent never exists,
 /// and the read fails. The test cannot pass on a build that ignores the field.
-#[cfg(target_os = "linux")]
+///
+/// Compiled on every platform and skipped at runtime, rather than `#[cfg]`d
+/// out. A test that only compiles on Linux is a test whose types are only
+/// checked by CI, and this one shipped a `held` that was not `mut` past a green
+/// macOS run because of exactly that.
 #[test]
 fn a_run_lands_under_the_cgroup_parent_its_plan_named() {
+    if !cfg!(target_os = "linux") {
+        println!(
+            "NOT_APPLICABLE: no cgroups on this platform. The refusal is what              this platform promises, and a_cgroup_parent_is_refused_on_a_platform_without_cgroups              asserts it."
+        );
+        return;
+    }
     let dir = temp_dir();
     let parent = std::path::PathBuf::from(format!(
         "/sys/fs/cgroup/nono-parent-test-{}",
@@ -1376,7 +1386,7 @@ fn a_run_lands_under_the_cgroup_parent_its_plan_named() {
         }
     };
 
-    let (held, handle) = prepared(validated);
+    let (mut held, handle) = prepared(validated);
     assert_eq!(
         held.cgroup_parent(),
         Some(parent.as_path()),
@@ -1456,9 +1466,16 @@ fn a_relative_cgroup_parent_is_refused_by_validation() {
 /// The caller asked for the run to land under an attachment. Running it
 /// somewhere else and saying nothing is the silent downgrade this crate
 /// refuses to make.
-#[cfg(not(target_os = "linux"))]
+///
+/// Compiled everywhere and skipped at runtime for the same reason as
+/// `a_run_lands_under_the_cgroup_parent_its_plan_named`: a `#[cfg]`d-out test
+/// is one whose types only one CI lane ever checks.
 #[test]
 fn a_cgroup_parent_is_refused_on_a_platform_without_cgroups() {
+    if cfg!(target_os = "linux") {
+        println!("NOT_APPLICABLE: this platform has cgroups, so it honours the request.");
+        return;
+    }
     let dir = temp_dir();
     let validated = match SandboxPlan::new("/bin/true")
         .capabilities(capabilities(dir.path()))
