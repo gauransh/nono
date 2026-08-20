@@ -483,10 +483,23 @@ impl ActivatedSandbox {
 
     /// The cgroup this run was placed in, if any.
     ///
-    /// The one place the platform difference lives. Everything else takes and
-    /// passes `Option<&Path>` on every platform, so a call site cannot compile
-    /// on one and fail on the other.
-    fn cgroup_path(&self) -> Option<&std::path::Path> {
+    /// # Why a consumer wants this
+    /// It is where the run actually is. A consumer attaching its own
+    /// enforcement to the run — cgroup-scoped BPF programs, most obviously —
+    /// has to attach to the cgroup the workload is in, and deriving that path
+    /// from a session id would be guessing at this library's naming and
+    /// breaking the moment it changed.
+    ///
+    /// `None` means the run has only process-group containment: on macOS
+    /// always, and on a Linux host that would not give this process a cgroup.
+    /// A consumer that needs containment it can attach to must treat `None` as
+    /// "not available here" rather than assume a path.
+    ///
+    /// This is also the one place the platform difference lives. Everything
+    /// else takes and passes `Option<&Path>` on every platform, so a call site
+    /// cannot compile on one and fail on the other.
+    #[must_use]
+    pub fn cgroup_path(&self) -> Option<&std::path::Path> {
         #[cfg(target_os = "linux")]
         {
             self.cgroup.as_ref().map(super::cgroup::RunCgroup::path)
