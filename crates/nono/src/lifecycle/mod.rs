@@ -104,6 +104,11 @@
 //! # Ok::<(), nono::NonoError>(())
 //! ```
 
+// Linux-only: cgroup v2 is where this containment exists. On other platforms
+// the process group remains the only basis, which is what the lifecycle uses
+// today on every platform.
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 mod cleanup;
 mod detached;
 mod events;
