@@ -727,6 +727,7 @@ fn shapes(events: &[LifecycleEvent]) -> Vec<String> {
             LifecycleEventKind::ExecObserved => "exec_observed".to_string(),
             LifecycleEventKind::ChildExited { outcome } => format!("child_exited:{outcome:?}"),
             LifecycleEventKind::StopRequested => "stop_requested".to_string(),
+            LifecycleEventKind::StopCgroupFailed { .. } => "stop_cgroup_failed".to_string(),
             LifecycleEventKind::StopObserved { .. } => "stop_observed".to_string(),
             LifecycleEventKind::GateAborted => "gate_aborted".to_string(),
             LifecycleEventKind::SupervisorFailure { stage, errno } => {

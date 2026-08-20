@@ -165,6 +165,18 @@ pub enum LifecycleEventKind {
     /// is.
     StopRequested,
 
+    /// The stop could not kill by cgroup, and fell back to the process group
+    /// alone.
+    ///
+    /// Emitted rather than swallowed because it is a downgrade in what the stop
+    /// can reach: the process-group kill misses a descendant that called
+    /// `setsid`, and the cgroup kill is the thing that does not. A caller that
+    /// sees this knows the run was contained by the escapable mechanism.
+    StopCgroupFailed {
+        /// What went wrong, in an operator's terms.
+        detail: String,
+    },
+
     /// The death that a stop asked for was observed.
     StopObserved {
         /// What the reap reported. A `SIGKILL` death is

@@ -417,6 +417,18 @@ pub struct ActivatedSandbox {
     /// the customer's program forks lands here too unless it deliberately
     /// leaves — see [`super::PreparedSandbox`].
     process_group: i32,
+    /// The cgroup this run was placed in, when the host allowed one.
+    ///
+    /// A process group is escapable — `setsid(2)` is the call that leaves one —
+    /// and a cgroup is not. When this is present the stop kills by cgroup as
+    /// well, which reaches a descendant that left the group; when it is absent
+    /// the run is contained exactly as it was before, by its process group
+    /// alone, and a descendant that leaves is still lost.
+    ///
+    /// `None` on macOS, and on a Linux host that would not give this process a
+    /// cgroup — an unprivileged container, most often.
+    #[cfg(target_os = "linux")]
+    cgroup: Option<super::cgroup::RunCgroup>,
     /// This handle's own core, started at the state the handoff observed.
     ///
     /// Deliberately not shared with the [`super::PreparedSandbox`] it came
@@ -443,6 +455,7 @@ impl ActivatedSandbox {
     pub(crate) fn new(
         identity: ProcessIdentity,
         process_group: i32,
+        #[cfg(target_os = "linux")] cgroup: Option<super::cgroup::RunCgroup>,
         state: LifecycleState,
         activation: ActivationObservation,
         events: Arc<EventEmitter>,
@@ -458,6 +471,8 @@ impl ActivatedSandbox {
         Self {
             identity,
             process_group,
+            #[cfg(target_os = "linux")]
+            cgroup,
             shared: SharedLifecycle::new(state),
             activation,
             reaped: None,
@@ -593,6 +608,24 @@ impl ActivatedSandbox {
             .map_err(|err| StopError::NotStoppable { state: err.from })?;
         self.events.emit(LifecycleEventKind::StopRequested);
         self.report(change);
+
+        // The cgroup first, when there is one. It is the only reach that
+        // catches a descendant which left the process group, and it kills every
+        // member in a single write — no set to enumerate, and nothing that can
+        // leave between the enumeration and the signal.
+        //
+        // A failure here is reported and does not stop the group kill from
+        // following: the group kill is what this run had before, and skipping
+        // it because the stronger mechanism faltered would make the stop weaker
+        // than it used to be.
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = self.cgroup.as_ref()
+            && let Err(error) = cgroup.kill_all()
+        {
+            self.events.emit(LifecycleEventKind::StopCgroupFailed {
+                detail: error.to_string(),
+            });
+        }
 
         kill_own_group(self.process_group).map_err(|errno| StopError::SignalFailed {
             target: self.process_group,

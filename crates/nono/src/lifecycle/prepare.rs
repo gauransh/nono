@@ -882,6 +882,20 @@ impl PreparedSandbox {
             return Err(ActivationError::InvalidActivationToken);
         }
 
+        // Into a cgroup BEFORE the gate opens, while the child is still held and
+        // has started nothing. Everything it forks after the release inherits
+        // the cgroup, so the whole run is contained by something a descendant
+        // cannot leave — `setsid` moves a process between process groups and
+        // does nothing to its cgroup.
+        //
+        // Best effort, and the fallback is exactly what this run had before: a
+        // host that will not give this process a cgroup (an unprivileged
+        // container, most often) still gets process-group containment. That is
+        // weaker, and the stop says so with `StopCgroupFailed` rather than
+        // leaving the caller to assume otherwise.
+        #[cfg(target_os = "linux")]
+        let cgroup = self.place_in_cgroup();
+
         // The compare-and-swap, and the release write it authorises, in one
         // critical section. The state machine — not a flag beside it — decides
         // whether this activation is the one that wins, and the winner writes
@@ -941,6 +955,8 @@ impl PreparedSandbox {
                 Ok(ActivatedSandbox::new(
                     self.identity.clone(),
                     self.process_group,
+                    #[cfg(target_os = "linux")]
+                    cgroup,
                     self.shared.state(),
                     ActivationObservation::ExecOrKilledPreExec,
                     Arc::clone(&self.events),
@@ -966,6 +982,32 @@ impl PreparedSandbox {
     /// [`StopError::NotStoppable`] if the run has already been activated,
     /// stopped, or failed; [`StopError::Reap`] if the death could not be
     /// observed, in which case nothing is claimed about the process.
+    /// Create this run's cgroup and put the held child in it.
+    ///
+    /// Returns `None` when the host will not allow it, which is not an error:
+    /// the run then keeps the process-group containment it has always had. What
+    /// must not happen is a *silent* downgrade, so the stop reports one.
+    ///
+    /// Named for the run's session so two runs never share a cgroup and a
+    /// stray directory says which run left it.
+    #[cfg(target_os = "linux")]
+    fn place_in_cgroup(&self) -> Option<super::cgroup::RunCgroup> {
+        use super::cgroup::{CGROUP2_ROOT, RunCgroup};
+
+        let name = format!("nono-{}", self.session_id.simple());
+        let cgroup = RunCgroup::create(std::path::Path::new(CGROUP2_ROOT), &name).ok()?;
+        match cgroup.place(self.identity.pid()) {
+            Ok(()) => Some(cgroup),
+            // Created but unusable. Removed rather than left behind: a cgroup
+            // holding nothing is litter, and one this run cannot place into is
+            // not containment.
+            Err(_) => {
+                let _ = cgroup.remove();
+                None
+            }
+        }
+    }
+
     pub fn stop_before_activation(&mut self) -> Result<SandboxExit, StopError> {
         self.begin_stop()
             .map_err(|err| StopError::NotStoppable { state: err.from })?;
