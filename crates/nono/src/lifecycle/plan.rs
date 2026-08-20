@@ -122,6 +122,15 @@ pub enum PlanError {
         /// The directory as supplied.
         path: PathBuf,
     },
+    /// The cgroup parent is not an absolute path.
+    ///
+    /// A relative one would be resolved against whatever directory the caller
+    /// happened to be in, which is not a cgroup anybody chose.
+    #[error("cgroup parent must be absolute, got {path:?}")]
+    RelativeCgroupParent {
+        /// The directory as supplied.
+        path: PathBuf,
+    },
 
     /// An environment key is empty.
     #[error("plan environment key at index {index} is empty")]
@@ -208,6 +217,7 @@ pub struct SandboxPlan {
     env: Vec<(String, String)>,
     capabilities: CapabilitySet,
     resource_limits: ResourceLimits,
+    cgroup_parent: Option<PathBuf>,
     session_mode: SessionMode,
     generation: u64,
     detached: bool,
@@ -227,6 +237,7 @@ impl SandboxPlan {
             program: program.into(),
             args: Vec::new(),
             working_dir: None,
+            cgroup_parent: None,
             env: Vec::new(),
             capabilities: CapabilitySet::new(),
             resource_limits: ResourceLimits::default(),
@@ -263,6 +274,26 @@ impl SandboxPlan {
     #[must_use]
     pub fn working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(dir.into());
+        self
+    }
+
+    /// Create this run's cgroup under `parent` rather than at the cgroup2 root.
+    /// Must be absolute.
+    ///
+    /// The run still gets its own cgroup named for its session; this only
+    /// changes where that cgroup is created. A caller that has attached
+    /// enforcement to a cgroup passes it here so the run lands *underneath* the
+    /// attachment: a cgroup created at the root shares no ancestor with one
+    /// created anywhere else, so an attachment made outside this run would
+    /// govern nothing it does.
+    ///
+    /// Unset means the cgroup2 root, which is what every run did before this
+    /// existed. Refused at preparation on platforms with no cgroups, rather
+    /// than accepted and ignored — a caller asking for containment it will not
+    /// get should hear so.
+    #[must_use]
+    pub fn cgroup_parent(mut self, parent: impl Into<PathBuf>) -> Self {
+        self.cgroup_parent = Some(parent.into());
         self
     }
 
@@ -393,6 +424,13 @@ impl SandboxPlan {
         {
             return Err(PlanError::RelativeWorkingDir { path: dir.clone() });
         }
+        if let Some(parent) = &self.cgroup_parent
+            && !parent.is_absolute()
+        {
+            return Err(PlanError::RelativeCgroupParent {
+                path: parent.clone(),
+            });
+        }
         for (index, (key, value)) in self.env.iter().enumerate() {
             if key.is_empty() {
                 return Err(PlanError::EmptyEnvKey { index });
@@ -435,6 +473,7 @@ impl std::fmt::Debug for SandboxPlan {
             .field("program", &self.program)
             .field("args", &self.args.len())
             .field("working_dir", &self.working_dir)
+            .field("cgroup_parent", &self.cgroup_parent)
             .field("env_keys", &env_keys)
             .field("capabilities", &self.capabilities)
             .field("resource_limits", &self.resource_limits)
@@ -474,6 +513,12 @@ impl ValidatedPlan {
     #[must_use]
     pub fn working_dir(&self) -> Option<&Path> {
         self.plan.working_dir.as_deref()
+    }
+
+    /// The directory this run's cgroup is created under, if one was set.
+    #[must_use]
+    pub fn cgroup_parent(&self) -> Option<&Path> {
+        self.plan.cgroup_parent.as_deref()
     }
 
     /// The permitted environment, in insertion order.

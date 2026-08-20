@@ -1325,3 +1325,157 @@ fn a_program_that_is_not_an_absolute_path_is_refused_before_forking() {
         "the library must never search PATH"
     );
 }
+
+/// A run placed under a caller-named parent lands *there*, not at the root.
+///
+/// This is what makes an out-of-process enforcement attachment reachable. A
+/// cgroup created at the cgroup2 root shares no ancestor with one created
+/// anywhere else, so a BPF program attached to a cgroup by another process
+/// governs nothing a root-placed run does. The caller names the cgroup it
+/// attached to; the run has to land underneath it.
+///
+/// The observation is the kernel's, not the library's: the child's pid is read
+/// back out of `cgroup.procs` under the parent. Asserting only on the path the
+/// library reports would pass on a build that computed a nice-looking path and
+/// placed the child somewhere else.
+///
+/// Mutation check: delete the `cgroup_parent` plumbing and the run lands at
+/// `/sys/fs/cgroup/nono-<uuid>`, the directory under the parent never exists,
+/// and the read fails. The test cannot pass on a build that ignores the field.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_lands_under_the_cgroup_parent_its_plan_named() {
+    let dir = temp_dir();
+    let parent = std::path::PathBuf::from(format!(
+        "/sys/fs/cgroup/nono-parent-test-{}",
+        std::process::id()
+    ));
+
+    // A host that will not give this process a cgroup cannot answer the
+    // question. That is reported, never treated as a pass: a test that is
+    // silently skipped is a test that stopped being evidence.
+    if let Err(err) = std::fs::create_dir(&parent) {
+        println!(
+            "INCONCLUSIVE: cannot create {}: {err}. \
+             This test needs write access to the cgroup2 root; it proves nothing here.",
+            parent.display()
+        );
+        return;
+    }
+
+    let validated = match SandboxPlan::new("/bin/sleep")
+        .args(["30"])
+        .capabilities(capabilities(dir.path()))
+        .cgroup_parent(&parent)
+        .validate()
+    {
+        Ok(validated) => validated,
+        Err(err) => {
+            let _ = std::fs::remove_dir(&parent);
+            panic!("plan must validate: {err}");
+        }
+    };
+
+    let (held, handle) = prepared(validated);
+    assert_eq!(
+        held.cgroup_parent(),
+        Some(parent.as_path()),
+        "the prepared run must carry the parent its plan named"
+    );
+
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => {
+            let _ = std::fs::remove_dir(&parent);
+            panic!("activation must succeed: {err}");
+        }
+    };
+
+    let placed = running.cgroup_path().map(std::path::Path::to_path_buf);
+    let pid = running.identity().pid();
+    let members = placed
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path.join("cgroup.procs")).ok());
+
+    // Stop the run before asserting, so a failed assertion does not leave a
+    // sleeping child and a cgroup that cannot be removed.
+    let _ = running.stop();
+    let _ = wait_until_gone(pid, GONE_TIMEOUT);
+    if let Some(path) = &placed {
+        let _ = std::fs::remove_dir(path);
+    }
+    let _ = std::fs::remove_dir(&parent);
+
+    let Some(placed) = placed else {
+        panic!(
+            "the run asked for a cgroup under {} and got none",
+            parent.display()
+        );
+    };
+    assert!(
+        placed.starts_with(&parent),
+        "run landed at {}, which is not under {}",
+        placed.display(),
+        parent.display()
+    );
+
+    // The kernel's answer, not the library's. `cgroup.procs` lists the pids the
+    // kernel considers members; the child's pid being in it is the placement.
+    let Some(members) = members else {
+        panic!("could not read cgroup.procs under {}", placed.display());
+    };
+    assert!(
+        members.lines().any(|line| line.trim() == pid.to_string()),
+        "pid {pid} is not a member of {}; cgroup.procs held {members:?}",
+        placed.display()
+    );
+}
+
+/// A relative cgroup parent is refused, not resolved against the caller's
+/// working directory.
+#[test]
+fn a_relative_cgroup_parent_is_refused_by_validation() {
+    let dir = temp_dir();
+    let err = SandboxPlan::new("/bin/true")
+        .capabilities(capabilities(dir.path()))
+        .cgroup_parent("relative/cgroup")
+        .validate()
+        .err();
+    assert!(
+        matches!(
+            err,
+            Some(nono::lifecycle::PlanError::RelativeCgroupParent { .. })
+        ),
+        "a relative cgroup parent must be refused, got {err:?}"
+    );
+}
+
+/// On a platform with no cgroups, asking for a parent is refused at
+/// preparation rather than accepted and quietly ignored.
+///
+/// The caller asked for the run to land under an attachment. Running it
+/// somewhere else and saying nothing is the silent downgrade this crate
+/// refuses to make.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_cgroup_parent_is_refused_on_a_platform_without_cgroups() {
+    let dir = temp_dir();
+    let validated = match SandboxPlan::new("/bin/true")
+        .capabilities(capabilities(dir.path()))
+        .cgroup_parent("/sys/fs/cgroup/somewhere")
+        .validate()
+    {
+        Ok(validated) => validated,
+        Err(err) => panic!("plan must validate: {err}"),
+    };
+    let err = PreparedSandbox::prepare(validated).err();
+    assert!(
+        matches!(
+            err,
+            Some(PrepareError::UnsupportedPlanFeature {
+                feature: "cgroup parent"
+            })
+        ),
+        "expected a refusal naming the feature, got {err:?}"
+    );
+}

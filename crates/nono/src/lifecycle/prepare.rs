@@ -428,6 +428,12 @@ pub struct PreparedSandbox {
     prepared_at: Instant,
     child_owned: bool,
     last_exit: Option<SandboxExit>,
+    /// Where this run's cgroup is created, when the plan named a directory.
+    ///
+    /// Kept rather than re-read from the plan because the plan is gone by the
+    /// time the run is activated, and the detached half of `prepare` never had
+    /// one: it arrives over the bootstrap channel instead.
+    cgroup_parent: Option<PathBuf>,
     /// This run's event vocabulary and its `seq` counter.
     ///
     /// Shared by `Arc` with the [`ActivatedSandbox`] this hands off to, so the
@@ -484,6 +490,10 @@ pub(super) struct AdoptedChild {
     /// The proxy-only rule to answer notifications from, if the plan asked for
     /// mediated egress.
     pub(super) proxy_policy: Option<crate::sandbox::ProxyOnlyPolicy>,
+    /// Where to create this run's cgroup, carried across the exec for the same
+    /// reason `proxy_policy` is: this process never sees the plan, and the
+    /// placement happens here.
+    pub(super) cgroup_parent: Option<PathBuf>,
     /// The emitter this run reports through, already carrying the supervisor's
     /// own ring sink.
     pub(super) events: Arc<EventEmitter>,
@@ -611,6 +621,7 @@ impl PreparedSandbox {
                     prepared_at,
                     child_owned: true,
                     last_exit: None,
+                    cgroup_parent: plan.cgroup_parent().map(Path::to_path_buf),
                     events,
                     // Attached afterwards by `SessionStore::prepare`, which can
                     // only build the record once the identity and process group
@@ -674,6 +685,7 @@ impl PreparedSandbox {
             secrets,
             expiry,
             proxy_policy,
+            cgroup_parent,
             events,
         } = adopted;
 
@@ -696,6 +708,7 @@ impl PreparedSandbox {
             shared: SharedLifecycle::new(state),
             gate: Some(gate),
             status: Some(status),
+            cgroup_parent,
             // Carried across the exec in the bootstrap blob: this process is
             // the one that services the listener, and it never sees the plan.
             proxy_policy,
@@ -971,6 +984,16 @@ impl PreparedSandbox {
         }
     }
 
+    /// The directory this run's cgroup is created under, if the plan named one.
+    ///
+    /// `None` is the cgroup2 root. This is what the plan *asked for*; whether a
+    /// cgroup was actually created is reported by the stop, because a host can
+    /// refuse one.
+    #[must_use]
+    pub fn cgroup_parent(&self) -> Option<&Path> {
+        self.cgroup_parent.as_deref()
+    }
+
     /// Stop a held child that has not been activated.
     ///
     /// Aborts the gate, closes it, and waits for the child to actually die.
@@ -994,8 +1017,12 @@ impl PreparedSandbox {
     fn place_in_cgroup(&self) -> Option<super::cgroup::RunCgroup> {
         use super::cgroup::{CGROUP2_ROOT, RunCgroup};
 
+        let parent = self
+            .cgroup_parent
+            .as_deref()
+            .unwrap_or_else(|| Path::new(CGROUP2_ROOT));
         let name = format!("nono-{}", self.session_id.simple());
-        let cgroup = RunCgroup::create(std::path::Path::new(CGROUP2_ROOT), &name).ok()?;
+        let cgroup = RunCgroup::create(parent, &name).ok()?;
         match cgroup.place(self.identity.pid()) {
             Ok(()) => Some(cgroup),
             // Created but unusable. Removed rather than left behind: a cgroup
@@ -1678,6 +1705,16 @@ pub(super) fn refuse_unsupported(
     if plan.resource_limits() != ResourceLimits::default() {
         return Err(PrepareError::UnsupportedPlanFeature {
             feature: "resource limits",
+        });
+    }
+    // A cgroup parent on a host with no cgroups is a request this platform
+    // cannot answer. Accepting it and placing the run somewhere else would be
+    // the silent downgrade this module refuses to make: the caller asked for
+    // the run to land under an attachment, and it would not have.
+    #[cfg(not(target_os = "linux"))]
+    if plan.cgroup_parent().is_some() {
+        return Err(PrepareError::UnsupportedPlanFeature {
+            feature: "cgroup parent",
         });
     }
     Ok(())

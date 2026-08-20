@@ -408,6 +408,13 @@ struct Bootstrap {
     /// launcher saw only `ECHILD`.
     #[serde(default)]
     proxy_policy: Option<crate::sandbox::ProxyOnlyPolicy>,
+    /// Where the supervisor creates this run's cgroup, as raw bytes.
+    ///
+    /// Bytes rather than a `String` for the same reason `store` is: a path on
+    /// this platform is not required to be UTF-8, and a lossy conversion here
+    /// would place the run somewhere other than where the caller said.
+    #[serde(default)]
+    cgroup_parent: Option<Vec<u8>>,
     /// The message that releases the held child.
     release: [u8; GATE_MESSAGE_BYTES],
     /// The message that tells it to give up.
@@ -587,6 +594,9 @@ fn launch_inner(
             .activation_expiry
             .map(|expiry| u64::try_from(expiry.as_millis()).unwrap_or(u64::MAX)),
         proxy_policy: super::prepare::proxy_policy_for(plan),
+        cgroup_parent: plan
+            .cgroup_parent()
+            .map(|parent| parent.as_os_str().as_bytes().to_vec()),
         release: *secrets.release(),
         abort: *secrets.abort(),
     };
@@ -1265,6 +1275,11 @@ fn serve(
         secrets: GateSecrets::from_parts(bootstrap.blob.release, bootstrap.blob.abort),
         expiry: bootstrap.blob.expiry_millis.map(Duration::from_millis),
         proxy_policy: bootstrap.blob.proxy_policy.clone(),
+        cgroup_parent: bootstrap.blob.cgroup_parent.as_ref().map(|bytes| {
+            std::path::PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes.clone()),
+            )
+        }),
         events: Arc::clone(&events),
     };
     let child_identity = adopted.identity.clone();
