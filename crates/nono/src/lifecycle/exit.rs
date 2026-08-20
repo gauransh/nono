@@ -481,6 +481,22 @@ impl ActivatedSandbox {
         }
     }
 
+    /// The cgroup this run was placed in, if any.
+    ///
+    /// The one place the platform difference lives. Everything else takes and
+    /// passes `Option<&Path>` on every platform, so a call site cannot compile
+    /// on one and fail on the other.
+    fn cgroup_path(&self) -> Option<&std::path::Path> {
+        #[cfg(target_os = "linux")]
+        {
+            self.cgroup.as_ref().map(super::cgroup::RunCgroup::path)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// What is known so far about whether the program started.
     ///
     /// Sharpens from [`ActivationObservation::ExecOrKilledPreExec`] to
@@ -675,8 +691,7 @@ impl ActivatedSandbox {
             &self.shared,
             &self.identity,
             self.process_group,
-            #[cfg(target_os = "linux")]
-            self.cgroup.as_ref().map(super::cgroup::RunCgroup::path),
+            self.cgroup_path(),
             death,
         )?;
         // Every verdict, not only a proof of absence: a survivor is a fact a

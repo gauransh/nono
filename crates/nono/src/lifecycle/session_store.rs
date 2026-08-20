@@ -1381,7 +1381,6 @@ impl RecoveredSession {
             // holds the process group, and inventing a path from the session id
             // would probe a directory this process did not create and cannot
             // vouch for. `NotReaped` verification does not consult it anyway.
-            #[cfg(target_os = "linux")]
             None,
             DeathObservation::NotReaped,
         )?;

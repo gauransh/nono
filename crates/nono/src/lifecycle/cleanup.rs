@@ -341,11 +341,16 @@ pub(crate) enum DeathObservation {
 ///
 /// [`CleanupError`] when verification is not legal in the state this call
 /// found. Nothing is probed in that case.
+/// `cgroup` is taken on every platform even though only Linux can act on it. A
+/// parameter that exists under `cfg` gives the two platforms different
+/// signatures, so a call site written on a macOS workstation compiles there and
+/// fails on Linux — which is exactly what happened when this was cfg-gated, and
+/// the break was invisible until CI.
 pub(crate) fn verify_and_record(
     shared: &SharedLifecycle,
     identity: &ProcessIdentity,
     pgid: i32,
-    #[cfg(target_os = "linux")] cgroup: Option<&std::path::Path>,
+    cgroup: Option<&std::path::Path>,
     death: DeathObservation,
 ) -> Result<(CleanupVerification, Option<Transition>), CleanupError> {
     // Advisory, and deliberately the same pure function the recording below
@@ -358,12 +363,7 @@ pub(crate) fn verify_and_record(
     }
 
     let verification = match death {
-        DeathObservation::Reaped => verify_after_reap(
-            identity,
-            pgid,
-            #[cfg(target_os = "linux")]
-            cgroup,
-        ),
+        DeathObservation::Reaped => verify_after_reap(identity, pgid, cgroup),
         DeathObservation::NotReaped => verify_identity(identity),
     };
     if !verification.is_confirmed_absent() {
@@ -397,11 +397,14 @@ pub(crate) fn probe_identity(identity: &ProcessIdentity) -> CleanupVerification 
 fn verify_after_reap(
     identity: &ProcessIdentity,
     pgid: i32,
-    #[cfg(target_os = "linux")] cgroup: Option<&std::path::Path>,
+    cgroup: Option<&std::path::Path>,
 ) -> CleanupVerification {
     if let Some(rebooted) = rebooted_since_capture(identity) {
         return rebooted;
     }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = cgroup;
 
     // The cgroup answers first when the run had one, and its answer is final.
     //
@@ -656,7 +659,7 @@ mod tests {
         // And on the reaped path too, where the group number would otherwise be
         // probed against whatever now holds it.
         assert_eq!(
-            verify_after_reap(&previous_boot, live.pid()),
+            verify_after_reap(&previous_boot, live.pid(), None),
             CleanupVerification::ConfirmedAbsent {
                 basis: AbsenceBasis::BootIdChanged
             }
@@ -704,7 +707,7 @@ mod tests {
         let live = live_identity();
         for pgid in [0, 1, -1, i32::MIN] {
             assert_eq!(
-                verify_after_reap(&live, pgid),
+                verify_after_reap(&live, pgid, None),
                 CleanupVerification::Indeterminate {
                     reason: IndeterminateReason::UnprobableProcessGroup { pgid }
                 },
@@ -742,7 +745,7 @@ mod tests {
         let own_group = unsafe { libc::getpgrp() };
         assert!(own_group > 1, "test harness must be in a real group");
         assert_eq!(
-            verify_after_reap(&live, own_group),
+            verify_after_reap(&live, own_group, None),
             CleanupVerification::StillPresent {
                 survivors: SurvivorEvidence::ProcessGroupMember { pgid: own_group }
             }
@@ -753,7 +756,7 @@ mod tests {
     fn an_empty_group_after_a_reap_is_confirmed_absent() {
         let live = live_identity();
         assert_eq!(
-            verify_after_reap(&live, i32::MAX),
+            verify_after_reap(&live, i32::MAX, None),
             CleanupVerification::ConfirmedAbsent {
                 basis: AbsenceBasis::ReapedAndGroupEmpty { pgid: i32::MAX }
             }
@@ -771,17 +774,11 @@ mod tests {
         // SAFETY: as above.
         let own_group = unsafe { libc::getpgrp() };
 
-        let (verdict, change) = match verify_and_record(
-            &shared,
-            &live,
-            own_group,
-            #[cfg(target_os = "linux")]
-            None,
-            DeathObservation::Reaped,
-        ) {
-            Ok(pair) => pair,
-            Err(err) => panic!("verification must be legal in Exited: {err}"),
-        };
+        let (verdict, change) =
+            match verify_and_record(&shared, &live, own_group, None, DeathObservation::Reaped) {
+                Ok(pair) => pair,
+                Err(err) => panic!("verification must be legal in Exited: {err}"),
+            };
         assert!(matches!(verdict, CleanupVerification::StillPresent { .. }));
         assert_eq!(change, None, "a survivor must not move the machine");
         assert_eq!(shared.state(), LifecycleState::Exited);
@@ -792,17 +789,11 @@ mod tests {
         let shared = SharedLifecycle::new(LifecycleState::Stopped);
         let absent = ProcessIdentity::from_parts(i32::MAX, Some(1), boot_id());
 
-        let (verdict, change) = match verify_and_record(
-            &shared,
-            &absent,
-            i32::MAX,
-            #[cfg(target_os = "linux")]
-            None,
-            DeathObservation::Reaped,
-        ) {
-            Ok(pair) => pair,
-            Err(err) => panic!("verification must be legal in Stopped: {err}"),
-        };
+        let (verdict, change) =
+            match verify_and_record(&shared, &absent, i32::MAX, None, DeathObservation::Reaped) {
+                Ok(pair) => pair,
+                Err(err) => panic!("verification must be legal in Stopped: {err}"),
+            };
         assert!(verdict.is_confirmed_absent());
         assert_eq!(
             change,
@@ -815,14 +806,7 @@ mod tests {
         // The second attempt is refused by the machine, not absorbed: counting
         // one proof twice is a caller bug worth seeing.
         assert_eq!(
-            verify_and_record(
-                &shared,
-                &absent,
-                i32::MAX,
-                #[cfg(target_os = "linux")]
-                None,
-                DeathObservation::Reaped
-            ),
+            verify_and_record(&shared, &absent, i32::MAX, None, DeathObservation::Reaped),
             Err(CleanupError {
                 state: LifecycleState::CleanupVerified
             })
@@ -845,7 +829,6 @@ mod tests {
                     &shared,
                     &live_identity(),
                     i32::MAX,
-                    #[cfg(target_os = "linux")]
                     None,
                     DeathObservation::NotReaped
                 ),
@@ -863,17 +846,11 @@ mod tests {
         // ignored the distinction would answer the wrong one.
         let live = live_identity();
         let shared = SharedLifecycle::new(LifecycleState::Failed);
-        let (reaped, _) = match verify_and_record(
-            &shared,
-            &live,
-            i32::MAX,
-            #[cfg(target_os = "linux")]
-            None,
-            DeathObservation::Reaped,
-        ) {
-            Ok(pair) => pair,
-            Err(err) => panic!("verification must be legal in Failed: {err}"),
-        };
+        let (reaped, _) =
+            match verify_and_record(&shared, &live, i32::MAX, None, DeathObservation::Reaped) {
+                Ok(pair) => pair,
+                Err(err) => panic!("verification must be legal in Failed: {err}"),
+            };
         assert_eq!(
             reaped,
             CleanupVerification::ConfirmedAbsent {
@@ -882,17 +859,11 @@ mod tests {
         );
 
         let shared = SharedLifecycle::new(LifecycleState::Failed);
-        let (not_reaped, _) = match verify_and_record(
-            &shared,
-            &live,
-            i32::MAX,
-            #[cfg(target_os = "linux")]
-            None,
-            DeathObservation::NotReaped,
-        ) {
-            Ok(pair) => pair,
-            Err(err) => panic!("verification must be legal in Failed: {err}"),
-        };
+        let (not_reaped, _) =
+            match verify_and_record(&shared, &live, i32::MAX, None, DeathObservation::NotReaped) {
+                Ok(pair) => pair,
+                Err(err) => panic!("verification must be legal in Failed: {err}"),
+            };
         assert_eq!(
             not_reaped,
             CleanupVerification::StillPresent {

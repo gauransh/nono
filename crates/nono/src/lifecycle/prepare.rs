@@ -1076,7 +1076,6 @@ impl PreparedSandbox {
             self.process_group,
             // A run that never activated was never placed in a cgroup:
             // placement happens as the gate opens.
-            #[cfg(target_os = "linux")]
             None,
             death,
         )?;
