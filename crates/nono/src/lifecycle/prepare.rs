@@ -47,11 +47,22 @@
 //! - **A descendant that calls `setsid` — or `setpgid` on itself — leaves the
 //!   group and stops being visible to either mechanism.** Nothing in POSIX
 //!   prevents that, and no bookkeeping the parent does can follow it. It is a
-//!   dark spot of this design, not an oversight: a stop reports what it
-//!   signalled, and verification reports what it could still see, so an escapee
-//!   shows up as neither killed nor confirmed absent rather than as a silent
-//!   success. Closing it needs a container-level mechanism (a cgroup on Linux, a
-//!   job object equivalent elsewhere), which this slice does not build.
+//!   dark spot of this design, not an oversight.
+//!
+//!   This note used to add that an escapee "shows up as neither killed nor
+//!   confirmed absent rather than as a silent success". **That was wrong, and
+//!   the correction matters more than the original claim did.** An escapee
+//!   survives the stop *and* cleanup verification certifies the run absent,
+//!   because the process group it probes is genuinely empty — every member
+//!   except the escapee was killed, and the escapee is no longer a member. The
+//!   caller is told the run is gone while it is still running. Measured, not
+//!   argued: `verified == true` with the escaped process observed alive
+//!   afterwards.
+//!
+//!   Closing it needs a container-level mechanism (a cgroup on Linux, a job
+//!   object equivalent elsewhere). [`super::cgroup`] is that mechanism, and
+//!   nothing here uses it yet: placing the run in a cgroup and killing by it is
+//!   a change to this containment model, not a patch to it.
 //! - **The run is no longer in the supervisor's own process group**, so a
 //!   terminal's Ctrl-C — which signals the foreground *group* — no longer
 //!   reaches the customer's program by accident. A consumer that wants that
