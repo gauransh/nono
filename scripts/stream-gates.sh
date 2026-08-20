@@ -189,8 +189,14 @@ run_gate workspace-tests tests \
 run_gate nono-crate-tests tests \
   cargo test -p nono --no-fail-fast
 
+# `--nocapture` so a test that decided it could not answer says so in the log.
+# Several tests here report INCONCLUSIVE or NOT_APPLICABLE on a host that
+# cannot give them what they need -- an unprivileged runner has no writable
+# cgroup2 mount -- and libtest swallows the stdout of a *passing* test. Without
+# this the log cannot distinguish a gate that proved something from one that
+# skipped, which is the whole difference between evidence and a green tick.
 run_gate lifecycle-live tests \
-  cargo test -p nono --test lifecycle_live
+  cargo test -p nono --test lifecycle_live -- --nocapture
 
 # The mode matrix asserts Seatbelt behaviour and is `#![cfg(target_os =
 # "macos")]`; on Linux it compiles to zero tests, and zero tests passing is not

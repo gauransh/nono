@@ -1351,7 +1351,9 @@ fn a_program_that_is_not_an_absolute_path_is_refused_before_forking() {
 fn a_run_lands_under_the_cgroup_parent_its_plan_named() {
     if !cfg!(target_os = "linux") {
         println!(
-            "NOT_APPLICABLE: no cgroups on this platform. The refusal is what              this platform promises, and a_cgroup_parent_is_refused_on_a_platform_without_cgroups              asserts it."
+            "NOT_APPLICABLE: no cgroups on this platform. The refusal is what this \
+             platform promises, and \
+             a_cgroup_parent_is_refused_on_a_platform_without_cgroups asserts it."
         );
         return;
     }
