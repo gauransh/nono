@@ -218,6 +218,7 @@ pub struct SandboxPlan {
     capabilities: CapabilitySet,
     resource_limits: ResourceLimits,
     cgroup_parent: Option<PathBuf>,
+    workload_uid: Option<u32>,
     session_mode: SessionMode,
     generation: u64,
     detached: bool,
@@ -238,6 +239,7 @@ impl SandboxPlan {
             args: Vec::new(),
             working_dir: None,
             cgroup_parent: None,
+            workload_uid: None,
             env: Vec::new(),
             capabilities: CapabilitySet::new(),
             resource_limits: ResourceLimits::default(),
@@ -294,6 +296,26 @@ impl SandboxPlan {
     #[must_use]
     pub fn cgroup_parent(mut self, parent: impl Into<PathBuf>) -> Self {
         self.cgroup_parent = Some(parent.into());
+        self
+    }
+
+    /// Make the child drop to `uid` (as its uid *and* gid) just before exec.
+    ///
+    /// The point is that the workload then runs as a different identity than the
+    /// daemon that owns its cgroup: a process may migrate itself between cgroups
+    /// only where it has write on the destination's `cgroup.procs`, and that
+    /// write is gated on the *euid* that owns the directory. Run the workload as
+    /// the daemon uid and it could walk itself out of the cgroup the daemon
+    /// placed it in; run it as a distinct `U_w` and that self-migration escape is
+    /// closed. The drop happens in the child after the sandbox is sealed — see
+    /// `child_main` — so nothing the workload does can undo it.
+    ///
+    /// Unset means no drop: the child keeps whatever identity it forked with,
+    /// which is what every run did before this existed. A Linux-only placement
+    /// concern, threaded like [`Self::cgroup_parent`]; a no-op where absent.
+    #[must_use]
+    pub const fn workload_uid(mut self, uid: u32) -> Self {
+        self.workload_uid = Some(uid);
         self
     }
 
@@ -474,6 +496,7 @@ impl std::fmt::Debug for SandboxPlan {
             .field("args", &self.args.len())
             .field("working_dir", &self.working_dir)
             .field("cgroup_parent", &self.cgroup_parent)
+            .field("workload_uid", &self.workload_uid)
             .field("env_keys", &env_keys)
             .field("capabilities", &self.capabilities)
             .field("resource_limits", &self.resource_limits)
@@ -519,6 +542,12 @@ impl ValidatedPlan {
     #[must_use]
     pub fn cgroup_parent(&self) -> Option<&Path> {
         self.plan.cgroup_parent.as_deref()
+    }
+
+    /// The uid/gid the child drops to just before exec, if one was set.
+    #[must_use]
+    pub const fn workload_uid(&self) -> Option<u32> {
+        self.plan.workload_uid
     }
 
     /// The permitted environment, in insertion order.

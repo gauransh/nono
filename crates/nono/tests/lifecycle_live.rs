@@ -1498,3 +1498,207 @@ fn a_cgroup_parent_is_refused_on_a_platform_without_cgroups() {
         "expected a refusal naming the feature, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 13. A workload uid drop changes the identity the program runs as.
+// ---------------------------------------------------------------------------
+
+/// The uid the workload should run as, distinct from the daemon uid (0 here)
+/// that owns its cgroup. `nobody` conventionally, and `setresuid` takes a
+/// numeric id, so the account need not exist for the drop to take.
+const WORKLOAD_UID: u32 = 65534;
+
+/// A run given a `workload_uid` execs as that uid, not as the forking process.
+///
+/// This is what closes the cgroup self-migration escape: the workload's euid
+/// differs from the daemon uid that owns its cgroup, so it cannot write its own
+/// pid into a sibling `cgroup.procs` and walk out of the placement. The proof
+/// is the kernel's, not the library's — the program reports `id -u`/`id -g`,
+/// and the numbers it wrote are read back here. Asserting only that activation
+/// reached `Observed` would pass on a build that never dropped, because the
+/// child's own readback (which gates the `execve`) would be the only witness.
+///
+/// Mutation check: delete the drop block in `child_main` and the program runs
+/// as uid 0, the file holds `0`, and the assertion fails. Reorder it to set the
+/// uid before the gid and a non-root run would half-drop; here it is exercised
+/// under root, where the readback guard is what a partial drop trips on.
+///
+/// Compiled on every platform and skipped at runtime, for the reason the cgroup
+/// placement test spells out: a `#[cfg]`d-out test is one whose types only the
+/// Linux CI lane ever checks. Needs `CAP_SETUID`, so it is INCONCLUSIVE for an
+/// unprivileged runner and runs for real on the root Linux rig.
+#[test]
+fn a_workload_uid_drop_makes_the_program_run_as_that_uid() {
+    if !cfg!(target_os = "linux") {
+        println!(
+            "NOT_APPLICABLE: the drop is setresuid/setresgid, which this platform's \
+             libc does not have; a_workload_uid_is_refused_without_the_syscalls_to_make_it \
+             asserts the refusal instead."
+        );
+        return;
+    }
+    // SAFETY: `geteuid` reads a per-process id and touches no memory.
+    let euid = unsafe { libc::geteuid() };
+    if euid != 0 {
+        println!(
+            "INCONCLUSIVE: dropping to another uid needs CAP_SETUID, which a process \
+             running as {euid} does not hold; this test proves nothing here."
+        );
+        return;
+    }
+    // The invariant the drop exists to create: a target that is neither the
+    // daemon uid (0) nor the identity we start with.
+    assert_ne!(
+        WORKLOAD_UID, euid,
+        "the drop target must differ from our uid"
+    );
+
+    let dir = temp_dir();
+    // The workload writes as `WORKLOAD_UID`, so the directory it writes into has
+    // to admit that identity: the temp dir is created 0700 for the runner, and a
+    // dropped `nobody` could not create a file under it otherwise. The Landlock
+    // read-write grant is orthogonal — it still applies after the drop — so both
+    // the DAC bits and the policy have to permit the write.
+    if let Err(err) = std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    ) {
+        println!("INCONCLUSIVE: could not widen the temp dir for the dropped uid: {err}");
+        return;
+    }
+
+    let out = dir.path().join("ids");
+    // `id -u`/`id -g` report the *effective* ids, which the full r/e/s drop sets
+    // together; the file carries the uid then the gid, one per line.
+    let script = format!("id -u > {out}; id -g >> {out}", out = out.display());
+    let validated = match SandboxPlan::new("/bin/sh")
+        .args(["-c", script.as_str()])
+        .capabilities(capabilities(dir.path()))
+        // Nothing is inherited, so `id` is only found if a search path is
+        // granted; the drop does not change where a binary lives.
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .workload_uid(WORKLOAD_UID)
+        .validate()
+    {
+        Ok(validated) => validated,
+        Err(err) => panic!("plan must validate: {err}"),
+    };
+
+    let (mut held, handle) = prepared(validated);
+    let mut running = match held.activate(&handle) {
+        Ok(running) => running,
+        Err(err) => panic!("activation must succeed: {err}"),
+    };
+    let exit = match running.wait() {
+        Ok(exit) => exit,
+        Err(err) => panic!("wait must observe the exit: {err}"),
+    };
+    // A clean exit means the child reached `execve` — which it only does after
+    // its own readback confirmed the drop to `WORKLOAD_UID` took hold.
+    assert_eq!(exit.activation(), ActivationObservation::Observed);
+    assert_eq!(exit.outcome(), ExitOutcome::Exited { code: 0 });
+
+    let written = match std::fs::read_to_string(&out) {
+        Ok(written) => written,
+        Err(err) => panic!("the workload should have written its ids: {err}"),
+    };
+    let mut lines = written.lines();
+    assert_eq!(
+        lines.next(),
+        Some(WORKLOAD_UID.to_string().as_str()),
+        "the program's effective uid was not the one the plan named; file held {written:?}"
+    );
+    assert_eq!(
+        lines.next(),
+        Some(WORKLOAD_UID.to_string().as_str()),
+        "the program's effective gid was not the one the plan named; file held {written:?}"
+    );
+}
+
+/// Without the privilege to make the drop, the run refuses before `execve`.
+///
+/// The whole point is fail-closed: a `workload_uid` that cannot be reached must
+/// stop the run, never exec the workload with the wrong identity still on it. An
+/// unprivileged process has no `CAP_SETGID`/`CAP_SETUID`, so the very first
+/// syscall of the drop — `setgroups` — returns `EPERM`, and the child dies at
+/// [`PreExecStage::DropPrivileges`] rather than running the program.
+///
+/// Only observable without the capability, so this is the mirror of the
+/// positive test: exactly one of the two runs for real in a given environment,
+/// and the other reports why it could not. Under a root runner the drop always
+/// succeeds, so the refusal cannot be provoked and the test is INCONCLUSIVE.
+#[test]
+fn a_workload_uid_is_refused_without_the_privilege_to_make_it() {
+    if !cfg!(target_os = "linux") {
+        println!(
+            "NOT_APPLICABLE: the drop is a Linux-only syscall sequence; a_workload_uid \
+             plan is refused at preparation here, not at the gate."
+        );
+        return;
+    }
+    // SAFETY: `geteuid` reads a per-process id and touches no memory.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        println!(
+            "INCONCLUSIVE: root can always make the drop, so its refusal cannot be \
+             provoked; this case is only observable without CAP_SETUID."
+        );
+        return;
+    }
+    // A target that is not the identity we already hold, so the drop is a real
+    // change the kernel must authorise rather than a no-op it waves through.
+    let target = if euid == WORKLOAD_UID {
+        WORKLOAD_UID.saturating_sub(1)
+    } else {
+        WORKLOAD_UID
+    };
+
+    let dir = temp_dir();
+    // `/bin/echo` need only exist for prepare's advisory check; the drop fails
+    // before the working directory or the `execve`, so it never runs.
+    let validated = match SandboxPlan::new("/bin/echo")
+        .args(["never printed"])
+        .capabilities(capabilities(dir.path()))
+        .workload_uid(target)
+        .validate()
+    {
+        Ok(validated) => validated,
+        Err(err) => panic!("plan must validate: {err}"),
+    };
+
+    let (mut held, handle) = prepared(validated);
+    let pid = held.identity().pid();
+
+    let error = held.activate(&handle).err();
+    assert_eq!(
+        error,
+        Some(ActivationError::PreExecFailed {
+            stage: PreExecStage::DropPrivileges,
+            errno: libc::EPERM,
+        }),
+        "an unprivileged drop must fail closed at the drop stage"
+    );
+    assert_eq!(held.state(), LifecycleState::Failed);
+    assert!(
+        wait_until_gone(pid, GONE_TIMEOUT),
+        "the child was not reaped"
+    );
+
+    match held.exit() {
+        Some(exit) => {
+            assert_eq!(
+                exit.activation(),
+                ActivationObservation::NotActivated,
+                "the child said where it stopped, so this is a fact not a guess"
+            );
+            assert_eq!(
+                exit.outcome(),
+                ExitOutcome::PreExecFailure {
+                    stage: PreExecStage::DropPrivileges,
+                    errno: libc::EPERM,
+                }
+            );
+        }
+        None => panic!("a failed activation must record its exit facts"),
+    }
+}

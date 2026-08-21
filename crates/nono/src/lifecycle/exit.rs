@@ -111,6 +111,13 @@ pub enum PreExecStage {
     /// wrote it holds the descriptor but not the secret, so it is treated as
     /// hostile and refused rather than guessed at.
     GateProtocol,
+    /// Dropping the child's uid/gid to the plan's `workload_uid` failed — a
+    /// `setgroups`, `setresgid`, `setresuid`, or the readback that proves the
+    /// drop took hold. The child dies here rather than exec the workload with
+    /// the daemon's identity still on it, which would leave it able to migrate
+    /// itself out of the cgroup the daemon placed it in. Linux only, and only
+    /// when a `workload_uid` was set.
+    DropPrivileges,
     /// Entering the plan's working directory failed.
     WorkingDirectory,
     /// `execve` returned, which it only does on failure.
@@ -133,6 +140,7 @@ impl PreExecStage {
             Self::GateClosed => "gate_closed",
             Self::GateAborted => "gate_aborted",
             Self::GateProtocol => "gate_protocol",
+            Self::DropPrivileges => "drop_privileges",
             Self::WorkingDirectory => "working_directory",
             Self::Exec => "exec",
             Self::Unknown => "unknown",
@@ -168,6 +176,10 @@ impl PreExecStage {
             // `SandboxApply`, whose 0x10 neighbourhood is long since spoken
             // for.
             Self::NetworkFilter => 0x18,
+            // Appended for the same reason: this stage runs after the gate
+            // release, but its 0x15/`WorkingDirectory` slot was assigned before
+            // this stage existed, so it takes the next free byte.
+            Self::DropPrivileges => 0x19,
             Self::Unknown => 0xFF,
         }
     }
@@ -187,6 +199,7 @@ impl PreExecStage {
             0x16 => Self::Exec,
             0x17 => Self::ControllingTerminal,
             0x18 => Self::NetworkFilter,
+            0x19 => Self::DropPrivileges,
             _ => Self::Unknown,
         }
     }
@@ -943,7 +956,7 @@ pub(crate) fn kill_pid(pid: i32) -> Result<(), i32> {
 mod tests {
     use super::*;
 
-    const ALL_STAGES: [PreExecStage; 11] = [
+    const ALL_STAGES: [PreExecStage; 12] = [
         PreExecStage::ProcessGroup,
         PreExecStage::ControllingTerminal,
         PreExecStage::SandboxApply,
@@ -952,6 +965,7 @@ mod tests {
         PreExecStage::GateClosed,
         PreExecStage::GateAborted,
         PreExecStage::GateProtocol,
+        PreExecStage::DropPrivileges,
         PreExecStage::WorkingDirectory,
         PreExecStage::Exec,
         PreExecStage::Unknown,

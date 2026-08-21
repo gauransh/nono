@@ -637,6 +637,8 @@ fn launch_inner(
             .map_or(std::ptr::null(), |dir| dir.as_ptr()),
         sandbox,
         secrets: &secrets,
+        #[cfg(target_os = "linux")]
+        workload_uid: plan.workload_uid(),
     };
     let context = LaunchContext {
         child,

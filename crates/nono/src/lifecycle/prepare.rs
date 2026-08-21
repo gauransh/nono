@@ -14,7 +14,8 @@
 //! 4. close every other inherited descriptor
 //! 5. write the "at the gate" record to the status descriptor
 //! 6. block in `read()` on the gate descriptor
-//! 7. on the release message: enter the working directory, then `execve`
+//! 7. on the release message: drop to the plan's workload uid if one was set
+//!    (Linux only), enter the working directory, then `execve`
 //!
 //! Any failure writes a fixed-size record to the status descriptor and exits.
 //! Nothing between step 3 and `execve` runs unconfined, and the customer's
@@ -570,6 +571,8 @@ impl PreparedSandbox {
                 .map_or(std::ptr::null(), |dir| dir.as_ptr()),
             sandbox: &sandbox,
             secrets: &secrets,
+            #[cfg(target_os = "linux")]
+            workload_uid: plan.workload_uid(),
         };
 
         // SAFETY: `fork` duplicates this process. The child branch below runs
@@ -1717,6 +1720,17 @@ pub(super) fn refuse_unsupported(
             feature: "cgroup parent",
         });
     }
+    // A workload uid to drop to has no meaning where the drop cannot happen:
+    // the `setresuid`/`setresgid` it is built on are absent from macOS libc,
+    // and the cgroup self-migration it closes needs cgroups to exist at all.
+    // Refused for the same reason as a cgroup parent — accepting it and never
+    // dropping would be the silent downgrade this module will not make.
+    #[cfg(not(target_os = "linux"))]
+    if plan.workload_uid().is_some() {
+        return Err(PrepareError::UnsupportedPlanFeature {
+            feature: "workload uid",
+        });
+    }
     Ok(())
 }
 
@@ -1901,6 +1915,14 @@ pub(super) struct ChildContext<'a> {
     pub(super) sandbox: &'a PlatformSandbox,
     /// The only two messages this child will act on.
     pub(super) secrets: &'a GateSecrets,
+    /// The uid/gid the child drops to just before `execve`, when the plan set
+    /// one. Linux only: the drop is `setresuid`/`setresgid`, which macOS libc
+    /// does not have, and the cgroup self-migration it defends against exists
+    /// only where cgroups do. `refuse_unsupported` refuses this plan feature on
+    /// platforms without it rather than accepting and ignoring it, so this
+    /// field is only ever read where the drop can actually run.
+    #[cfg(target_os = "linux")]
+    pub(super) workload_uid: Option<u32>,
 }
 
 /// The whole of the child's life before `execve`.
@@ -2041,6 +2063,112 @@ pub(super) fn child_main(context: &ChildContext<'_>) -> ! {
             GateDecision::Unknown => {
                 child_fail(context.status_write, PreExecStage::GateProtocol, 0)
             }
+        }
+    }
+
+    // The last privileged act before exec. Drop to the plan's workload uid so
+    // the customer program runs as an identity distinct from the daemon that
+    // owns its cgroup — which closes the cgroup self-migration escape:
+    // `cgroup.procs` is writable by the euid that owns the directory, so a
+    // workload sharing the daemon's uid could write its own pid into a sibling
+    // cgroup and walk out of the one the daemon placed it in. Run it as a
+    // distinct `U_w` and that door is shut.
+    //
+    // The order below is load-bearing and not interchangeable:
+    //   1. `setgroups(0, NULL)`     — shed every supplementary group first; a
+    //                                 leftover gid is authority the workload
+    //                                 would otherwise keep.
+    //   2. `setresgid(U_w,U_w,U_w)` — gid before uid...
+    //   3. `setresuid(U_w,U_w,U_w)` — ...because dropping the uid FIRST forfeits
+    //                                 the very privilege needed to set the gid
+    //                                 and the group list, leaving a half-taken
+    //                                 drop. uid is set LAST for exactly that.
+    //
+    // Three things this rests on. (a) uid last, as above. (b) `setresuid`
+    // DOWNWARD is not blocked by `no_new_privs`: NNP forbids a privilege GAIN
+    // across `execve` — setuid bits, file capabilities — not a voluntary drop
+    // made here, before exec, by a process shedding authority it holds. (c) an
+    // invariant on the sandbox: no seccomp filter installed in `apply_in_child`
+    // may trap `setresuid`/`setresgid`/`setgroups`, or this drop would `EPERM`
+    // and the child would die here. That is fail-closed and therefore safe, but
+    // it is a floor to respect on purpose, not by accident. (d) cgroup
+    // placement is untouched: the parent (attached) or the supervisor
+    // (detached) writes `cgroup.procs` at activation — the child never does — so
+    // the child holding a lesser identity changes nothing about where it lands.
+    //
+    // Each readback proves the drop took hold rather than trusting a zero
+    // return: a partial drop — real changed, saved not — is precisely what an
+    // attacker would engineer, so all three of each id must equal `U_w` or the
+    // child fails closed.
+    #[cfg(target_os = "linux")]
+    if let Some(uid) = context.workload_uid {
+        // One identity: the run's uid doubles as its gid.
+        let gid = uid;
+        // SAFETY: two scalar arguments and a NULL group list. `setgroups` is
+        // async-signal-safe and touches no memory this frame owns. A non-zero
+        // return is a plain `errno` failure, which the record below carries.
+        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+            child_fail(
+                context.status_write,
+                PreExecStage::DropPrivileges,
+                last_errno(),
+            );
+        }
+        // SAFETY: three scalar gids, no memory touched, async-signal-safe. Real,
+        // effective, and saved set together so no saved-id path can restore the
+        // old gid afterwards. Runs before the uid drop, while still privileged.
+        if unsafe { libc::setresgid(gid, gid, gid) } != 0 {
+            child_fail(
+                context.status_write,
+                PreExecStage::DropPrivileges,
+                last_errno(),
+            );
+        }
+        // SAFETY: three scalar uids, no memory touched, async-signal-safe. Last
+        // of the three, so the two calls above still ran with the authority to
+        // change the gid and the group list.
+        if unsafe { libc::setresuid(uid, uid, uid) } != 0 {
+            child_fail(
+                context.status_write,
+                PreExecStage::DropPrivileges,
+                last_errno(),
+            );
+        }
+
+        let mut ruid: libc::uid_t = 0;
+        let mut euid: libc::uid_t = 0;
+        let mut suid: libc::uid_t = 0;
+        // SAFETY: three out-pointers to live locals in this frame; `getresuid`
+        // writes each exactly once and is async-signal-safe.
+        if unsafe { libc::getresuid(&mut ruid, &mut euid, &mut suid) } != 0 {
+            child_fail(
+                context.status_write,
+                PreExecStage::DropPrivileges,
+                last_errno(),
+            );
+        }
+        let mut rgid: libc::gid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        let mut sgid: libc::gid_t = 0;
+        // SAFETY: three out-pointers to live locals in this frame; `getresgid`
+        // writes each exactly once and is async-signal-safe.
+        if unsafe { libc::getresgid(&mut rgid, &mut egid, &mut sgid) } != 0 {
+            child_fail(
+                context.status_write,
+                PreExecStage::DropPrivileges,
+                last_errno(),
+            );
+        }
+        if ruid != uid || euid != uid || suid != uid || rgid != gid || egid != gid || sgid != gid {
+            // The syscalls returned success but the identity is not `U_w`
+            // through and through: a partial drop, refused. `EPERM` is the
+            // errno that fits "the identity is not the one we demanded"; no call
+            // here left a truer one to report.
+            child_fail(
+                context.status_write,
+                PreExecStage::DropPrivileges,
+                libc::EPERM,
+            );
         }
     }
 
