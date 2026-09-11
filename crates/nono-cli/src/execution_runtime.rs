@@ -318,6 +318,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         plain_domain_strs
     };
+    // Expand `deny_domain` the same way for `nono why --self`.
+    let denied_domain_strs: Vec<String> = domain_filter
+        .map(|d| d.deny_domain.as_slice())
+        .map(|deny_domain| {
+            let policy_json = config::embedded::embedded_network_policy_json();
+            match network_policy::load_network_policy(policy_json) {
+                Ok(net_policy) => network_policy::expand_proxy_deny(&net_policy, deny_domain),
+                Err(e) => {
+                    warn!("failed to load network policy for sandbox state: {e}");
+                    deny_domain.to_vec()
+                }
+            }
+        })
+        .unwrap_or_default();
     let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = all_domain_entries
         .iter()
         .filter_map(|e| match e {
@@ -343,6 +357,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         &flags.bypass_protection_paths,
         &deny_paths,
         &allowed_domain_strs,
+        &denied_domain_strs,
         &domain_endpoints,
         flags.silent,
     );
@@ -719,6 +734,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         sandbox_policy: flags.sandbox_policy,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
+        case_insensitive_env_vars: flags.case_insensitive_env_vars,
         set_vars: flags.set_vars.unwrap_or_default(),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: tool_sandbox_runtime.as_ref(),
@@ -734,6 +750,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
+            // Look up the approval backend for supervised file/capability
+            // prompts. It lives under the profile `security` section, kept
+            // separate from `command_policies` so it does not switch on
+            // tool-sandbox. Fail closed: if a backend is configured but cannot
+            // be built or picked, error out — never quietly drop back to the
+            // terminal prompt. Nothing configured returns `None`, keeping the
+            // prompt.
+            let approval_backend = crate::approval_runtime::resolve_supervised_approval_backend(
+                &flags.approval_backends,
+                flags
+                    .approval_defaults
+                    .as_ref()
+                    .and_then(|d| d.backend.clone()),
+            )?;
             let exit_result = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,
@@ -746,6 +776,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 executable_identity: executable_identity.as_ref(),
                 audit_signer: audit_signer.as_ref(),
                 redaction_policy: &flags.redaction_policy,
+                approval_backend,
                 silent: flags.silent,
             });
 
@@ -804,6 +835,7 @@ fn write_capability_state_file(
     bypass_protection_paths: &[std::path::PathBuf],
     deny_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
+    denied_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
@@ -812,6 +844,7 @@ fn write_capability_state_file(
         bypass_protection_paths,
         deny_paths,
         allowed_domains,
+        denied_domains,
         domain_endpoints,
     );
 

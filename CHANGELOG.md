@@ -1,5 +1,336 @@
 # Changelog
 
+## [0.77.0] - 2026-09-11
+
+### Bug Fixes
+
+- *(cli)* Keep legacy ~/.claude.json in sync with CLAUDE_CONFIG_DIR redirects (#1837) ([#1837](https://github.com/nolabs-ai/nono/pull/1837))
+
+- *(cli)* Guard consent prompts against type-ahead
+
+- *(cli)* Guard denied-path selector against type-ahead
+
+- *(lib)* Validate localhost port ranges for zero end and inverted ranges (#1860) ([#1860](https://github.com/nolabs-ai/nono/pull/1860))
+
+- *(cli)* Always re-invoke the credential source for ambient captures (#1849) ([#1849](https://github.com/nolabs-ai/nono/pull/1849))
+
+- *(cli)* Ignore unhandled keys in the denied-path review selector (#1852) ([#1852](https://github.com/nolabs-ai/nono/pull/1852))
+
+- *(cli)* Gate diagnostic remedies on observed evidence (#1816) ([#1816](https://github.com/nolabs-ai/nono/pull/1816))
+
+- *(proxy)* Make * stop at / in endpoint path patterns (#1828) ([#1828](https://github.com/nolabs-ai/nono/pull/1828))
+
+- *(cli)* Preserve file permissions on write_file wiring copy (#1807) ([#1807](https://github.com/nolabs-ai/nono/pull/1807))
+
+- *(cli)* Use CLAUDE_CONFIG_DIR instead of ~/.claude.json symlink redirects (#1820) ([#1820](https://github.com/nolabs-ai/nono/pull/1820))
+
+- *(policy)* Resolve nss module error (#1806) ([#1806](https://github.com/nolabs-ai/nono/pull/1806))
+
+- *(cgroup)* Skip control files when sweeping stale lineage sessions (#1802) ([#1802](https://github.com/nolabs-ai/nono/pull/1802))
+
+- *(cli)* Route tracing warnings to stderr, not stdout (#1801) ([#1801](https://github.com/nolabs-ai/nono/pull/1801))
+
+- *(proxy)* Read chunked HTTP request bodies on L7 forward path (#1687) ([#1687](https://github.com/nolabs-ai/nono/pull/1687))
+
+- *(proxy)* Load declarative credentials from profiles (#1789) ([#1789](https://github.com/nolabs-ai/nono/pull/1789))
+
+- *(sandbox)* Resolve multi-hop symlinks in fs grants (#1776) ([#1776](https://github.com/nolabs-ai/nono/pull/1776))
+
+- Allow fire-and-forget child processes (#1737) ([#1737](https://github.com/nolabs-ai/nono/pull/1737))
+
+- *(policy)* Remove blanket /Volumes read grant from system_read_macos (#1769) ([#1769](https://github.com/nolabs-ai/nono/pull/1769))
+
+- *(proxy)* Disable audit buffer for standalone \`nono proxy\` (#1766) ([#1766](https://github.com/nolabs-ai/nono/pull/1766))
+
+
+### CI/CD
+
+- Run full integration suite on PRs (#1872) ([#1872](https://github.com/nolabs-ai/nono/pull/1872))
+
+- *(spire)* Scope SPIRE workflow to code changes (#1800) ([#1800](https://github.com/nolabs-ai/nono/pull/1800))
+
+
+### Dependencies
+
+- *(deps)* Bump h2 from 0.4.16 to 0.4.19 (#1814) ([#1814](https://github.com/nolabs-ai/nono/pull/1814))
+
+- *(deps)* Bump serde from 1.0.228 to 1.0.229 (#1813) ([#1813](https://github.com/nolabs-ai/nono/pull/1813))
+
+- *(deps)* Bump clap from 4.6.4 to 4.6.6 (#1812) ([#1812](https://github.com/nolabs-ai/nono/pull/1812))
+
+- *(deps)* Bump regress from 0.11.1 to 0.12.0 (#1811) ([#1811](https://github.com/nolabs-ai/nono/pull/1811))
+
+- *(deps)* Bump tokio-rustls from 0.26.4 to 0.26.5 (#1809) ([#1809](https://github.com/nolabs-ai/nono/pull/1809))
+
+- *(deps)* Bump docker/setup-qemu-action from 4.2.0 to 4.3.0 (#1815) ([#1815](https://github.com/nolabs-ai/nono/pull/1815))
+
+- *(deps)* Bump softprops/action-gh-release from 3.0.2 to 3.0.3 (#1810) ([#1810](https://github.com/nolabs-ai/nono/pull/1810))
+
+
+### Documentation
+
+- *(cli)* Link built-in groups to their policy.json source (#1850) ([#1850](https://github.com/nolabs-ai/nono/pull/1850))
+
+- *(cli)* Update built-in profiles and groups list (#1840) ([#1840](https://github.com/nolabs-ai/nono/pull/1840))
+
+- *(neps)* Add NEP-0001, pre-1.0.0 tech debt and API-freeze cleanup (#1758) ([#1758](https://github.com/nolabs-ai/nono/pull/1758))
+
+
+### Features
+
+- *(cli)* Use CLONE_FILES bootstrap for network-notification sessions (#1825) ([#1825](https://github.com/nolabs-ai/nono/pull/1825))
+
+- *(profile)* Remove all legacy aliases and deprecation shims for v1.0.0 prep (#1826) ([#1826](https://github.com/nolabs-ai/nono/pull/1826))
+
+- *(audit)* Add --max-total-size to audit cleanup (#1819) ([#1819](https://github.com/nolabs-ai/nono/pull/1819))
+
+- Add Nix flake support (#1784) ([#1784](https://github.com/nolabs-ai/nono/pull/1784))
+
+- *(tool-sandbox)* Support Git fsmonitor socket via unix_socket_bind (#1780) ([#1780](https://github.com/nolabs-ai/nono/pull/1780))
+
+
+### Miscellaneous
+
+- Release v0.76.0 (#1832) ([#1832](https://github.com/nolabs-ai/nono/pull/1832))
+
+- *(github)* Remove triage label from issue templates (#1798) ([#1798](https://github.com/nolabs-ai/nono/pull/1798))
+
+## [0.76.0] - 2026-09-09
+
+### Bug Fixes
+
+- *(cli)* Gate diagnostic remedies on observed evidence (#1816) ([#1816](https://github.com/nolabs-ai/nono/pull/1816))
+
+- *(proxy)* Make * stop at / in endpoint path patterns (#1828) ([#1828](https://github.com/nolabs-ai/nono/pull/1828))
+
+- *(cli)* Preserve file permissions on write_file wiring copy (#1807) ([#1807](https://github.com/nolabs-ai/nono/pull/1807))
+
+- *(cli)* Use CLAUDE_CONFIG_DIR instead of ~/.claude.json symlink redirects (#1820) ([#1820](https://github.com/nolabs-ai/nono/pull/1820))
+
+- *(policy)* Resolve nss module error (#1806) ([#1806](https://github.com/nolabs-ai/nono/pull/1806))
+
+- *(cgroup)* Skip control files when sweeping stale lineage sessions (#1802) ([#1802](https://github.com/nolabs-ai/nono/pull/1802))
+
+- *(cli)* Route tracing warnings to stderr, not stdout (#1801) ([#1801](https://github.com/nolabs-ai/nono/pull/1801))
+
+- *(proxy)* Read chunked HTTP request bodies on L7 forward path (#1687) ([#1687](https://github.com/nolabs-ai/nono/pull/1687))
+
+- *(proxy)* Load declarative credentials from profiles (#1789) ([#1789](https://github.com/nolabs-ai/nono/pull/1789))
+
+- *(sandbox)* Resolve multi-hop symlinks in fs grants (#1776) ([#1776](https://github.com/nolabs-ai/nono/pull/1776))
+
+- Allow fire-and-forget child processes (#1737) ([#1737](https://github.com/nolabs-ai/nono/pull/1737))
+
+- *(policy)* Remove blanket /Volumes read grant from system_read_macos (#1769) ([#1769](https://github.com/nolabs-ai/nono/pull/1769))
+
+- *(proxy)* Disable audit buffer for standalone \`nono proxy\` (#1766) ([#1766](https://github.com/nolabs-ai/nono/pull/1766))
+
+
+### CI/CD
+
+- *(spire)* Scope SPIRE workflow to code changes (#1800) ([#1800](https://github.com/nolabs-ai/nono/pull/1800))
+
+
+### Dependencies
+
+- *(deps)* Bump h2 from 0.4.16 to 0.4.19 (#1814) ([#1814](https://github.com/nolabs-ai/nono/pull/1814))
+
+- *(deps)* Bump serde from 1.0.228 to 1.0.229 (#1813) ([#1813](https://github.com/nolabs-ai/nono/pull/1813))
+
+- *(deps)* Bump clap from 4.6.4 to 4.6.6 (#1812) ([#1812](https://github.com/nolabs-ai/nono/pull/1812))
+
+- *(deps)* Bump regress from 0.11.1 to 0.12.0 (#1811) ([#1811](https://github.com/nolabs-ai/nono/pull/1811))
+
+- *(deps)* Bump tokio-rustls from 0.26.4 to 0.26.5 (#1809) ([#1809](https://github.com/nolabs-ai/nono/pull/1809))
+
+- *(deps)* Bump docker/setup-qemu-action from 4.2.0 to 4.3.0 (#1815) ([#1815](https://github.com/nolabs-ai/nono/pull/1815))
+
+- *(deps)* Bump softprops/action-gh-release from 3.0.2 to 3.0.3 (#1810) ([#1810](https://github.com/nolabs-ai/nono/pull/1810))
+
+
+### Documentation
+
+- *(neps)* Add NEP-0001, pre-1.0.0 tech debt and API-freeze cleanup (#1758) ([#1758](https://github.com/nolabs-ai/nono/pull/1758))
+
+
+### Features
+
+- *(audit)* Add --max-total-size to audit cleanup (#1819) ([#1819](https://github.com/nolabs-ai/nono/pull/1819))
+
+- Add Nix flake support (#1784) ([#1784](https://github.com/nolabs-ai/nono/pull/1784))
+
+- *(tool-sandbox)* Support Git fsmonitor socket via unix_socket_bind (#1780) ([#1780](https://github.com/nolabs-ai/nono/pull/1780))
+
+
+### Miscellaneous
+
+- *(github)* Remove triage label from issue templates (#1798) ([#1798](https://github.com/nolabs-ai/nono/pull/1798))
+
+## [0.75.0] - 2026-09-01
+
+### Bug Fixes
+
+- *(sandbox)* Use capturing group in ** deny-glob Seatbelt regex (#1764) ([#1764](https://github.com/nolabs-ai/nono/pull/1764))
+
+- *(sandbox)* Expand env vars anywhere in local-socket path, not just as prefix (#1762) ([#1762](https://github.com/nolabs-ai/nono/pull/1762))
+
+- *(why)* Evaluate network.deny_domain in nono why host queries (#1751) ([#1751](https://github.com/nolabs-ai/nono/pull/1751))
+
+- *(cli)* Hint at CAP_SYS_PTRACE on pidfd_getfd EPERM, fix doubled error prefix (#1750) ([#1750](https://github.com/nolabs-ai/nono/pull/1750))
+
+- *(hooks)* Expand $WORKDIR/$HOME/etc. in session hook script paths (#1749) ([#1749](https://github.com/nolabs-ai/nono/pull/1749))
+
+- *(cli)* Honor inline custom credential routes in --config manifests (#1705) ([#1705](https://github.com/nolabs-ai/nono/pull/1705))
+
+- *(credentials)* Configurable phantom format for prefix-sniffing clients (#1489) ([#1489](https://github.com/nolabs-ai/nono/pull/1489))
+
+- *(policy)* Make unmatched deny-glob warning platform-accurate (#1738) ([#1738](https://github.com/nolabs-ai/nono/pull/1738))
+
+- *(proxy)* Add redeem_phantoms for by-value phantom redemption (#1469) ([#1469](https://github.com/nolabs-ai/nono/pull/1469))
+
+- *(cli)* Warn when a draft profile cannot resolve its extends chain (#1702) ([#1702](https://github.com/nolabs-ai/nono/pull/1702))
+
+- *(cli)* Make profile promote work for existing profiles (#1703) ([#1703](https://github.com/nolabs-ai/nono/pull/1703))
+
+- *(sandbox)* Grant Refer on command_policies outer exec gate (#1722) ([#1722](https://github.com/nolabs-ai/nono/pull/1722))
+
+- *(proxy)* Skip network audit buffer when --no-audit is set (#1682) ([#1682](https://github.com/nolabs-ai/nono/pull/1682))
+
+- *(proxy)* Decode Basic auth for basic_auth phantom validation (#1683) ([#1683](https://github.com/nolabs-ai/nono/pull/1683))
+
+- *(proxy)* Honor host:port deny entries under wildcard allow (#1709) ([#1709](https://github.com/nolabs-ai/nono/pull/1709))
+
+- Broken quote formatting in README (#1707) ([#1707](https://github.com/nolabs-ai/nono/pull/1707))
+
+
+### Dependencies
+
+- *(deps)* Bump globset from 0.4.19 to 0.4.20 (#1753) ([#1753](https://github.com/nolabs-ai/nono/pull/1753))
+
+- *(deps)* Bump hyper from 1.11.0 to 1.11.1 (#1755) ([#1755](https://github.com/nolabs-ai/nono/pull/1755))
+
+- *(deps)* Bump which from 8.0.5 to 8.0.6 (#1756) ([#1756](https://github.com/nolabs-ai/nono/pull/1756))
+
+- *(deps)* Bump rcgen from 0.14.8 to 0.14.9 (#1752) ([#1752](https://github.com/nolabs-ai/nono/pull/1752))
+
+- *(deps)* Bump ureq from 3.3.0 to 3.4.0 (#1754) ([#1754](https://github.com/nolabs-ai/nono/pull/1754))
+
+- *(deps)* Bump aws-lc-rs from 1.17.3 to 1.18.0 (#1726) ([#1726](https://github.com/nolabs-ai/nono/pull/1726))
+
+- *(deps)* Bump tokio-tungstenite from 0.28.0 to 0.30.0 (#1728) ([#1728](https://github.com/nolabs-ai/nono/pull/1728))
+
+- *(deps)* Bump base64 from 0.23.0 to 0.23.1 (#1727) ([#1727](https://github.com/nolabs-ai/nono/pull/1727))
+
+- *(deps)* Bump thiserror from 2.0.18 to 2.0.20 (#1725) ([#1725](https://github.com/nolabs-ai/nono/pull/1725))
+
+- *(deps)* Bump similar from 3.1.1 to 3.2.0 (#1729) ([#1729](https://github.com/nolabs-ai/nono/pull/1729))
+
+- *(deps)* Bump docker/setup-buildx-action from 4.2.0 to 4.3.0 (#1730) ([#1730](https://github.com/nolabs-ai/nono/pull/1730))
+
+
+### Documentation
+
+- Add NEP process for design proposals (#1743) ([#1743](https://github.com/nolabs-ai/nono/pull/1743))
+
+- Update SECURITY.md to clarify security model (#1747) ([#1747](https://github.com/nolabs-ai/nono/pull/1747))
+
+- *(security)* Security model clarification  (#1734) ([#1734](https://github.com/nolabs-ai/nono/pull/1734))
+
+
+### Features
+
+- *(profile,proxy)* Glob patterns for env var and hostname allow/deny lists (#1692) ([#1692](https://github.com/nolabs-ai/nono/pull/1692))
+
+- *(broker-path)* Sanitize PATH for host-side credential and URL brokers (#1733) ([#1733](https://github.com/nolabs-ai/nono/pull/1733))
+
+- *(examples)* Add initial set of tool sandbox examples (#1696) ([#1696](https://github.com/nolabs-ai/nono/pull/1696))
+
+- *(cli)* Show resolved command_policies in profile show (#1685) ([#1685](https://github.com/nolabs-ai/nono/pull/1685))
+
+- *(cli)* Support --extends on nono proxy (#1686) ([#1686](https://github.com/nolabs-ai/nono/pull/1686))
+
+## [0.74.0] - 2026-08-19
+
+### Bug Fixes
+
+- *(fs)* Validate unix socket nodes and normalize landlock (#1654) ([#1654](https://github.com/nolabs-ai/nono/pull/1654))
+
+- *(net_filter)* Normalize hostnames before deny/allow-list matching (#1676) ([#1676](https://github.com/nolabs-ai/nono/pull/1676))
+
+- *(cli)* Stop leaking orphaned proxy CA Keychain items (#1674) ([#1674](https://github.com/nolabs-ai/nono/pull/1674))
+
+- *(proxy)* Check hostname allowlist before DNS resolution (#1675) ([#1675](https://github.com/nolabs-ai/nono/pull/1675))
+
+- *(proxy)* Bound per-line reads of the WebSocket upgrade response (#1617) ([#1617](https://github.com/nolabs-ai/nono/pull/1617))
+
+- *(proxy)* Honour require_auth on the plain-HTTP forward path (#1673) ([#1673](https://github.com/nolabs-ai/nono/pull/1673))
+
+- *(proxy)* Honor profiles network.tls_intercept in `nono proxy` (#1672) ([#1672](https://github.com/nolabs-ai/nono/pull/1672))
+
+- *(cli)* Preserve terminal output during capability approval (#1527) ([#1527](https://github.com/nolabs-ai/nono/pull/1527))
+
+- *(supervisor)* Enforce peer-UID check in SupervisorSocket::bind() (#1639) ([#1639](https://github.com/nolabs-ai/nono/pull/1639))
+
+- *(cli)* Union separate read and write grants for `nono why --op readwrite` (#1638) ([#1638](https://github.com/nolabs-ai/nono/pull/1638))
+
+- *(sandbox)* Allow hex-suffixed atomic-write temp files on macOS (#1637) ([#1637](https://github.com/nolabs-ai/nono/pull/1637))
+
+- *(sandbox)* Enforce proxy-only destination check on Landlock V4+ kernels (#1631) ([#1631](https://github.com/nolabs-ai/nono/pull/1631))
+
+- *(audit)* Propogate errors after unparseable ledger (#1596) ([#1596](https://github.com/nolabs-ai/nono/pull/1596))
+
+
+### Dependencies
+
+- *(deps)* Bump h2 to 0.4.16 (#1670) ([#1670](https://github.com/nolabs-ai/nono/pull/1670))
+
+- *(deps)* Bump webpki-roots from 1.0.8 to 1.0.9 (#1660) ([#1660](https://github.com/nolabs-ai/nono/pull/1660))
+
+- *(deps)* Bump libc from 0.2.186 to 0.2.189 (#1662) ([#1662](https://github.com/nolabs-ai/nono/pull/1662))
+
+- *(deps)* Bump http-body-util from 0.1.4 to 0.1.5 (#1661) ([#1661](https://github.com/nolabs-ai/nono/pull/1661))
+
+- *(deps)* Bump clap_complete from 4.6.7 to 4.6.9 (#1659) ([#1659](https://github.com/nolabs-ai/nono/pull/1659))
+
+- *(deps)* Bump jsonc-parser from 0.32.4 to 0.33.1 (#1658) ([#1658](https://github.com/nolabs-ai/nono/pull/1658))
+
+- *(deps)* Bump regex from 1.13.0 to 1.13.1 (#1615) ([#1615](https://github.com/nolabs-ai/nono/pull/1615))
+
+- *(deps)* Bump time from 0.3.53 to 0.3.55 (#1614) ([#1614](https://github.com/nolabs-ai/nono/pull/1614))
+
+- *(deps)* Bump rustls from 0.23.42 to 0.23.43 (#1612) ([#1612](https://github.com/nolabs-ai/nono/pull/1612))
+
+- *(deps)* Bump http from 1.4.2 to 1.5.0 (#1611) ([#1611](https://github.com/nolabs-ai/nono/pull/1611))
+
+- *(deps)* Bump base64 from 0.22.1 to 0.23.0 (#1609) ([#1609](https://github.com/nolabs-ai/nono/pull/1609))
+
+- *(deps)* Bump actions/attest from 4.2.1 to 4.2.2 (#1613) ([#1613](https://github.com/nolabs-ai/nono/pull/1613))
+
+
+### Documentation
+
+- Correct outdated/inaccurate sections across 4 doc pages (#1668) ([#1668](https://github.com/nolabs-ai/nono/pull/1668))
+
+
+### Features
+
+- *(profile)* Configurable approval backend for supervised-mode prompts (#1677) ([#1677](https://github.com/nolabs-ai/nono/pull/1677))
+
+- *(audit)* Surface subtool audit (#1641) ([#1641](https://github.com/nolabs-ai/nono/pull/1641))
+
+- *(remote)* Add remote session connect and ps (#1656) ([#1656](https://github.com/nolabs-ai/nono/pull/1656))
+
+- *(policy)* Allow unlink for atomic write temp files (#1657) ([#1657](https://github.com/nolabs-ai/nono/pull/1657))
+
+- *(tool-sandbox)* Caller-declared env pass-through via export_env (#1440) ([#1440](https://github.com/nolabs-ai/nono/pull/1440))
+
+
+### Refactoring
+
+- *(seccomp)* Ensure all filters include arch guard (#1636) ([#1636](https://github.com/nolabs-ai/nono/pull/1636))
+
+- *(test)* Share integration harness (#1597) ([#1597](https://github.com/nolabs-ai/nono/pull/1597))
+
 ## [0.73.0] - 2026-08-10
 
 ### Bug Fixes

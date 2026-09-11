@@ -287,7 +287,7 @@ impl CommandPoliciesConfig {
         })
     }
 
-    fn has_non_command_fields(&self) -> bool {
+    pub(crate) fn has_non_command_fields(&self) -> bool {
         !self.executable_dirs.is_empty()
             || self.allow_writable_executables
             || self.entrypoint.is_some()
@@ -418,6 +418,11 @@ pub struct CommandCredentialConfig {
     pub tls_client_key: Option<String>,
     #[serde(default)]
     pub source: Option<AmbientCredentialSourceConfig>,
+    /// Literal template for the visible phantom, `{}` standing in for the random
+    /// body (e.g. `"sk-ant-oat01-{}"`), so a client that classifies a credential by
+    /// sniffing a token prefix still recognises it. `ambient` credentials only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 impl Default for CommandCredentialConfig {
@@ -436,6 +441,7 @@ impl Default for CommandCredentialConfig {
             tls_client_cert: None,
             tls_client_key: None,
             source: None,
+            format: None,
         }
     }
 }
@@ -814,6 +820,12 @@ pub struct CommandSandboxConfig {
     /// tools like `git` that re-exec their own helpers by absolute path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exec_paths: Vec<String>,
+    /// Exact-file Unix domain socket grants this command may `connect` or
+    /// `bind` to (e.g. a daemon's IPC socket it starts on demand). Mirrors
+    /// the agent-level `filesystem.unix_socket_bind` field but scoped to a
+    /// single command. Supports dynamic-provider tokens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unix_socket_bind: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -842,6 +854,7 @@ impl CommandSandboxConfig {
                 &child.unsafe_macos_seatbelt_rules,
             ),
             exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
+            unix_socket_bind: dedup_append(&self.unix_socket_bind, &child.unix_socket_bind),
         }
     }
 }
@@ -1155,7 +1168,12 @@ pub(crate) fn validate_command_policies(
     if let Some(entrypoint) = &config.entrypoint {
         validate_identifier("entrypoint", entrypoint, &mut report);
     }
-    validate_approval_defaults(config, &mut report);
+    validate_approval_defaults(
+        "approval_defaults",
+        &config.approval_backends,
+        Some(&config.approval_defaults),
+        &mut report,
+    );
     validate_absolute_file_path_list(
         "command_policies.deny_direct_exec_bypass",
         &config.deny_direct_exec_bypass,
@@ -1177,7 +1195,7 @@ pub(crate) fn validate_command_policies(
         validate_credential(name, credential, &mut report);
     }
     for (name, backend) in &config.approval_backends {
-        validate_approval_backend(name, backend, config, &mut report);
+        validate_approval_backend(name, backend, &config.approval_backends, &mut report);
     }
 
     for (command_name, command) in &config.commands {
@@ -1766,14 +1784,28 @@ fn validate_intercept_rules(
                 format!("command '{command_name}' intercept rule {i} respond stdout exceeds 1 MiB"),
             );
         }
-        if let InterceptActionConfig::CaptureCredential { credential, .. } = &rule.action {
+        if let InterceptActionConfig::CaptureCredential {
+            credential, shape, ..
+        } = &rule.action
+        {
             validate_identifier(
                 &format!("commands.{command_name}.intercept[{i}].action.credential"),
                 credential,
                 report,
             );
             match config.credentials.get(credential) {
-                Some(config) if config.credential_type == CommandCredentialType::Ambient => {}
+                Some(cred) if cred.credential_type == CommandCredentialType::Ambient => {
+                    // A `format` here would land inside the JWT signature
+                    // segment rather than shaping the visible token.
+                    if *shape == CapturedNonceShape::Jwt && cred.format.is_some() {
+                        report.error(
+                            "invalid_credential_capture",
+                            format!(
+                                "command '{command_name}' intercept rule {i} capture_credential shape 'jwt' cannot be combined with credential '{credential}' format"
+                            ),
+                        );
+                    }
+                }
                 Some(_) => {
                     report.error(
                         "invalid_credential_capture",
@@ -2091,21 +2123,26 @@ fn validate_invocation_policy(
 }
 
 fn validate_approval_defaults(
-    config: &CommandPoliciesConfig,
+    defaults_label: &str,
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    defaults: Option<&ApprovalDefaultsConfig>,
     report: &mut CommandPolicyValidationReport,
 ) {
-    if let Some(backend) = &config.approval_defaults.backend {
-        validate_identifier("approval_defaults.backend", backend, report);
-        if !config.approval_backends.contains_key(backend) {
+    let Some(defaults) = defaults else {
+        return;
+    };
+    if let Some(backend) = &defaults.backend {
+        validate_identifier(&format!("{defaults_label}.backend"), backend, report);
+        if !backends.contains_key(backend) {
             report.error(
                 "unknown_approval_backend",
-                format!("approval_defaults references unknown backend '{backend}'"),
+                format!("{defaults_label} references unknown backend '{backend}'"),
             );
         }
     }
     validate_positive_timeout(
-        "approval_defaults.timeout_secs",
-        config.approval_defaults.timeout_secs,
+        &format!("{defaults_label}.timeout_secs"),
+        defaults.timeout_secs,
         report,
     );
 }
@@ -2113,7 +2150,7 @@ fn validate_approval_defaults(
 fn validate_approval_backend(
     name: &str,
     backend: &ApprovalBackendConfig,
-    config: &CommandPoliciesConfig,
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
     report: &mut CommandPolicyValidationReport,
 ) {
     match backend.backend_type {
@@ -2171,7 +2208,7 @@ fn validate_approval_backend(
                         "invalid_approval_backend",
                         format!("approval backend '{name}' cannot chain to itself"),
                     );
-                } else if !config.approval_backends.contains_key(child_backend) {
+                } else if !backends.contains_key(child_backend) {
                     report.error(
                         "unknown_approval_backend",
                         format!(
@@ -2196,6 +2233,31 @@ fn validate_approval_backend(
         backend.timeout_secs,
         report,
     );
+}
+
+/// Validate the profile `security.approval_backends` surface at profile-load
+/// time, so a malformed backend is rejected with a clean error instead of
+/// deferring to a supervised-launch build failure. This reuses the exact
+/// per-backend checks the `command_policies` surface gets — identifier syntax
+/// and collisions, per-type field consistency (webhook needs a url; chain needs
+/// a mode and child list; terminal takes none of those), self-chaining,
+/// references to unknown backends, NUL-in-url, and positive timeouts.
+pub(crate) fn validate_security_approval_backends(
+    backends: &BTreeMap<String, ApprovalBackendConfig>,
+    defaults: Option<&ApprovalDefaultsConfig>,
+) -> nono::Result<()> {
+    let mut report = CommandPolicyValidationReport::default();
+    validate_identifier_set("approval backend", backends.keys(), &mut report);
+    validate_approval_defaults(
+        "security.approval_defaults",
+        backends,
+        defaults,
+        &mut report,
+    );
+    for (name, backend) in backends {
+        validate_approval_backend(name, backend, backends, &mut report);
+    }
+    report.into_result()
 }
 
 fn validate_policy_default(
@@ -2444,6 +2506,19 @@ fn validate_credential(
     credential: &CommandCredentialConfig,
     report: &mut CommandPolicyValidationReport,
 ) {
+    if let Some(template) = &credential.format {
+        if credential.credential_type != CommandCredentialType::Ambient {
+            report.error(
+                "invalid_credential",
+                format!("credential '{name}' format is only valid for ambient credentials"),
+            );
+        } else if let Err(err) = nono_proxy::token::PhantomTemplate::parse(template) {
+            report.error(
+                "invalid_credential",
+                format!("ambient credential '{name}' {err}"),
+            );
+        }
+    }
     match credential.credential_type {
         CommandCredentialType::LocalSocket => {
             if credential.path.as_deref().unwrap_or_default().is_empty() {
@@ -2636,14 +2711,6 @@ fn validate_environment(
                     format!("command '{command_name}' from.{caller} has empty allow_vars pattern"),
                 );
             }
-            if pattern.matches('*').count() > 1 {
-                report.error(
-                    "invalid_environment_pattern",
-                    format!(
-                        "command '{command_name}' from.{caller} allow_vars pattern '{pattern}' contains multiple wildcards"
-                    ),
-                );
-            }
         }
 
         if let Some(error) =
@@ -2693,12 +2760,6 @@ fn validate_export_env(
                 format!("{field_label} has an empty pattern"),
             );
             continue;
-        }
-        if pattern.matches('*').count() > 1 {
-            report.error(
-                "invalid_export_env",
-                format!("{field_label} pattern '{pattern}' contains multiple wildcards"),
-            );
         }
         // nono owns PATH/NONO_*, so naming them is an error. A broad pattern is
         // fine — they are excluded at build time regardless.
@@ -2761,6 +2822,14 @@ fn validate_network(
                 "command '{command_name}' from.{caller} uses network.allow_domain through the supervisor proxy; execution fails closed if no loopback proxy is available"
             ),
         );
+    }
+    for pattern in &network.allow_domain {
+        if let Err(err) = nono::net_filter::validate_host_pattern(pattern) {
+            report.error(
+                "invalid_network_pattern",
+                format!("command '{command_name}' from.{caller} allow_domain: {err}"),
+            );
+        }
     }
 
     if !network.tcp_connect_ports.is_empty() || !network.tcp_bind_ports.is_empty() {
@@ -4016,7 +4085,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_rejects_non_trailing_wildcards() {
+    fn environment_accepts_multi_wildcard_patterns() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.sandbox = Some(CommandSandboxConfig {
@@ -4032,7 +4101,7 @@ mod tests {
             validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
 
         assert!(
-            report
+            !report
                 .errors
                 .iter()
                 .any(|finding| finding.code == "invalid_environment_pattern")
@@ -4064,9 +4133,7 @@ mod tests {
     }
 
     #[test]
-    fn export_env_rejects_repeated_trailing_wildcards() {
-        // "A**" passes validate_env_var_patterns but matches_env_var_patterns
-        // treats it as unmatchable, silently excluding the var at runtime.
+    fn export_env_accepts_repeated_wildcards() {
         let mut config = active_git_config();
         if let Some(git) = config.commands.get_mut("git") {
             git.export_env = vec!["A**".to_string()];
@@ -4076,7 +4143,7 @@ mod tests {
             validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
 
         assert!(
-            report
+            !report
                 .errors
                 .iter()
                 .any(|finding| finding.code == "invalid_export_env")
@@ -4094,6 +4161,24 @@ mod tests {
                 "AWS_*".to_string(),
                 "*".to_string(),
             ];
+        }
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|finding| finding.code == "invalid_export_env")
+        );
+    }
+
+    #[test]
+    fn export_env_accepts_single_mid_string_wildcard() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.export_env = vec!["A*B".to_string()];
         }
 
         let report =
@@ -5844,6 +5929,106 @@ mod tests {
         assert!(report.is_ok(), "{:?}", report.errors);
     }
 
+    fn security_backend(backend_type: ApprovalBackendType) -> ApprovalBackendConfig {
+        ApprovalBackendConfig {
+            backend_type,
+            url: None,
+            timeout_secs: None,
+            mode: None,
+            backends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_accepts_valid_webhook_with_default() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "review".to_string(),
+            ApprovalBackendConfig {
+                url: Some("https://approval.example".to_string()),
+                timeout_secs: Some(30),
+                ..security_backend(ApprovalBackendType::Webhook)
+            },
+        );
+        let defaults = ApprovalDefaultsConfig {
+            backend: Some("review".to_string()),
+            timeout_secs: None,
+        };
+        assert!(validate_security_approval_backends(&backends, Some(&defaults)).is_ok());
+    }
+
+    #[test]
+    fn security_approval_backends_empty_is_ok() {
+        let backends = BTreeMap::new();
+        assert!(validate_security_approval_backends(&backends, None).is_ok());
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_webhook_without_url() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "review".to_string(),
+            security_backend(ApprovalBackendType::Webhook),
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a webhook backend without a url must be rejected"),
+            Err(err) => assert!(err.to_string().contains("must define url"), "{err}"),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_terminal_with_url() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "term".to_string(),
+            ApprovalBackendConfig {
+                url: Some("https://nope.example".to_string()),
+                ..security_backend(ApprovalBackendType::Terminal)
+            },
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a terminal backend with a url must be rejected"),
+            Err(err) => assert!(err.to_string().contains("cannot define url"), "{err}"),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_unknown_default() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "review".to_string(),
+            security_backend(ApprovalBackendType::Terminal),
+        );
+        let defaults = ApprovalDefaultsConfig {
+            backend: Some("missing".to_string()),
+            timeout_secs: None,
+        };
+        match validate_security_approval_backends(&backends, Some(&defaults)) {
+            Ok(()) => panic!("a default pointing at an unknown backend must be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("unknown backend 'missing'"),
+                "{err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn security_approval_backends_rejects_self_chain() {
+        let mut backends = BTreeMap::new();
+        backends.insert(
+            "loop".to_string(),
+            ApprovalBackendConfig {
+                mode: Some(ApprovalChainMode::All),
+                backends: vec!["loop".to_string()],
+                ..security_backend(ApprovalBackendType::Chain)
+            },
+        );
+        match validate_security_approval_backends(&backends, None) {
+            Ok(()) => panic!("a self-chaining backend must be rejected"),
+            Err(err) => assert!(err.to_string().contains("cannot chain to itself"), "{err}"),
+        }
+    }
+
     #[test]
     fn approval_timeouts_must_be_nonzero() {
         let mut config = active_git_config();
@@ -6094,5 +6279,115 @@ mod tests {
         let restored: CommandHashCacheFile =
             serde_json::from_str("{}").expect("missing entries should default to empty");
         assert!(restored.entries.is_empty());
+    }
+
+    fn validate_one(credential: &CommandCredentialConfig) -> CommandPolicyValidationReport {
+        let mut report = CommandPolicyValidationReport::default();
+        validate_credential("cred", credential, &mut report);
+        report
+    }
+
+    #[test]
+    fn ambient_format_single_placeholder_accepted() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("sk-ant-oat01-{}".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred).errors.is_empty(),
+            "single-placeholder ambient format should validate"
+        );
+    }
+
+    #[test]
+    fn ambient_format_with_control_characters_rejected() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Ambient,
+            format: Some("a\r\nX: y{}".to_string()),
+            ..Default::default()
+        };
+        let errors = validate_one(&cred).errors;
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("must not contain control characters")),
+            "expected control-character error, got {errors:?}"
+        );
+    }
+
+    fn capture_credential_config(
+        format: Option<&str>,
+        shape: CapturedNonceShape,
+    ) -> CommandPoliciesConfig {
+        let mut config = active_git_config();
+        config.credentials.insert(
+            "anthropic".to_string(),
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Ambient,
+                format: format.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        let git = config.commands.get_mut("git").expect("git command");
+        git.intercept.push(InterceptRuleConfig {
+            args: Some(vec!["status".to_string()]),
+            match_config: None,
+            action: InterceptActionConfig::CaptureCredential {
+                credential: "anthropic".to_string(),
+                grant_to: Vec::new(),
+                shape,
+            },
+            sandbox: None,
+        });
+        config
+    }
+
+    fn capture_shape_errors(format: Option<&str>, shape: CapturedNonceShape) -> Vec<String> {
+        validate_command_policies(
+            Some(&capture_credential_config(format, shape)),
+            CommandPolicyValidationScope::Resolved,
+        )
+        .errors
+        .into_iter()
+        .filter(|finding| finding.code == "invalid_credential_capture")
+        .map(|finding| finding.message)
+        .collect()
+    }
+
+    #[test]
+    fn ambient_format_with_jwt_capture_shape_rejected() {
+        let errors = capture_shape_errors(Some("sk-ant-oat01-{}"), CapturedNonceShape::Jwt);
+        assert!(
+            errors
+                .iter()
+                .any(|message| message.contains("shape 'jwt' cannot be combined")),
+            "expected jwt-shape/format conflict, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn ambient_format_with_opaque_capture_shape_accepted() {
+        assert!(
+            capture_shape_errors(Some("sk-ant-oat01-{}"), CapturedNonceShape::Opaque).is_empty()
+        );
+        assert!(capture_shape_errors(None, CapturedNonceShape::Jwt).is_empty());
+    }
+
+    #[test]
+    fn format_rejected_on_non_ambient_credential() {
+        let cred = CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            format: Some("sk-{}".to_string()),
+            upstream: Some("https://example.com".to_string()),
+            inject_header: Some("Authorization".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            validate_one(&cred)
+                .errors
+                .iter()
+                .any(|e| e.message.contains("only valid for ambient credentials"))
+        );
     }
 }

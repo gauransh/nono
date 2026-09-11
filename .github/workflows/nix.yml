@@ -1,0 +1,60 @@
+name: Nix flake
+
+# Validates the flake (flake.nix) on Linux and macOS.
+# Runs on PRs that touch flake files and on manual dispatch.
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "**/*.nix"
+      - ".github/workflows/nix.yml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: nix flake check (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-latest: x86_64-linux + aarch64-linux (cross-eval)
+        # macos-26-intel: x86_64-darwin (Intel, retires ~Nov 2028)
+        # macos-26: aarch64-darwin (Apple Silicon)
+        runner: [ubuntu-latest, macos-26-intel, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Linux-only: the v14 static binary fails on arm64-darwin (libc++ symbol
+      # mismatch). Gated to non-PR events to prevent cache poisoning from forks.
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        with:
+          use-flakehub: false
+
+      - name: nix flake check
+        run: nix flake check --no-build
+
+      - name: nix build
+        run: nix build . --print-build-logs
+
+      - name: nix run -- --version
+        if: github.event_name != 'pull_request'
+        run: nix run . -- --version

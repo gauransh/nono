@@ -252,9 +252,7 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     );
     root.insert("workdir".to_string(), serde_json::Value::Object(workdir));
 
-    // filesystem (minimal has allow + read; full adds all fields, including
-    // the canonical replacements for the legacy `policy` patch keys —
-    // see deprecated_schema.rs for the migration mapping).
+    // filesystem (minimal has allow + read; full adds all fields).
     let mut filesystem = serde_json::Map::new();
     filesystem.insert("allow".to_string(), serde_json::Value::Array(vec![]));
     filesystem.insert("read".to_string(), serde_json::Value::Array(vec![]));
@@ -857,13 +855,9 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
     // Order matters: `load_profile_extends` opens an internal
     // `WarningSuppressionGuard` for its preview parse, so deprecation
-    // warnings fire only on the subsequent real `load_profile` call —
-    // exactly once per legacy key per file (the design's contract,
-    // line 141). DO NOT swap or merge these two calls without
-    // preserving that suppression scope, or warnings will double-emit.
-    // See the regression test `legacy_all_keys_shows_byte_equal_canonical_equivalent`
-    // in tests/deprecated_schema.rs which asserts the exact 9-warning
-    // count on `legacy_all_keys.json`.
+    // warnings fire only on the subsequent real `load_profile` call.
+    // DO NOT swap or merge these two calls without preserving that
+    // suppression scope, or warnings will double-emit.
     let raw_extends = profile::load_profile_extends(&args.profile);
     let profile = profile::load_profile_no_migrate(&args.profile)?;
 
@@ -1130,6 +1124,25 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    // Command policies (merged tool-sandbox mediation config).
+    if let Some(cp) = &profile.command_policies
+        && (!cp.commands.is_empty() || cp.has_non_command_fields())
+    {
+        println!();
+        println!("  {}", theme::fg("Command policies:", t.subtext).bold());
+        for name in cp.commands.keys() {
+            println!("    {}", theme::fg(name, t.text));
+        }
+        println!();
+        println!(
+            "  {}",
+            theme::fg(
+                "Hint: use --json for the full command_policies structure.",
+                t.yellow
+            )
+        );
+    }
+
     // Workdir
     if profile.workdir.access != WorkdirAccess::None {
         println!();
@@ -1262,8 +1275,7 @@ fn profile_to_json(
         val["linux"] = serde_json::json!({ "af_unix_mediation": v });
     }
 
-    // Filesystem (canonical schema). Legacy keys deserialize into these fields
-    // via `deprecated_schema::LegacyPolicyPatch` before reaching `Profile`.
+    // Filesystem (canonical schema).
     val["filesystem"] = serde_json::json!({
         "allow": profile.filesystem.allow,
         "read": profile.filesystem.read,
@@ -1365,6 +1377,13 @@ fn profile_to_json(
 
     if !profile.unsafe_macos_seatbelt_rules.is_empty() {
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
+    }
+
+    // Resolved tool-sandbox mediation config (merged through extends).
+    if let Some(ref cp) = profile.command_policies
+        && let Ok(v) = serde_json::to_value(cp)
+    {
+        val["command_policies"] = v;
     }
 
     val
@@ -2585,7 +2604,7 @@ pub(crate) fn cmd_promote(args: ProfilePromoteArgs) -> Result<()> {
     }
 
     if let Some(current) = current_bytes.as_deref() {
-        verify_base_hash(&base_path, current)?;
+        verify_or_infer_base_hash(&base_path, current)?;
     }
 
     print_promote_diff(&args.name, current_bytes.as_deref(), &draft_bytes);
@@ -2663,9 +2682,32 @@ fn reserved_profile_source(name: &str) -> Result<Option<&'static str>> {
     Ok(None)
 }
 
-fn verify_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
-    let base_bytes = read_regular_file(base_path, "profile draft base hash")?;
-    let provided = std::str::from_utf8(&base_bytes)
+fn verify_or_infer_base_hash(base_path: &Path, current_bytes: &[u8]) -> Result<()> {
+    // Single open: do not exists-check then read. A concurrent swap to a
+    // symlink, or a vanish between check and use, must fail closed.
+    match read_regular_file(base_path, "profile draft base hash") {
+        Ok(base_bytes) => verify_base_hash_bytes(base_path, &base_bytes, current_bytes),
+        Err(NonoError::ProfileRead { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            // Agents often write only the draft JSON. Infer the baseline from
+            // the live profile so promote can still show a diff; staleness
+            // relative to an older draft-time snapshot cannot be proven.
+            eprintln!(
+                "{} missing {}; treating the current profile as the draft baseline. \
+                 Concurrent edits to the live profile since the draft was written cannot be detected. \
+                 To pin a baseline next time, write the live profile SHA-256 hex to that path.",
+                prefix(),
+                base_path.display()
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn verify_base_hash_bytes(base_path: &Path, base_bytes: &[u8], current_bytes: &[u8]) -> Result<()> {
+    let provided = std::str::from_utf8(base_bytes)
         .map_err(|e| NonoError::ProfileParse(format!("base hash is not UTF-8: {e}")))?
         .trim();
     if provided.len() != 64 || !provided.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -2692,10 +2734,9 @@ fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
     {
         options.custom_flags(nix::libc::O_NOFOLLOW);
     }
-    let mut file = options.open(path).map_err(|e| NonoError::ProfileRead {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let mut file = options
+        .open(path)
+        .map_err(|e| profile_file_open_error(path, label, e))?;
     let metadata = file.metadata().map_err(|e| NonoError::ProfileRead {
         path: path.to_path_buf(),
         source: e,
@@ -2713,6 +2754,20 @@ fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
             source: e,
         })?;
     Ok(bytes)
+}
+
+fn profile_file_open_error(path: &Path, label: &str, error: std::io::Error) -> NonoError {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(nix::libc::ELOOP) {
+        return NonoError::ProfileParse(format!(
+            "{label} must not be a symlink: {}",
+            path.display()
+        ));
+    }
+    NonoError::ProfileRead {
+        path: path.to_path_buf(),
+        source: error,
+    }
 }
 
 fn regular_file_exists(path: &Path, label: &str) -> Result<bool> {
@@ -3675,9 +3730,8 @@ mod tests {
         assert!(!minimal_obj.contains_key("network"));
         assert!(!minimal_obj.contains_key("hooks"));
 
-        // Full filesystem has all canonical fields, including the new
-        // `deny` and `bypass_protection` (canonical replacements for the
-        // legacy `policy` patch — see deprecated_schema.rs).
+        // Full filesystem has all canonical fields, including `deny` and
+        // `bypass_protection`.
         let full_fs = full_obj["filesystem"].as_object().expect("fs object");
         assert!(full_fs.contains_key("write"));
         assert!(full_fs.contains_key("allow_file"));
@@ -3918,6 +3972,65 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unwrap_used)]
+    fn profile_to_json_includes_merged_command_policies()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "command_policies": {
+                    "commands": {
+                        "git": {
+                            "can_use": ["node"]
+                        }
+                    }
+                }
+            }"#,
+        )?;
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "command_policies": {
+                    "commands": {
+                        "node": {},
+                        "npm": {}
+                    }
+                }
+            }"#,
+        )?;
+
+        let profile = profile::load_profile_from_path(&child_path)?;
+        let value = profile_to_json("child", &profile, &Some(vec!["base".to_string()]));
+
+        let commands = value["command_policies"]["commands"]
+            .as_object()
+            .expect("command_policies.commands object");
+        assert!(
+            commands.contains_key("git"),
+            "merged profile should inherit git"
+        );
+        assert!(
+            commands.contains_key("node"),
+            "merged profile should include node"
+        );
+        assert!(
+            commands.contains_key("npm"),
+            "merged profile should include npm"
+        );
+        assert_eq!(
+            commands["git"]["can_use"],
+            serde_json::json!(["node"]),
+            "child should inherit base git.can_use"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_diff_shows_differences() {
         let p1 = profile::load_profile("default").expect("default should load");
         let p2 = profile::load_profile("linux-host-compat").expect("linux-host-compat should load");
@@ -4049,6 +4162,49 @@ mod tests {
     }
 
     #[test]
+    fn promote_existing_profile_infers_missing_base_hash() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let profiles_dir = profile::user_profile_dir().expect("profile dir");
+        let draft_dir = profile::user_profile_draft_dir().expect("draft dir");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles");
+        std::fs::create_dir_all(&draft_dir).expect("create drafts");
+
+        let target = profile::get_user_profile_path("agent-local").expect("target path");
+        let old = b"{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/tmp\"] }\n}\n";
+        std::fs::write(&target, old).expect("write target");
+        let draft = profile::get_user_profile_draft_path("agent-local").expect("draft path");
+        std::fs::write(
+            &draft,
+            "{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/var/tmp\"] }\n}\n",
+        )
+        .expect("write draft");
+
+        // No .base file: promote should still succeed using the live profile as baseline.
+        let result = cmd_promote(ProfilePromoteArgs {
+            name: "agent-local".to_string(),
+            diff: false,
+            yes: true,
+            help: None,
+        });
+        assert!(
+            result.is_ok(),
+            "promote without .base should succeed: {result:?}"
+        );
+        let promoted = std::fs::read_to_string(&target).expect("read promoted");
+        assert!(promoted.contains("/var/tmp"));
+        assert!(!draft.exists(), "draft should be removed after promote");
+    }
+
+    #[test]
     fn promote_existing_profile_requires_matching_base_hash() {
         let _guard = match crate::test_env::ENV_LOCK.lock() {
             Ok(guard) => guard,
@@ -4075,19 +4231,23 @@ mod tests {
         )
         .expect("write draft");
 
-        let missing_base = cmd_promote(ProfilePromoteArgs {
+        let base = profile::get_user_profile_draft_base_path("agent-local").expect("base path");
+        std::fs::write(&base, "0".repeat(64)).expect("write mismatched base");
+        let mismatched = cmd_promote(ProfilePromoteArgs {
             name: "agent-local".to_string(),
             diff: false,
             yes: true,
             help: None,
         });
-        assert!(
-            missing_base.is_err(),
-            "existing profile promote must require .base"
-        );
+        assert!(mismatched.is_err(), "mismatched .base must still fail");
 
-        let base = profile::get_user_profile_draft_base_path("agent-local").expect("base path");
-        std::fs::write(&base, sha256_hex(old)).expect("write base");
+        std::fs::write(&base, sha256_hex(old)).expect("write matching base");
+        // Re-write draft (previous promote attempt did not consume it on error).
+        std::fs::write(
+            &draft,
+            "{\n  \"meta\": { \"name\": \"agent-local\" },\n  \"filesystem\": { \"read\": [\"/var/tmp\"] }\n}\n",
+        )
+        .expect("rewrite draft");
         let result = cmd_promote(ProfilePromoteArgs {
             name: "agent-local".to_string(),
             diff: false,
@@ -4097,6 +4257,40 @@ mod tests {
         assert!(result.is_ok(), "promote should succeed: {result:?}");
         let promoted = std::fs::read_to_string(&target).expect("read promoted");
         assert!(promoted.contains("/var/tmp"));
+    }
+
+    #[test]
+    fn verify_or_infer_base_hash_infers_when_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("agent-local.base");
+        let result = verify_or_infer_base_hash(&missing, b"current-profile");
+        assert!(
+            result.is_ok(),
+            "missing base file should infer the live profile: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_or_infer_base_hash_rejects_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let referent = dir.path().join("real.base");
+        std::fs::write(&referent, "0".repeat(64)).expect("write referent");
+        let link = dir.path().join("agent-local.base");
+        std::os::unix::fs::symlink(&referent, &link).expect("symlink");
+        let err = verify_or_infer_base_hash(&link, b"current-profile")
+            .expect_err("symlink base must fail closed");
+        let msg = err.to_string();
+        assert!(msg.contains("symlink"), "expected symlink error, got {msg}");
+    }
+
+    #[test]
+    fn verify_or_infer_base_hash_accepts_matching_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let current = b"live-profile-bytes";
+        let base = dir.path().join("agent-local.base");
+        std::fs::write(&base, sha256_hex(current)).expect("write hash");
+        verify_or_infer_base_hash(&base, current).expect("matching regular file should pass");
     }
 
     #[test]

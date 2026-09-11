@@ -9,6 +9,7 @@ use crate::command_policy::{
 };
 use crate::lineage_cgroup::LineageMarker;
 use crate::profile;
+use crate::tool_sandbox::command_policy_decision::CommandPolicyDecision;
 use crate::tool_sandbox::credentials::{ResolvedCredential, resolve_credentials};
 use crate::tool_sandbox::env::{
     apply_environment_set_vars, apply_export_env, default_env_allow_patterns,
@@ -462,6 +463,11 @@ impl PreparedToolSandboxRuntime {
             .collect())
     }
 
+    /// Invariant: must never add a filesystem Write grant. `caps` is cloned
+    /// into `ToolSandboxState.outer_caps` (and into the proxy's credential
+    /// capture backend) *before* this runs, and those clones are what
+    /// `nono::sanitize_broker_path_for_binary` checks for the lifetime of the session —
+    /// a Write grant added here would silently bypass that check.
     pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
         caps.add_fs(FsCapability::new_dir(
             &self.inner.shim_dir,
@@ -480,6 +486,17 @@ impl PreparedToolSandboxRuntime {
         )?);
         caps.deduplicate();
         Ok(())
+    }
+
+    pub(crate) fn prepare_outer_exec_gate(&self) -> Result<OwnedFd> {
+        let ruleset = prepare_outer_exec_gate(
+            &self.inner.allowed_outer_exec_files,
+            &self.inner.plan.outer_exec_writable_dirs,
+            self.inner.landlock_abi,
+        )?;
+        Option::<OwnedFd>::from(ruleset).ok_or_else(|| {
+            NonoError::SandboxInit("tool-sandbox execution gate was not created".to_string())
+        })
     }
 
     pub(crate) fn apply_outer_exec_gate(&self) -> Result<()> {
@@ -1150,7 +1167,7 @@ fn handle_url_open_stream(
 
     let (success, error) = match validate_url_open(state, peer_pid, session_root_pid, &request.url)
     {
-        Ok(()) => match crate::url_open::open_url_in_browser(&request.url) {
+        Ok(()) => match crate::url_open::open_url_in_browser(&request.url, &state.outer_caps) {
             Ok(()) => (true, None),
             Err(reason) => (false, Some(reason)),
         },
@@ -1281,7 +1298,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 None,
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some(err.to_string()),
                 None,
             )?;
@@ -1298,7 +1315,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "denied",
+            CommandPolicyDecision::Denied,
             Some("legacy_blocked_command".to_string()),
             None,
         )?;
@@ -1332,7 +1349,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some(err.to_string()),
                 None,
             )?;
@@ -1348,7 +1365,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "denied",
+            CommandPolicyDecision::Denied,
             Some(err.to_string()),
             None,
         )?;
@@ -1369,7 +1386,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "invocation_denied",
+                    CommandPolicyDecision::InvocationDenied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1388,7 +1405,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "invocation_denied",
+                        CommandPolicyDecision::InvocationDenied,
                         Some(err.to_string()),
                         None,
                     )?;
@@ -1405,7 +1422,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "invocation_allowed",
+                    CommandPolicyDecision::InvocationAllowed,
                     None,
                     None,
                 )?;
@@ -1419,7 +1436,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "invocation_denied",
+                    CommandPolicyDecision::InvocationDenied,
                     Some(reason.clone()),
                     None,
                 )?;
@@ -1449,7 +1466,7 @@ fn handle_shim_stream_inner(
                             auth.peer_pid,
                             session_root_pid,
                             Some(&caller),
-                            "invocation_approve_denied",
+                            CommandPolicyDecision::InvocationApproveDenied,
                             Some(err.to_string()),
                             None,
                         )?;
@@ -1473,7 +1490,7 @@ fn handle_shim_stream_inner(
                             auth.peer_pid,
                             session_root_pid,
                             Some(&caller),
-                            "invocation_approve_denied",
+                            CommandPolicyDecision::InvocationApproveDenied,
                             Some(err.to_string()),
                             None,
                         )?;
@@ -1510,10 +1527,10 @@ fn handle_shim_stream_inner(
                     move || backend.request_approval(&approval_request),
                 )?;
                 let (audit_decision, deny_reason) = if decision.is_granted() {
-                    ("invocation_approve_granted", None)
+                    (CommandPolicyDecision::InvocationApproveGranted, None)
                 } else {
                     (
-                        "invocation_approve_denied",
+                        CommandPolicyDecision::InvocationApproveDenied,
                         Some(super::approval_deny_reason(&decision)),
                     )
                 };
@@ -1557,7 +1574,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "denied",
+                        CommandPolicyDecision::Denied,
                         Some(err.to_string()),
                         None,
                     )?;
@@ -1591,7 +1608,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "respond",
+            CommandPolicyDecision::Respond,
             None,
             Some(0),
         )?;
@@ -1637,10 +1654,10 @@ fn handle_shim_stream_inner(
             run_with_timeout(timeout, move || backend.request_approval(&approval_request))?;
 
         let (audit_decision, deny_reason) = if decision.is_granted() {
-            ("approve_granted", None)
+            (CommandPolicyDecision::ApproveGranted, None)
         } else {
             (
-                "approve_denied",
+                CommandPolicyDecision::ApproveDenied,
                 Some(super::approval_deny_reason(&decision)),
             )
         };
@@ -1686,7 +1703,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "capture_credential_cached",
+                CommandPolicyDecision::CaptureCredentialCached,
                 None,
                 Some(0),
             )?;
@@ -1704,7 +1721,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some("resource_limit".to_string()),
                 None,
             )?;
@@ -1728,7 +1745,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "denied",
+                        CommandPolicyDecision::Denied,
                         Some("credential_capture_failed".to_string()),
                         Some(exit_code),
                     )?;
@@ -1737,13 +1754,23 @@ fn handle_shim_stream_inner(
                     )));
                 }
                 let captured = normalize_captured_credential(raw_output);
+                let template = state
+                    .credential_handles
+                    .get(credential)
+                    .and_then(ResolvedCredential::phantom_template);
                 let nonce = {
                     let mut broker = state.token_broker.lock().map_err(|_| {
                         NonoError::SandboxInit(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured, grants.clone())
+                    broker.store_named(
+                        credential.clone(),
+                        captured,
+                        grants.clone(),
+                        template,
+                        crate::tool_sandbox::token_broker::NamedValuePolicy::SingleActiveValue,
+                    )
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -1753,7 +1780,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "capture_credential",
+                    CommandPolicyDecision::CaptureCredential,
                     None,
                     Some(0),
                 )?;
@@ -1768,7 +1795,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1792,7 +1819,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some("resource_limit".to_string()),
                 None,
             )?;
@@ -1828,7 +1855,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "capture",
+                    CommandPolicyDecision::Capture,
                     None,
                     Some(*exit_code),
                 )?;
@@ -1843,7 +1870,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1864,7 +1891,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some("resource_limit".to_string()),
                 None,
             )?;
@@ -1898,7 +1925,7 @@ fn handle_shim_stream_inner(
                         auth.peer_pid,
                         session_root_pid,
                         Some(&caller),
-                        "denied",
+                        CommandPolicyDecision::Denied,
                         Some(reason.clone()),
                         None,
                         launch_result.stdio,
@@ -1916,7 +1943,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "exec",
+                    CommandPolicyDecision::Exec,
                     None,
                     Some(launch_result.exit_code),
                     launch_result.stdio,
@@ -1932,7 +1959,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(err.to_string()),
                     None,
                 )?;
@@ -1952,7 +1979,7 @@ fn handle_shim_stream_inner(
             auth.peer_pid,
             session_root_pid,
             Some(&caller),
-            "denied",
+            CommandPolicyDecision::Denied,
             Some("resource_limit".to_string()),
             None,
         )?;
@@ -1977,7 +2004,7 @@ fn handle_shim_stream_inner(
                     auth.peer_pid,
                     session_root_pid,
                     Some(&caller),
-                    "denied",
+                    CommandPolicyDecision::Denied,
                     Some(reason.clone()),
                     None,
                     launch_result.stdio,
@@ -1995,7 +2022,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "allowed",
+                CommandPolicyDecision::Allowed,
                 None,
                 Some(launch_result.exit_code),
                 launch_result.stdio,
@@ -2011,7 +2038,7 @@ fn handle_shim_stream_inner(
                 auth.peer_pid,
                 session_root_pid,
                 Some(&caller),
-                "denied",
+                CommandPolicyDecision::Denied,
                 Some(err.to_string()),
                 None,
             )?;
@@ -2349,7 +2376,7 @@ fn record_command_policy_audit(
     shim_pid: u32,
     session_root_pid: u32,
     caller: Option<&Caller>,
-    decision: &str,
+    decision: CommandPolicyDecision,
     reason: Option<String>,
     exit_code: Option<i32>,
 ) -> Result<()> {
@@ -2377,7 +2404,7 @@ fn record_command_policy_audit_with_stdio(
     shim_pid: u32,
     session_root_pid: u32,
     caller: Option<&Caller>,
-    decision: &str,
+    decision: CommandPolicyDecision,
     reason: Option<String>,
     exit_code: Option<i32>,
     stdio: Option<CommandPolicyStdioAudit>,
@@ -2397,7 +2424,7 @@ fn record_command_policy_audit_with_stdio(
         caller_pid: caller_pid(caller),
         shim_pid: Some(shim_pid),
         session_root_pid: Some(session_root_pid),
-        decision: decision.to_string(),
+        decision: decision.as_str().to_string(),
         reason,
         stdio_mode: selected_stdio_mode(request).to_string(),
         argv_hash: hash_byte_fields(&request.argv),
@@ -2413,7 +2440,7 @@ fn record_command_policy_audit_with_stdio(
     let mut recorder = recorder
         .lock()
         .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
-    recorder.record_command_policy_event(event)
+    recorder.record_command_policy_event(event, decision.outcome())
 }
 
 fn hash_byte_fields(fields: &[Vec<u8>]) -> String {
@@ -3090,11 +3117,28 @@ fn add_outer_exec_file_with_deps(
     Ok(())
 }
 
+/// Stack a Landlock layer that restricts execute to `paths` and `writable_dirs`.
+///
+/// Also grants bare `Refer` on `/`. Landlock requires Refer in every stacked
+/// layer for rename/link, so omitting it here silently breaks same-FS
+/// renames the outer sandbox already permits (`command_policies` / #1689).
+/// Bare `Refer` alone cannot widen access. Mirrors `restrict_execute`.
 fn apply_outer_exec_gate(
     paths: &[PathBuf],
     writable_dirs: &[PathBuf],
     abi: nono::DetectedAbi,
 ) -> Result<()> {
+    let status = prepare_outer_exec_gate(paths, writable_dirs, abi)?
+        .restrict_self()
+        .map_err(|err| NonoError::SandboxInit(format!("tool-sandbox restrict_self: {err}")))?;
+    ensure_outer_exec_gate_fully_enforced(status.ruleset)
+}
+
+fn prepare_outer_exec_gate(
+    paths: &[PathBuf],
+    writable_dirs: &[PathBuf],
+    abi: nono::DetectedAbi,
+) -> Result<landlock::RulesetCreated> {
     if !abi.has_execute() {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox outer exec gate requires Landlock ABI V3+; detected {}",
@@ -3111,6 +3155,12 @@ fn apply_outer_exec_gate(
             ))
         })?
         .set_compatibility(CompatLevel::BestEffort)
+        .handle_access(AccessFs::Refer)
+        .map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot handle Refer: {err}"
+            ))
+        })?
         .create()
         .map_err(|err| {
             NonoError::SandboxInit(format!(
@@ -3153,12 +3203,22 @@ fn apply_outer_exec_gate(
             })?;
     }
 
-    let status = ruleset.restrict_self().map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "tool-sandbox outer exec gate restrict_self failed: {err}"
-        ))
-    })?;
-    ensure_outer_exec_gate_fully_enforced(status.ruleset)
+    if abi.has_refer() {
+        let root_fd = PathFd::new("/").map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "tool-sandbox outer exec gate cannot open / for Refer grant: {err}"
+            ))
+        })?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(root_fd, AccessFs::Refer))
+            .map_err(|err| {
+                NonoError::SandboxInit(format!(
+                    "tool-sandbox outer exec gate add_rule for / (Refer): {err}"
+                ))
+            })?;
+    }
+
+    Ok(ruleset)
 }
 
 fn ensure_outer_exec_gate_fully_enforced(status: landlock::RulesetStatus) -> Result<()> {
@@ -3419,7 +3479,12 @@ fn build_child_launch_spec_for_binary(
     }
     // Let multi-call tools (e.g. git) exec the helpers they invoke by
     // absolute path.
-    for path in resolve_exec_paths(&policy.exec_paths, &state.policy_root, &cwd)? {
+    for path in resolve_exec_paths(
+        &policy.exec_paths,
+        &state.policy_root,
+        &cwd,
+        &state.outer_caps,
+    )? {
         allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
     }
 
@@ -3495,6 +3560,14 @@ fn build_child_caps(
     add_interpreted_script_read(&mut caps, state, binary, request)?;
     add_chaining_control_caps(&mut caps, state)?;
     add_policy_fs(
+        &mut caps,
+        policy,
+        &state.policy_root,
+        cwd,
+        &state.outer_caps,
+        &state.deny_paths,
+    )?;
+    add_policy_unix_sockets(
         &mut caps,
         policy,
         &state.policy_root,
@@ -3740,20 +3813,20 @@ fn add_policy_fs(
     // `@git:*` tokens run git in the command's live cwd so they resolve to the
     // repo the command is actually operating in (e.g. its worktree / .git
     // common-dir), not the repo the agent was launched in.
-    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_dir(caps, path, AccessMode::Read)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         let access = write_access(&path);
         add_optional_dir(caps, path, access)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd))? {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file, Some(cwd), outer_caps)? {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if matches!(write_access(&path), AccessMode::Read) {
             add_optional_read_file(caps, path)?;
@@ -3762,6 +3835,74 @@ fn add_policy_fs(
         }
     }
     Ok(())
+}
+
+fn add_policy_unix_sockets(
+    caps: &mut CapabilitySet,
+    policy: &CommandSandboxConfig,
+    policy_root: &Path,
+    cwd: &Path,
+    outer_caps: &CapabilitySet,
+    deny_paths: &[PathBuf],
+) -> Result<()> {
+    use super::dynamic_providers::expand_dynamic_tokens;
+    // Must canonicalize cwd to match dynamic-token providers, or a symlinked
+    // cwd escapes the write non-escalation downgrade.
+    let canonical_cwd = cwd
+        .canonicalize()
+        .unwrap_or_else(|_| super::lexically_normalize(cwd));
+    let write_access = |path: &Path| {
+        let normalized = super::lexically_normalize(path);
+        // `normalized` is only lexically cleaned, not canonicalized, so it
+        // must be compared against both the raw and canonical cwd or a
+        // symlinked cwd bypasses the downgrade below.
+        if (normalized.starts_with(cwd) || normalized.starts_with(&canonical_cwd))
+            && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
+        {
+            AccessMode::Read
+        } else {
+            AccessMode::ReadWrite
+        }
+    };
+    for entry in &expand_dynamic_tokens(&policy.unix_socket_bind, Some(cwd), outer_caps)? {
+        let path = resolve_policy_path(entry, policy_root, cwd)?;
+        let access = write_access(&path);
+        add_optional_unix_socket_bind(caps, path, access)?;
+    }
+    Ok(())
+}
+
+fn add_optional_unix_socket_bind(
+    caps: &mut CapabilitySet,
+    path: PathBuf,
+    access: AccessMode,
+) -> Result<()> {
+    // Dangling-symlink guard: bind(2) would punch through to the link
+    // target, so reject rather than silently skip.
+    if path.symlink_metadata().is_ok() && !path.exists() {
+        return Err(NonoError::SandboxInit(format!(
+            "unix_socket_bind rejects dangling symlink (bind would punch \
+             through to the link target): '{}'",
+            path.display()
+        )));
+    }
+    match UnixSocketCapability::new_file(&path, UnixSocketMode::ConnectBind) {
+        Ok(capability) => {
+            caps.add_unix_socket(capability);
+            // bind(2) creates the socket if absent, so grant the parent dir
+            // when it doesn't exist yet, or the exact file when it does.
+            if path.exists() {
+                caps.add_fs(FsCapability::new_file(&path, access)?);
+            } else if let Some(parent) = path.parent()
+                && !crate::query_ext::is_sensitive_root(parent)
+            {
+                add_optional_dir(caps, parent.to_path_buf(), access)?;
+            }
+            Ok(())
+        }
+        Err(NonoError::PathNotFound(_)) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn add_optional_dir(caps: &mut CapabilitySet, path: PathBuf, access: AccessMode) -> Result<()> {
@@ -3801,9 +3942,12 @@ fn resolve_exec_paths(
     exec_paths: &[String],
     policy_root: &Path,
     cwd: &Path,
+    outer_caps: &CapabilitySet,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved = Vec::new();
-    for entry in &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd))? {
+    for entry in
+        &super::dynamic_providers::expand_dynamic_tokens(exec_paths, Some(cwd), outer_caps)?
+    {
         let path = resolve_policy_path(entry, policy_root, cwd)?;
         if path.exists() {
             resolved.push(path);
@@ -4468,23 +4612,20 @@ fn join_relay_thread(
     })?
 }
 
+/// Re-derives a nonce by re-reading `credential`'s statically configured
+/// source; `None` means it has none, so the caller re-runs the capture.
 fn issue_existing_ambient_credential_nonce(
     state: &ToolSandboxState,
     credential: &str,
     grants: crate::tool_sandbox::token_broker::GrantSet,
 ) -> Result<Option<String>> {
-    {
-        let mut broker = state.token_broker.lock().map_err(|_| {
-            NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
-        })?;
-        if let Some(nonce) = broker.issue_named(credential) {
-            return Ok(Some(nonce));
-        }
-    }
-
     let Some(value) = load_ambient_credential_source(state, credential)? else {
         return Ok(None);
     };
+    let template = state
+        .credential_handles
+        .get(credential)
+        .and_then(ResolvedCredential::phantom_template);
     let mut broker = state.token_broker.lock().map_err(|_| {
         NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
     })?;
@@ -4492,6 +4633,8 @@ fn issue_existing_ambient_credential_nonce(
         credential.to_string(),
         value,
         grants,
+        template,
+        crate::tool_sandbox::token_broker::NamedValuePolicy::SingleActiveValue,
     )))
 }
 
@@ -4502,8 +4645,12 @@ fn load_ambient_credential_source(
     match state.credential_handles.get(credential) {
         Some(ResolvedCredential::Ambient {
             source: Some(source),
-        }) => Ok(Some(super::load_supervisor_credential_source(source)?)),
-        Some(ResolvedCredential::Ambient { source: None }) => Ok(None),
+            ..
+        }) => Ok(Some(super::load_supervisor_credential_source(
+            source,
+            &state.outer_caps,
+        )?)),
+        Some(ResolvedCredential::Ambient { source: None, .. }) => Ok(None),
         Some(_) => Err(NonoError::SandboxInit(format!(
             "tool-sandbox credential '{credential}' is not ambient"
         ))),
@@ -5662,6 +5809,7 @@ mod tests {
             ],
             tmp.path(),
             tmp.path(),
+            &CapabilitySet::default(),
         )?;
 
         assert!(
@@ -5882,7 +6030,9 @@ mod tests {
     #[test]
     fn resolve_exec_paths_empty_yields_empty() -> Result<()> {
         let tmp = test_tempdir()?;
-        assert!(resolve_exec_paths(&[], tmp.path(), tmp.path())?.is_empty());
+        assert!(
+            resolve_exec_paths(&[], tmp.path(), tmp.path(), &CapabilitySet::default())?.is_empty()
+        );
         Ok(())
     }
 
@@ -6030,6 +6180,74 @@ mod tests {
         let result =
             ensure_outer_exec_gate_fully_enforced(landlock::RulesetStatus::PartiallyEnforced);
         assert!(matches!(result, Err(err) if err.to_string().contains("partially enforced")));
+    }
+
+    #[test]
+    fn outer_exec_gate_does_not_break_same_fs_rename_from_child_dir() {
+        // Regression for #1689: stacked outer exec gate must keep Refer so
+        // pending/result.json -> result.json succeeds on the same filesystem.
+        let detected = match nono::detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+        if !detected.has_execute() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "nono-outer-exec-rename-test-{}",
+            std::process::id()
+        ));
+        let pending = root.join("pending");
+        if let Err(err) = std::fs::create_dir_all(&pending) {
+            panic!("create pending dir: {err}");
+        }
+        let src = pending.join("result.json");
+        if let Err(err) = std::fs::write(&src, b"{}") {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("create pending/result.json: {err}");
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            let cap = match FsCapability::new_dir(&root, AccessMode::ReadWrite) {
+                Ok(cap) => cap,
+                Err(_) => unsafe { libc::_exit(2) },
+            };
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(cap);
+
+            if Sandbox::apply_landlock(&caps).is_err() {
+                unsafe { libc::_exit(2) };
+            }
+            if apply_outer_exec_gate(&["/usr/bin".into()], &[], detected).is_err() {
+                unsafe { libc::_exit(3) };
+            }
+
+            let dst = root.join("result.json");
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => unsafe { libc::_exit(0) },
+                Err(_) => unsafe { libc::_exit(1) },
+            }
+        }
+
+        let mut status: i32 = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(waited, pid, "waitpid() failed");
+        assert!(
+            libc::WIFEXITED(status),
+            "child did not exit normally: status={status}"
+        );
+        let code = libc::WEXITSTATUS(status);
+        assert_eq!(
+            code, 0,
+            "same-FS rename pending/result.json -> result.json failed under stacked outer exec gate \
+             (exit code {code}; 1=rename EXDEV/denied, 2=apply_landlock failed, \
+             3=apply_outer_exec_gate failed)"
+        );
     }
 
     #[test]
@@ -6516,6 +6734,321 @@ mod tests {
         assert_eq!(restored_cap.original, link);
         assert_eq!(restored_cap.resolved, resolved);
 
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_rejects_dangling_symlink() -> Result<()> {
+        let temp = test_tempdir()?;
+        let link = temp.path().join("dangling.sock");
+        let missing_target = temp.path().join("does-not-exist");
+        symlink_path(&missing_target, &link)?;
+
+        let mut caps = CapabilitySet::new();
+        let err = add_optional_unix_socket_bind(&mut caps, link, AccessMode::ReadWrite)
+            .expect_err("dangling symlink must be rejected");
+        assert!(
+            format!("{err}").contains("dangling symlink"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_accepts_nonexistent_path_and_widens_fs_to_parent() -> Result<()>
+    {
+        let temp = test_tempdir()?;
+        let pending = temp.path().join("future.sock");
+        assert!(!pending.exists(), "test precondition: path must not exist");
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, pending.clone(), AccessMode::ReadWrite)?;
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+
+        let canonical_parent =
+            temp.path()
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: temp.path().to_path_buf(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_parent)
+            .expect("implied parent-dir fs grant missing");
+        assert_eq!(parent_grant.access, AccessMode::ReadWrite);
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_existing_grants_readwrite_fs() -> Result<()> {
+        let temp = test_tempdir()?;
+        let sock = temp.path().join("existing.sock");
+        std::os::unix::net::UnixListener::bind(&sock).expect("create socket");
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, sock.clone(), AccessMode::ReadWrite)?;
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+
+        let canonical_sock =
+            sock.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: sock.clone(),
+                    source,
+                })?;
+        let fs_match = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| c.is_file && c.resolved == canonical_sock)
+            .expect("implied fs grant not found");
+        assert_eq!(fs_match.access, AccessMode::ReadWrite);
+        Ok(())
+    }
+
+    #[test]
+    fn add_policy_unix_sockets_expands_git_fsmonitor_socket_token() -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(&repo)
+                .status()
+                .expect("run git init")
+                .success()
+        );
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["@git:fsmonitor-socket".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        add_policy_unix_sockets(&mut caps, &policy, &repo, &repo, &outer_caps, &[])?;
+
+        let socks = caps.unix_socket_capabilities();
+        assert_eq!(socks.len(), 1);
+        assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
+        assert!(
+            socks[0].resolved.ends_with("fsmonitor--daemon.ipc"),
+            "expected fsmonitor socket path, got {:?}",
+            socks[0].resolved
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_policy_unix_sockets_grants_none_when_undeclared() -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+
+        let policy = CommandSandboxConfig::default();
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        add_policy_unix_sockets(&mut caps, &policy, &repo, &repo, &outer_caps, &[])?;
+
+        assert!(
+            caps.unix_socket_capabilities().is_empty(),
+            "a command with no unix_socket_bind entries must get no socket capability"
+        );
+        Ok(())
+    }
+
+    /// A symlinked `cwd` must not escape the write non-escalation check.
+    /// Mirrors the macOS parity test.
+    #[test]
+    fn add_policy_unix_sockets_downgrades_to_read_when_cwd_resolves_through_symlink() -> Result<()>
+    {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(&repo)
+                .status()
+                .expect("run git init")
+                .success()
+        );
+
+        // policy_root (the agent's own --workdir) is a sibling of the repo,
+        // so the agent itself has no write authority under the repo.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["@git:fsmonitor-socket".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        // `repo` is passed raw (un-canonicalized), exactly as a real
+        // command's `cwd` would be.
+        add_policy_unix_sockets(&mut caps, &policy, &policy_root, &repo, &outer_caps, &[])?;
+
+        let canonical_git_dir =
+            repo.join(".git")
+                .canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.join(".git"),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_git_dir)
+            .expect("implied parent-dir fs grant for the socket missing");
+        assert_eq!(
+            parent_grant.access,
+            AccessMode::Read,
+            "socket under a cwd the agent cannot write must be downgraded to \
+             Read even when cwd resolves through a symlink"
+        );
+        Ok(())
+    }
+
+    /// A literal (non-`@git:`) relative `unix_socket_bind` entry is resolved
+    /// against the raw `cwd`, so `normalized` is never canonicalized even
+    /// when `cwd` resolves through a symlink. The downgrade check must still
+    /// catch it by also comparing against the raw `cwd`.
+    #[test]
+    fn add_policy_unix_sockets_downgrades_to_read_for_literal_relative_socket_under_symlinked_cwd()
+    -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+
+        // policy_root (the agent's own --workdir) is a sibling of the repo,
+        // so the agent itself has no write authority under the repo.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["my.sock".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        // `repo` is passed raw (un-canonicalized), exactly as a real
+        // command's `cwd` would be.
+        add_policy_unix_sockets(&mut caps, &policy, &policy_root, &repo, &outer_caps, &[])?;
+
+        let canonical_repo =
+            repo.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.clone(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_repo)
+            .expect("implied parent-dir fs grant for the socket missing");
+        assert_eq!(
+            parent_grant.access,
+            AccessMode::Read,
+            "a literal relative socket path under a cwd the agent cannot \
+             write must be downgraded to Read even when cwd resolves \
+             through a symlink"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_sensitive_root_parent_skips_fs_widening() -> Result<()> {
+        let _guard = crate::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let temp = test_tempdir()?;
+        let home = temp.path().join("home");
+        create_dir(&home)?;
+        // is_sensitive_root compares against a canonicalized $HOME, so match it.
+        let home = home
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: home.clone(),
+                source,
+            })?;
+        let home_str = home.to_string_lossy().into_owned();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", home_str.as_str())]);
+
+        let pending = home.join("fsmonitor--daemon.ipc");
+        assert!(!pending.exists(), "test precondition: path must not exist");
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, pending, AccessMode::ReadWrite)?;
+
+        assert_eq!(
+            caps.unix_socket_capabilities().len(),
+            1,
+            "socket capability itself must still be granted"
+        );
+        assert!(
+            caps.fs_capabilities().is_empty(),
+            "must not widen a filesystem grant onto a sensitive root like $HOME"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_optional_unix_socket_bind_downgrades_to_read_outside_agent_write_authority() -> Result<()>
+    {
+        let temp = test_tempdir()?;
+        // policy_root is a sibling of cwd, so the agent has no write
+        // authority under cwd — mirrors a cwd outside the writable root.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+        let pending = repo.join("future.sock");
+
+        // Mirrors add_policy_fs's write non-escalation check: a path under
+        // cwd that the agent itself cannot write is downgraded to Read.
+        let outer_caps = CapabilitySet::new();
+        let write_access = |path: &Path| {
+            let normalized = crate::tool_sandbox::lexically_normalize(path);
+            if normalized.starts_with(&repo)
+                && !crate::tool_sandbox::agent_can_write(
+                    &normalized,
+                    &policy_root,
+                    &outer_caps,
+                    &[],
+                )
+            {
+                AccessMode::Read
+            } else {
+                AccessMode::ReadWrite
+            }
+        };
+        let access = write_access(&pending);
+        assert_eq!(access, AccessMode::Read);
+
+        let mut caps = CapabilitySet::new();
+        add_optional_unix_socket_bind(&mut caps, pending, access)?;
+
+        let canonical_parent =
+            repo.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.clone(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_parent)
+            .expect("implied parent-dir fs grant missing");
+        assert_eq!(parent_grant.access, AccessMode::Read);
         Ok(())
     }
 

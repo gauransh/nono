@@ -23,7 +23,9 @@ A Tool Sandbox profile answers three questions:
 
 Each child command starts from a minimal runtime baseline. It does not inherit outer `--allow`, CWD access, broad profile groups, raw credential paths, or outer network access.
 
-When Tool Sandbox is active, the outer process can execute the initial program and the Tool Sandbox shims. Further tool launches should be modeled as command-policy hops. This keeps direct executable-path bypasses blocked without building a host-wide allow-list of every executable on `PATH`.
+When Tool Sandbox is active, the outer session's execute grant is built from every trusted directory on `PATH`: nono scans each non-writable `PATH` directory and allow-lists every executable file found there, plus its shared-library dependency closure — not just the initial program and the Tool Sandbox shims. A binary that lives outside `PATH` (for example a JVM's `jspawnhelper` under `/usr/lib/jvm/.../lib/`) is not covered by this scan and is denied unless it's reachable through `PATH`, added to `command_policies.executable_dirs`, or modeled as a command-policy hop with its own `sandbox.exec_paths` entry.
+
+Tool Sandbox's real security boundary is at policy-controlled *commands*, not at execute-vs-no-execute for the outer session: once a command becomes a Tool Sandbox entry, everything it invokes is governed by `can_use`/`from` edges regardless of `PATH` membership.
 
 ## Available Fields
 
@@ -94,6 +96,7 @@ The selected `sandbox` object describes what the child receives:
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
 | `unsafe_macos_seatbelt_rules` | string array | macOS-only escape hatch: raw Seatbelt rules appended to this command's child profile after the deny gate (last-match-wins). Mirrors the top-level `unsafe_macos_seatbelt_rules` but scoped to one command/intercept. Use sparingly — e.g. to let a command exec + read a binary it forks by absolute path. Honoured only for **user-authored profiles** (same trust boundary as `binary` — see below); pack and built-in profiles have these rules stripped with a warning. |
+| `unix_socket_bind` | path array | Grant `connect(2)` and `bind(2)` on the named pathname AF_UNIX socket files (supports the dynamic tokens below). Implied filesystem grant is ReadWrite on the file if it already exists, otherwise ReadWrite on its parent directory (so `bind(2)` can create it) — mirrors the agent-level `unix_socket_bind` field, see [AF_UNIX Socket Grants](/cli/features/profiles-groups#af-unix-socket-grants). A path that resolves to an existing dangling symlink is rejected. |
 
 ### Per-Intercept Sandbox Override
 
@@ -168,6 +171,7 @@ Supported tokens:
 | `@git:worktree` | `fs_read`, `fs_write` | The main worktree root (parent of `@git:common-dir`). Empty in a regular repo; in a linked worktree it is the absolute path to the main repo root. `git worktree add` changes CWD to the main repo root, so without this `getcwd()` fails with EPERM. |
 | `@git:toplevel` | `fs_read`, `fs_write` | Absolute path of the current checkout root (`git rev-parse --show-toplevel`). In a linked worktree this is the worktree's own root, not the main repo. |
 | `@git:toplevel-parent` | `fs_write` | Parent directory of `@git:toplevel`. Required for `git worktree add ../sibling`, where the new worktree is created adjacent to the current checkout. |
+| `@git:fsmonitor-socket` | `unix_socket_bind` | Path to `fsmonitor--daemon.ipc` under the current worktree's private git-dir (not the shared common dir — each worktree runs its own fsmonitor daemon). Pair with `unix_socket_bind` to let `core.fsmonitor=true` reach the daemon's socket. |
 
 Example:
 
@@ -190,6 +194,8 @@ Example:
 The Git provider reads `git config --list --show-origin --show-scope` and keeps only `global` and `system` scoped paths. It ignores `local` and `worktree` scopes so a repository cannot grant itself additional host filesystem access through `.git/config`. If `git` is unavailable or returns no matching paths, the token expands to no paths.
 
 The `@git:common-dir` token runs `git rev-parse --git-common-dir` from nono's working directory at sandbox-prepare time. In a regular repo it returns `.git` (relative, resolved against `$WORKDIR`). In a worktree it returns the absolute path to the main repo's `.git`. If git is unavailable or the process is not inside a repo, the token expands to no paths. The `@git:worktree`, `@git:toplevel`, and `@git:toplevel-parent` tokens are derived from the same git invocations and behave the same way when git is unavailable.
+
+`@git:fsmonitor-socket` is resolved without spawning `git`: it walks the filesystem from the current working directory to find the checkout (reading `.git`, then following a `gitdir:`/`commondir` pointer file when present) and appends `fsmonitor--daemon.ipc` to the private per-worktree git-dir. This mirrors the no-process-spawn approach the other path-resolution tokens use internally, so a working directory with an attacker-controlled `.git/config` cannot influence resolution through `core.pager` or similar. If the process is not inside a git repo, the token expands to no paths.
 
 `@git:config-files` expands to the config files git reads in the current context, plus the declared target of every `include.path` and `includeIf.*.path` directive in trusted `global` and `system` scopes — including conditional includes whose condition does not currently fire (e.g. a `hasconfig:remote.*.url` rule that only matches certain repositories). A conditional include that is false now is still grantable because a later git operation — such as `git worktree add` for a repo with a matching remote — may make the condition fire. Like the other git tokens it keeps only `global` and `system` scopes; per-repo `.git/config` entries are not trusted.
 
@@ -280,6 +286,10 @@ Tool Sandbox authorizes a request by walking the caller's process ancestry to th
 
 Either way a severed caller resolves only to the command that spawned it, never the session, and is denied on any mismatch.
 
+macOS adds one case where the session is the answer: a launcher nono never mediated — a plain fork of the session root, such as an agent's status-line script that backgrounds a command and returns — leaves no marker naming it. nono then accepts the orphan under the **session** policy when it is a member of the session nono created for its direct child. Membership is proof of descent: a session can only be created, never joined.
+
+That session exists only when nono allocated a pty for the direct child, which it does when stdin, stdout and stderr are all a terminal. With any of them redirected — a piped or CI run — the direct child inherits nono's own session, shared with every other process in the user's terminal session, so membership proves nothing and such a caller is denied.
+
 The macOS helper is declared as `{ "argv": [...], "env": [...] }`. nono passes the daemon's context as a single JSON object on **stdin**:
 
 ```json
@@ -297,6 +307,17 @@ The macOS helper is declared as `{ "argv": [...], "env": [...] }`. nono passes t
 `candidate_pid` is the severed daemon nono walked to; `daemon_cwd`, `daemon_argv`, and `daemon_env` describe it, read from the kernel, and are omitted when unreadable. `daemon_env` carries only the keys named in `env` that are present in the daemon's environment; credential-named keys are always dropped. The helper prints the pid it believes is its server on stdout; nono accepts only if that equals `candidate_pid`.
 
 The helper runs **unsandboxed** in the supervisor. It MUST only read and emit a single pid (for example, the pid file the daemon writes) and MUST NOT execute workspace-controlled code. nono hardens the launch — the `argv` program is expanded (`~`, `$WORKDIR`, `$TMPDIR`, `$UID`, XDG) and must then be an absolute path, its environment is cleared to a minimal set, its working directory is neutral, and it is killed if it exceeds a short timeout — but cannot vet what the declared helper itself does.
+
+### macOS: mediated commands run in their own session
+
+To make that marker work for an ordinary orphan — a `child &` whose parent exits immediately, rather than a deliberate daemon — macOS Tool Sandbox puts **every** mediated launch in its own POSIX session (`setsid`) before exec. A session id cannot be joined after the fact, only created, which is what makes it unforgeable; a descendant keeps it across reparenting, so nono can still attribute a request whose ancestry walk has run off the top of the process tree.
+
+The cost is that a mediated command has **no controlling terminal**, and cannot reacquire one (the session's pty already belongs to the direct child's session, so `TIOCSCTTY` is refused):
+
+- `open("/dev/tty")` fails with `ENXIO`. A command that reads a secret straight from the terminal — `ssh` asking for a passphrase, `git` with a terminal credential helper — fails instead of prompting. Supply those through `credentials`, an `askpass` helper, or an agent socket rather than an interactive prompt.
+- The kernel delivers it no terminal job-control signals. nono relays Ctrl-C, Ctrl-\\, Ctrl-Z and terminal hangup to mediated commands itself, so interrupting and suspending a session still reaches them, but a mediated command cannot read or set the terminal's foreground process group.
+
+nono's own interactive prompts (command approval, profile save) run in the supervisor, which keeps the terminal, and are unaffected.
 
 ## Examples
 
@@ -623,7 +644,28 @@ hostname/network enforcement on macOS:
 }
 ```
 
-If `SSH_AUTH_SOCK` is unset, a command that selects this credential fails before launch with a Tool Sandbox error. Prefer the agent socket over raw private-key file grants.
+`path` may reference environment variables, optionally followed by a literal suffix,
+such as `"$XDG_RUNTIME_DIR/sccache.sock"`. Variables are expanded anywhere in 
+the string; if a referenced variable is unset, a command that selects the 
+credential fails before launch with a Tool Sandbox error naming the variable.
+Prefer the agent socket over raw private-key file grants.
+
+### Shaping an ambient credential's phantom
+
+An `ambient` credential may declare a `format`: a literal template with exactly one `{}` placeholder, such as `"sk-ant-oat01-{}"`. Every phantom issued for that credential renders as the template with a 64-hex body in place of `{}`, instead of the default bare `nono_<hex>`. Use it when the consuming client classifies a credential by sniffing a literal token prefix and would otherwise reject the phantom. The template is stripped on egress, so the real credential — never the template — reaches upstream.
+
+```json
+{
+  "credentials": {
+    "anthropic-oauth": {
+      "type": "ambient",
+      "format": "sk-ant-oat01-{}"
+    }
+  }
+}
+```
+
+`format` is rejected on non-ambient credentials, when it carries control characters, and when the `capture_credential` rule that mints the phantom also sets `shape: "jwt"` (the JWT shape already dictates the phantom's structure).
 
 ## Stdio Output Mediation
 
@@ -673,6 +715,51 @@ is active:
   }
 }
 ```
+
+## Audit Record
+
+Every command-policy decision is recorded as an audit event by the broker, not by
+the mediated tool. Each event records what the broker decided as a `decision`
+string drawn from a closed vocabulary that mixes lifecycle stages with terminal
+results, such as `invocation_allowed` for clearing an invocation gate and
+`allowed`, `denied`, or `capture` for a terminal result. The vocabulary only ever
+grows, and a decision an older nono does not recognize is summarized as
+unclassified rather than counted as allowed or denied.
+
+The broker also folds these events into a per-command rollup stored in the
+session's `session.json`, so listing sessions never has to parse event logs. The
+rollup classifies each `decision` as allowed, denied, or unclassifiable, and
+counts only terminal ones, so a command that clears an invocation gate and then
+runs records two events but counts as one allowed invocation.
+
+`nono audit list` names the mediated commands per session, and `nono audit show`
+still carries every individual decision:
+
+```bash
+# Which tools did recent sessions mediate, and what was denied?
+nono audit list --recent 10
+
+# Every mediated decision for one session, with reasons and stdio counts
+nono audit show <session-id> --json
+
+# What has a session mediated so far, while it is still running
+nono inspect <session-id>
+```
+
+```
+20260219-092017-8117  just now  completed  claude
+  tools: gh (3 allowed, 1 denied), git (12 allowed)
+```
+
+The rollup is covered by the session digest committed to the ledger, so a denial
+edited out of `session.json` fails `nono audit verify`. See
+[Audit Trail](/cli/features/audit#mediated-tool-summary) for the rollup's bounds
+and how it renders.
+
+A session writes `session.json` only when it finalizes. While it is still
+running, `nono inspect` reports the same rollup recomputed from the event log,
+marked `[live]` because the session can still mediate more commands. See
+[Session Lifecycle](/cli/features/session-lifecycle#mediated-tools-while-the-session-runs).
 
 ## Direct Exec Bypass
 

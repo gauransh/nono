@@ -67,14 +67,9 @@ fn test_schema_network_config_matches_rust_model() {
             "allow_http2",
             "network_profile",
             "allow_domain",
-            "proxy_allow",
-            "allow_proxy",
             "deny_domain",
             "credentials",
-            "proxy_credentials",
             "open_port",
-            "port_allow",
-            "allow_port",
             "open_port_range",
             "listen_port",
             "listen_port_range",
@@ -83,9 +78,7 @@ fn test_schema_network_config_matches_rust_model() {
             "custom_credentials",
             "tls_intercept",
             "upstream_proxy",
-            "external_proxy",
             "upstream_bypass",
-            "external_proxy_bypass",
         ],
     );
 }
@@ -109,7 +102,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "diagnostics",
             "linux",
             "env_credentials",
-            "secrets",
             "environment",
             "command_policies",
             "credential_capture",
@@ -119,7 +111,6 @@ fn test_schema_top_level_profile_matches_rust_model() {
             "hooks",
             "session_hooks",
             "rollback",
-            "undo",
             "open_urls",
             "allow_launch_services",
             "allow_gpu",
@@ -497,6 +488,7 @@ fn test_schema_custom_credential_def_matches_rust_model() {
             "tls_client_cert",
             "tls_client_key",
             "rate_limit",
+            "redeem_phantoms",
         ],
     );
 }
@@ -610,6 +602,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "credential_format",
             "credential_key",
             "env_var",
+            "format",
             "inject_header",
             "mode",
             "path",
@@ -662,6 +655,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "open_urls",
             "resources",
             "stdio",
+            "unix_socket_bind",
             "unsafe_macos_seatbelt_rules",
             "use_credentials",
         ],
@@ -980,7 +974,6 @@ fn test_schema_filesystem_config_matches_rust_model() {
             "deny",
             "bypass_protection",
             "suppress_save_prompt",
-            "ignore",
         ],
     );
 }
@@ -1074,6 +1067,8 @@ fn test_schema_security_config_matches_rust_model() {
             "process_info_mode",
             "ipc_mode",
             "capability_elevation",
+            "approval_backends",
+            "approval_defaults",
             "wsl2_proxy_policy",
         ],
     );
@@ -1144,7 +1139,12 @@ fn test_schema_environment_config_matches_rust_model() {
     assert_schema_properties(
         &schema,
         "EnvironmentConfig",
-        &["allow_vars", "deny_vars", "set_vars"],
+        &[
+            "allow_vars",
+            "deny_vars",
+            "case_insensitive_vars",
+            "set_vars",
+        ],
     );
 }
 
@@ -1246,4 +1246,48 @@ fn test_schema_validates_credential_provider_inject_header_and_format() {
     validator
         .validate(&profile)
         .expect("credential provider inject_header/credential_format should validate");
+}
+
+#[test]
+fn test_schema_rejects_empty_and_nul_env_patterns() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+
+    let empty_pattern = json!({ "environment": { "allow_vars": [""] } });
+    assert!(
+        validator.validate(&empty_pattern).is_err(),
+        "schema should reject an empty allow_vars pattern"
+    );
+
+    let nul_pattern = json!({ "environment": { "deny_vars": ["AWS_\0TOKEN"] } });
+    assert!(
+        validator.validate(&nul_pattern).is_err(),
+        "schema should reject a NUL byte in a deny_vars pattern"
+    );
+
+    let valid_infix = json!({ "environment": { "allow_vars": ["*_TOKEN", "AWS_*_TOKEN"] } });
+    assert!(
+        validator.validate(&valid_infix).is_ok(),
+        "schema should accept infix/leading wildcard patterns"
+    );
+}
+
+#[test]
+fn test_schema_validates_profile_authoring_guide_environment_example() {
+    // The exact JSON snippet from the "environment" section of
+    // profile-authoring-guide.md — must stay valid as the schema evolves.
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "environment": {
+            "allow_vars": ["*"],
+            "deny_vars": ["*TOKEN*", "*KEY*", "*SECRET*"],
+            "case_insensitive_vars": true,
+            "set_vars": { "RUST_LOG": "debug", "XDG_CONFIG_HOME": "$HOME/.config" }
+        }
+    });
+
+    validator
+        .validate(&profile)
+        .expect("profile-authoring-guide.md environment example should validate");
 }

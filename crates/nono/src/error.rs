@@ -16,6 +16,9 @@ pub enum NonoError {
     #[error("Expected a file but got a directory: {0}")]
     ExpectedFile(PathBuf),
 
+    #[error("Expected a pathname Unix socket: {0}")]
+    ExpectedUnixSocket(PathBuf),
+
     #[error("Failed to canonicalize path {path}: {source}")]
     PathCanonicalization {
         path: PathBuf,
@@ -157,6 +160,15 @@ pub enum NonoError {
     #[error("Failed to parse audit ledger line {line}: {reason}")]
     AuditLedgerCorrupt { line: usize, reason: String },
 
+    /// A session directory resolved outside the audit root that named it.
+    ///
+    /// Separate from [`Self::SessionNotFound`] because a caller that only sees
+    /// "no directory" cannot tell a session `audit cleanup` removed from one a
+    /// symlink points outside the audit roots, and reporting a containment
+    /// failure as an ordinary absence hides it.
+    #[error("Audit session {session_id} resolves outside audit root {root}")]
+    AuditSessionOutsideRoot { session_id: String, root: String },
+
     // Trust/attestation errors
     #[error("Trust verification failed for {path}: {reason}")]
     TrustVerification { path: String, reason: String },
@@ -227,6 +239,7 @@ impl NonoError {
             | Self::TrustPolicy(_)
             | Self::BlocklistBlocked { .. }
             | Self::InstructionFileDenied { .. }
+            | Self::AuditSessionOutsideRoot { .. }
             | Self::PackageVerification { .. } => NonoDiagnosticCode::TrustVerificationFailed,
             Self::Snapshot(msg) | Self::ObjectStore(msg) if msg.contains("budget exceeded") => {
                 NonoDiagnosticCode::RollbackBudgetExceeded
@@ -258,6 +271,7 @@ impl NonoError {
             Self::PathNotFound(_)
             | Self::ExpectedDirectory(_)
             | Self::ExpectedFile(_)
+            | Self::ExpectedUnixSocket(_)
             | Self::PathCanonicalization { .. }
             | Self::HashMismatch { .. }
             | Self::SessionNotFound(_)

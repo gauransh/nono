@@ -166,6 +166,10 @@ pub(crate) struct ProxyLaunchOptions {
     /// Profile-declared client-side proxy bypass entries for generated
     /// NO_PROXY/no_proxy.
     pub(crate) no_proxy: Vec<String>,
+    /// When true, the proxy does not allocate the in-memory network audit
+    /// buffer. Set from `--no-audit`. Does not change filter, credentials,
+    /// or fail-closed auth.
+    pub(crate) audit_disabled: bool,
 }
 
 impl ProxyLaunchOptions {
@@ -215,6 +219,12 @@ impl NetworkIntent {
     }
 }
 
+fn mark_network_audit_disabled(network: &mut NetworkIntent) {
+    if let NetworkIntent::ProxyFiltered(opts) = network {
+        opts.audit_disabled = true;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecutionFlags {
     pub(crate) strategy: exec_strategy::ExecStrategy,
@@ -245,6 +255,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) case_insensitive_env_vars: bool,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
@@ -252,6 +263,12 @@ pub(crate) struct ExecutionFlags {
     /// Command binaries already resolved while validating `command_policies`,
     /// reused when building the tool-sandbox plan instead of re-resolving.
     pub(crate) resolved_command_binaries: Option<crate::command_policy::ResolvedCommandBinaries>,
+    /// Named approval backends from the profile `security` section (decoupled
+    /// from `command_policies`). Drives the supervised-mode approval backend.
+    pub(crate) approval_backends:
+        std::collections::BTreeMap<String, crate::command_policy::ApprovalBackendConfig>,
+    /// Default routing for `approval_backends`.
+    pub(crate) approval_defaults: Option<crate::command_policy::ApprovalDefaultsConfig>,
 }
 
 impl ExecutionFlags {
@@ -299,10 +316,13 @@ impl ExecutionFlags {
             session_hooks: prepared.session_hooks.clone(),
             allowed_env_vars: prepared.allowed_env_vars.clone(),
             denied_env_vars: prepared.denied_env_vars.clone(),
+            case_insensitive_env_vars: prepared.case_insensitive_env_vars,
             set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
             command_policies: prepared.command_policies.clone(),
             resolved_command_binaries: prepared.resolved_command_binaries.clone(),
+            approval_backends: prepared.approval_backends.clone(),
+            approval_defaults: prepared.approval_defaults.clone(),
         })
     }
 }
@@ -327,7 +347,9 @@ pub(crate) fn prepare_run_launch_plan(
     let startup_timeout_secs = run_args.startup_timeout_secs;
 
     if no_audit && !silent {
-        eprintln!("  [nono] Warning: --no-audit disables session and command-policy audit events.");
+        eprintln!(
+            "  [nono] Warning: --no-audit disables session, command-policy, and network audit events."
+        );
     }
     if no_audit_integrity && !silent {
         eprintln!(
@@ -396,7 +418,10 @@ pub(crate) fn prepare_run_launch_plan(
         .ok()
         .filter(|id| !id.is_empty())
         .unwrap_or_else(crate::session::generate_session_id);
-    let network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
+    let mut network = prepare_proxy_launch_options(&args, &prepared, silent, session_id.clone())?;
+    if no_audit {
+        mark_network_audit_disabled(&mut network);
+    }
     let rollback_options = prepare_rollback_launch_options(
         &run_args.rollback_exclude,
         run_args.rollback_all,
@@ -646,6 +671,26 @@ pub(crate) fn select_threading_context(
 mod tests {
     use super::*;
     use crate::cli::SandboxArgs;
+
+    #[test]
+    fn mark_network_audit_disabled_only_sets_proxy_intent() {
+        let mut unrestricted = NetworkIntent::Unrestricted;
+        mark_network_audit_disabled(&mut unrestricted);
+        assert!(matches!(unrestricted, NetworkIntent::Unrestricted));
+
+        let mut blocked = NetworkIntent::BlockAll;
+        mark_network_audit_disabled(&mut blocked);
+        assert!(matches!(blocked, NetworkIntent::BlockAll));
+
+        let mut proxy = NetworkIntent::ProxyFiltered(Box::default());
+        mark_network_audit_disabled(&mut proxy);
+        assert!(
+            proxy
+                .proxy_options()
+                .is_some_and(|opts| opts.audit_disabled),
+            "--no-audit must propagate onto ProxyLaunchOptions"
+        );
+    }
 
     fn run_args_with_sandbox(sandbox: SandboxArgs) -> RunArgs {
         RunArgs {

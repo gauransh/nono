@@ -3,7 +3,7 @@
 //! Defines the configuration for the proxy server, including allowed hosts,
 //! credential routes, and external proxy settings.
 
-use globset::Glob;
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -200,6 +200,24 @@ pub struct ProxyConfig {
     /// keep-alive and the CONNECT intercept only advertises HTTP/1.1 ALPN.
     #[serde(default)]
     pub enable_h2: bool,
+
+    /// Collect in-memory network audit events for later drain.
+    ///
+    /// Defaults to `true`. Set `false` when the CLI user passed `--no-audit`
+    /// so the proxy does not allocate the 4096-event buffer or emit
+    /// buffer-full warnings. Network filtering, credential injection, and
+    /// fail-closed auth are independent of this flag.
+    #[serde(default = "default_enable_network_audit")]
+    pub enable_network_audit: bool,
+
+    /// The sandboxed session's write policy, when this proxy instance is
+    /// serving one. Used to strip sandbox-writable PATH entries before this
+    /// host-side, unsandboxed proxy resolves `op`/`bw`/`security` by bare
+    /// name to load a keystore-backed credential (see
+    /// [`nono::keystore::load_secret_by_ref`]). `None` for the standalone
+    /// `nono proxy` command, which has no sandboxed child.
+    #[serde(default, skip)]
+    pub outer_caps: Option<nono::CapabilitySet>,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -261,6 +279,8 @@ impl Default for ProxyConfig {
             ca_validity: None,
             leaf_validity: None,
             enable_h2: false,
+            enable_network_audit: default_enable_network_audit(),
+            outer_caps: None,
         }
     }
 }
@@ -318,6 +338,12 @@ pub struct OAuthTokenResponseFieldConfig {
     pub path: String,
     #[serde(default)]
     pub kind: OAuthTokenResponseFieldKind,
+    /// Literal template for the visible phantom, `{}` standing in for the random
+    /// body (e.g. `"sk-ant-oat01-{}"`), so a client that classifies a credential by
+    /// sniffing a token prefix still recognises it. The whole templated span is
+    /// replaced on egress, so no template literal reaches upstream. `opaque` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +365,10 @@ pub enum OAuthTokenRequestBodyFormat {
 
 fn default_bind_addr() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_enable_network_audit() -> bool {
+    true
 }
 
 fn default_require_auth() -> bool {
@@ -707,6 +737,11 @@ pub struct RouteConfig {
     /// Keystore account name to load the credential from.
     /// If `None`, no credential is injected.
     pub credential_key: Option<String>,
+
+    /// Broker credential names this route redeems from a caller-presented phantom.
+    /// Non-empty forces `requires_intercept`; not honored with `aws_auth`/`spiffe`.
+    #[serde(default)]
+    pub redeem_phantoms: Vec<String>,
 
     /// Injection mode (default: "header")
     #[serde(default)]
@@ -1148,7 +1183,9 @@ impl CompiledEndpointRules {
     pub fn compile(rules: &[EndpointRule]) -> Result<Self, String> {
         let mut compiled = Vec::with_capacity(rules.len());
         for rule in rules {
-            let glob = Glob::new(&rule.path)
+            let glob = GlobBuilder::new(&rule.path)
+                .literal_separator(true)
+                .build()
                 .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
             compiled.push(CompiledRule {
                 method: rule.method.clone(),
@@ -1290,7 +1327,9 @@ impl CompiledEndpointPolicy {
 fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
     let mut compiled = Vec::with_capacity(rules.len());
     for rule in rules {
-        let glob = Glob::new(&rule.path)
+        let glob = GlobBuilder::new(&rule.path)
+            .literal_separator(true)
+            .build()
             .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
         compiled.push(CompiledPolicyRule {
             method: rule.method.clone(),
@@ -1348,7 +1387,9 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
     let normalized = normalize_path(path);
     rules.iter().any(|r| {
         (r.method == "*" || r.method.eq_ignore_ascii_case(method))
-            && Glob::new(&r.path)
+            && GlobBuilder::new(&r.path)
+                .literal_separator(true)
+                .build()
                 .ok()
                 .map(|g| g.compile_matcher())
                 .is_some_and(|m| m.is_match(&normalized))
@@ -1647,6 +1688,13 @@ mod tests {
         let deserialized: ProxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.allowed_hosts, vec!["api.openai.com"]);
         assert_eq!(deserialized.no_proxy, vec!["redis"]);
+        assert!(deserialized.enable_network_audit);
+    }
+
+    #[test]
+    fn test_enable_network_audit_defaults_true_when_absent() {
+        let config: ProxyConfig = serde_json::from_str(r#"{"allowed_hosts":[]}"#).unwrap();
+        assert!(config.enable_network_audit);
     }
 
     #[test]
@@ -1745,6 +1793,37 @@ mod tests {
             "/api/v4/projects/my-proj/merge_requests"
         ));
         assert!(!check(&rule, "GET", "/api/v4/projects/merge_requests"));
+    }
+
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // `*` must not cross a `/` segment boundary the way `**` does.
+    #[test]
+    fn test_endpoint_rule_single_wildcard_rejects_multi_segment() {
+        let rule = EndpointRule {
+            method: "GET".to_string(),
+            path: "/api/v4/projects/*/merge_requests".to_string(),
+        };
+        assert!(!check(
+            &rule,
+            "GET",
+            "/api/v4/projects/123/456/merge_requests"
+        ));
+
+        let one_star = EndpointRule {
+            method: "*".to_string(),
+            path: "/repos/*".to_string(),
+        };
+        assert!(check(&one_star, "GET", "/repos/one"));
+        assert!(!check(&one_star, "GET", "/repos/one/two"));
+        assert!(!check(&one_star, "GET", "/repos/a/b/c/d"));
+
+        let two_star = EndpointRule {
+            method: "*".to_string(),
+            path: "/repos/**".to_string(),
+        };
+        assert!(check(&two_star, "GET", "/repos/one"));
+        assert!(check(&two_star, "GET", "/repos/one/two"));
+        assert!(check(&two_star, "GET", "/repos/a/b/c/d"));
     }
 
     #[test]
@@ -1899,6 +1978,37 @@ mod tests {
                 reason: Some("blocked"),
                 ..
             }
+        ));
+    }
+
+    // Regression test for https://github.com/nolabs-ai/nono/issues/1824:
+    // policy-config paths (allow/deny/approve) must honor the same
+    // one-segment `*` semantics as legacy EndpointRule.
+    #[test]
+    fn test_compiled_endpoint_policy_single_wildcard_rejects_multi_segment() {
+        let policy = EndpointPolicyConfig {
+            allow: vec![EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/repos/*".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/one"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/one/two"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            compiled.evaluate("GET", "/repos/a/b/c/d"),
+            EndpointPolicyOutcome::Deny { .. }
         ));
     }
 

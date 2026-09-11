@@ -119,7 +119,8 @@ enum StaticNetworkFilter {
 }
 
 /// A Landlock ruleset whose allocation and path opening happened in the
-/// parent, before a raw-cloned child exists.
+/// parent. A synchronized child can use the resulting kernel ruleset without
+/// accessing the parent's allocation-dependent state.
 ///
 /// `apply_raw()` creates the ruleset, adds the already-opened path/port rules,
 /// and restricts the calling task using raw syscalls only.  It neither
@@ -139,9 +140,26 @@ impl PreparedLandlockSandbox {
         &self.fallback
     }
 
-    /// Apply this prepared policy without heap allocation or libc coordination
-    /// wrappers.  This is intended for the child side of raw `clone(2)`.
-    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+    /// Create the kernel ruleset without restricting the calling process.
+    ///
+    /// This lets a supervisor prepare rules for a known child PID and share the
+    /// resulting descriptor during a synchronized `CLONE_FILES` bootstrap.
+    /// The caller must still set no_new_privs, restrict the child with this
+    /// ruleset, and install the matching static network filter.
+    #[must_use = "the prepared ruleset must be applied to the child"]
+    pub fn create_ruleset(&self) -> Result<OwnedFd> {
+        let fd = self.create_ruleset_raw().map_err(|error| {
+            NonoError::SandboxInit(format!(
+                "prepared Landlock ruleset {:?}: {}",
+                error.stage(),
+                std::io::Error::from_raw_os_error(error.errno())
+            ))
+        })?;
+        // SAFETY: create_ruleset_raw returned a fresh, uniquely owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn create_ruleset_raw(&self) -> std::result::Result<RawFd, RawSandboxError> {
         // SAFETY: all pointers below refer to fixed-size stack values or data
         // owned by `self`, which remains live for the duration of each syscall.
         unsafe {
@@ -202,6 +220,25 @@ impl PreparedLandlockSandbox {
                 }
             }
 
+            Ok(ruleset_fd)
+        }
+    }
+
+    /// Install only the prepared static network filter, without allocation.
+    ///
+    /// This does not enforce filesystem or Landlock port rules. Callers using
+    /// `create_ruleset` must separately restrict the child with that ruleset.
+    #[must_use = "a failed filter installation must prevent exec"]
+    pub fn apply_static_network_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        install_static_network_filter_raw(self.static_network_filter)
+    }
+
+    /// Apply this prepared policy without heap allocation or libc coordination
+    /// wrappers. This is intended for the child side of raw `clone(2)`.
+    pub fn apply_raw(&self) -> std::result::Result<(), RawSandboxError> {
+        let ruleset_fd = self.create_ruleset_raw()?;
+        // SAFETY: ruleset_fd is newly owned and all syscall arguments are scalar.
+        unsafe {
             if libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 {
                 let errno = raw_errno();
                 libc::syscall(libc::SYS_close, ruleset_fd);
@@ -553,10 +590,10 @@ struct LandlockAccess {
 /// writes (write to .tmp -> rename to target), which is the standard pattern
 /// used by most applications for safe config/build artifact updates.
 ///
-/// IoctlDev is NOT included here — it is added selectively in `apply_with_abi_inner()`
-/// only for paths that are actual device files (char/block devices), detected
-/// via `stat()` at rule-addition time. This avoids granting device ioctl access
-/// to non-device paths.
+/// IoctlDev is NOT included here — it is added selectively by
+/// `normalize_path_access()` only for opened inodes that are actual device files
+/// (char/block devices) or intended device directories. This avoids granting
+/// device ioctl access to non-device paths.
 fn access_to_landlock(access: AccessMode, abi: ABI) -> LandlockAccess {
     let available = AccessFs::from_all(abi);
 
@@ -590,6 +627,83 @@ fn access_to_landlock(access: AccessMode, abi: ABI) -> LandlockAccess {
         effective: desired & available,
         dropped: desired & !available,
     }
+}
+
+/// A Landlock path rule normalized against the inode opened for enforcement.
+struct OpenedPathRule {
+    path_fd: OwnedFd,
+    access: LandlockAccess,
+}
+
+/// Normalize a path rule against metadata from the inode opened for enforcement.
+///
+/// `landlock::PathBeneath` performs this compatibility step internally, but
+/// the allocation-free prepared path emits raw Landlock rules and must mirror
+/// it explicitly.  In particular, Linux rejects directory-only access rights
+/// such as `ReadDir`, `MakeReg`, and `Refer` when `parent_fd` identifies a
+/// non-directory inode.
+fn normalize_path_access(
+    cap: &crate::capability::FsCapability,
+    metadata: &std::fs::Metadata,
+    abi: ABI,
+) -> Result<LandlockAccess> {
+    let is_directory = metadata.is_dir();
+    if cap.is_file == is_directory {
+        return Err(if cap.is_file {
+            NonoError::ExpectedFile(cap.resolved.clone())
+        } else {
+            NonoError::ExpectedDirectory(cap.resolved.clone())
+        });
+    }
+
+    let mut result = access_to_landlock(cap.access, abi);
+    if !is_directory {
+        result.effective &= AccessFs::from_file(abi);
+    }
+
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = metadata.file_type();
+    let is_device = file_type.is_char_device() || file_type.is_block_device();
+    let is_device_directory = is_directory && cap.resolved.starts_with("/dev");
+    if AccessFs::from_all(abi).contains(AccessFs::IoctlDev)
+        && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
+        && (is_device || is_device_directory)
+    {
+        result.effective |= AccessFs::IoctlDev;
+    }
+
+    Ok(result)
+}
+
+/// Open a Landlock rule path once and derive all enforcement state from that FD.
+///
+/// Returning the same descriptor used for metadata validation prevents a path
+/// replacement between type/device classification and rule installation.
+fn open_path_rule(cap: &crate::capability::FsCapability, abi: ABI) -> Result<OpenedPathRule> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(&cap.resolved)
+        .map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "Cannot open Landlock rule path {}: {}",
+                cap.resolved.display(),
+                e
+            ))
+        })?;
+    let metadata = file.metadata().map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "Cannot inspect opened Landlock rule path {}: {}",
+            cap.resolved.display(),
+            e
+        ))
+    })?;
+    let access = normalize_path_access(cap, &metadata, abi)?;
+
+    Ok(OpenedPathRule {
+        path_fd: file.into(),
+        access,
+    })
 }
 
 /// Legacy check: whether the simple block-all seccomp filter can be used.
@@ -659,31 +773,6 @@ fn unsupported_filesystem_dev(path: &Path) -> Option<u64> {
     }
 }
 
-/// Check if a path is a character or block device file.
-///
-/// Used to selectively grant `IoctlDev` only for actual device files
-/// (e.g., `/dev/tty`, `/dev/null`), not for regular files or directories.
-fn is_device_path(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::metadata(path)
-        .map(|m| {
-            let ft = m.file_type();
-            ft.is_char_device() || ft.is_block_device()
-        })
-        .unwrap_or(false)
-}
-
-/// Check if a path is a directory that contains device files (e.g., `/dev/pts`).
-///
-/// For directories under `/dev`, we grant `IoctlDev` because Landlock's
-/// `PathBeneath` applies to all files within the subtree, and those files
-/// are device nodes that need ioctl access for terminal operations.
-fn is_device_directory(path: &Path) -> bool {
-    // Only consider directories directly under /dev as device directories.
-    // This avoids granting IoctlDev to arbitrary directories.
-    path.starts_with("/dev") && path.is_dir()
-}
-
 /// Determine which Landlock scopes must be enabled for these capabilities.
 ///
 /// `SignalMode::AllowSameSandbox` has an exact Landlock mapping.
@@ -737,6 +826,15 @@ pub fn apply_landlock(caps: &CapabilitySet) -> Result<()> {
 /// Same contract as `apply_landlock` but avoids re-probing the kernel ABI.
 pub fn apply_landlock_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
     apply_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly).map(|_| ())
+}
+
+/// Prepare Landlock-only enforcement without installing a seccomp fallback.
+#[must_use = "preparation failure must prevent sandbox launch"]
+pub fn prepare_landlock_with_abi(
+    caps: &CapabilitySet,
+    abi: &DetectedAbi,
+) -> Result<PreparedLandlockSandbox> {
+    prepare_with_abi_inner(caps, abi, TcpNetworkEnforcement::LandlockOnly)
 }
 
 /// Apply Landlock filesystem/process sandboxing and use seccomp for TCP
@@ -872,30 +970,10 @@ fn prepare_with_abi_inner(
         }
     }
 
-    let ioctl_dev_available = AccessFs::from_all(target_abi).contains(AccessFs::IoctlDev);
     let mut path_rules = Vec::with_capacity(caps.fs_capabilities().len());
     for cap in caps.fs_capabilities() {
-        let result = access_to_landlock(cap.access, target_abi);
-        let mut access = result.effective;
-        if ioctl_dev_available
-            && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
-            && (is_device_path(&cap.resolved) || is_device_directory(&cap.resolved))
-        {
-            access |= AccessFs::IoctlDev;
-        }
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-            .open(&cap.resolved)
-            .map_err(|e| {
-                NonoError::SandboxInit(format!(
-                    "Cannot pre-open Landlock rule path {}: {}",
-                    cap.resolved.display(),
-                    e
-                ))
-            })?;
-        let path_fd = move_fd_above_stdio(file.into()).map_err(|e| {
+        let opened = open_path_rule(cap, target_abi)?;
+        let path_fd = move_fd_above_stdio(opened.path_fd).map_err(|e| {
             NonoError::SandboxInit(format!(
                 "Cannot reserve Landlock rule descriptor for {}: {}",
                 cap.resolved.display(),
@@ -904,7 +982,7 @@ fn prepare_with_abi_inner(
         })?;
         path_rules.push(PreparedPathRule {
             path_fd,
-            allowed_access: access.bits(),
+            allowed_access: opened.access.effective.bits(),
         });
     }
 
@@ -1203,21 +1281,20 @@ fn apply_with_abi_inner(
     // directory grants, so SocketScope::DirChildren and SocketScope::DirSubtree
     // are not distinguishable on this Linux path until the seccomp AF_UNIX
     // allowlist work enforces UnixSocketCapability::covers().
-    let ioctl_dev_available = AccessFs::from_all(target_abi).contains(AccessFs::IoctlDev);
     // Track device IDs of mounts already warned about to emit one warning
     // per mount, not one per capability path.
     let mut warned_unsupported_devs: std::collections::HashSet<u64> =
         std::collections::HashSet::new();
 
     for cap in caps.fs_capabilities() {
-        let result = access_to_landlock(cap.access, target_abi);
-        let mut access = result.effective;
+        let opened = open_path_rule(cap, target_abi)?;
+        let access = opened.access.effective;
 
-        if !result.dropped.is_empty() {
+        if !opened.access.dropped.is_empty() {
             debug!(
                 "Landlock ABI {:?} does not support {:?} for path {} (requested for {:?})",
                 target_abi,
-                result.dropped,
+                opened.access.dropped,
                 cap.resolved.display(),
                 cap.access
             );
@@ -1228,11 +1305,7 @@ fn apply_with_abi_inner(
         // Without it, TUI programs fail with EACCES on /dev/tty and /dev/pts.
         // We restrict this to actual devices to avoid granting ioctl access to
         // regular files and non-device directories.
-        if ioctl_dev_available
-            && matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite)
-            && (is_device_path(&cap.resolved) || is_device_directory(&cap.resolved))
-        {
-            access |= AccessFs::IoctlDev;
+        if access.contains(AccessFs::IoctlDev) {
             debug!(
                 "Adding IoctlDev for device path: {}",
                 cap.resolved.display()
@@ -1257,9 +1330,8 @@ fn apply_with_abi_inner(
             access
         );
 
-        let path_fd = PathFd::new(&cap.resolved)?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(path_fd, access))
+            .add_rule(PathBeneath::new(opened.path_fd, access))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
                     "Cannot add Landlock rule for {}: {} (filesystem may not support Landlock)",
@@ -3359,6 +3431,45 @@ pub struct PreparedSeccompNotifyFilter {
 }
 
 impl PreparedSeccompNotifyFilter {
+    /// Add filesystem notifications to this network notification program.
+    ///
+    /// Linux permits only one NEW_LISTENER filter per thread. A combined
+    /// supervisor must dispatch this listener by syscall number. The original
+    /// network program and its relative jumps are retained unchanged.
+    #[must_use]
+    pub fn with_openat_notifications(self) -> Self {
+        let mut filter = vec![
+            SockFilterInsn {
+                code: BPF_LD | BPF_W | BPF_ABS,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_DATA_NR_OFFSET,
+            },
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 1,
+                jf: 0,
+                k: SYS_OPENAT as u32,
+            },
+            SockFilterInsn {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 1,
+                k: SYS_OPENAT2 as u32,
+            },
+            SockFilterInsn {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_USER_NOTIF,
+            },
+        ];
+        filter.extend_from_slice(self.filter.as_slice());
+        Self {
+            filter: prepend_seccomp_arch_guard_vec(filter, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        }
+    }
+
     /// Install the prepared filter and return the listener as a borrowed raw
     /// slot.  The caller must establish private fd-table ownership before
     /// constructing `OwnedFd` or running Rust destructors for this slot.
@@ -3775,34 +3886,88 @@ mod tests {
     }
 
     #[test]
-    fn test_is_device_path_dev_null() {
-        // /dev/null is a character device on all Unix systems
-        assert!(is_device_path(Path::new("/dev/null")));
-    }
+    fn test_open_path_rule_classifies_ioctl_from_opened_inode() {
+        let device_cap =
+            crate::capability::FsCapability::new_file("/dev/null", AccessMode::ReadWrite)
+                .expect("device capability");
+        let device_rule = open_path_rule(&device_cap, ABI::V5).expect("open device rule");
+        assert!(device_rule.access.effective.contains(AccessFs::IoctlDev));
 
-    #[test]
-    fn test_is_device_path_regular_file() {
-        // A regular file should not be detected as a device
-        assert!(!is_device_path(Path::new("/etc/hosts")));
-    }
+        let regular = tempfile::NamedTempFile::new().expect("regular file");
+        let regular_cap =
+            crate::capability::FsCapability::new_file(regular.path(), AccessMode::ReadWrite)
+                .expect("regular file capability");
+        let regular_rule = open_path_rule(&regular_cap, ABI::V5).expect("open regular rule");
+        assert!(!regular_rule.access.effective.contains(AccessFs::IoctlDev));
 
-    #[test]
-    fn test_is_device_path_nonexistent() {
-        assert!(!is_device_path(Path::new("/nonexistent/path/12345")));
-    }
+        let ordinary_dir = tempfile::tempdir().expect("ordinary directory");
+        let ordinary_dir_cap =
+            crate::capability::FsCapability::new_dir(ordinary_dir.path(), AccessMode::ReadWrite)
+                .expect("ordinary directory capability");
+        let ordinary_dir_rule =
+            open_path_rule(&ordinary_dir_cap, ABI::V5).expect("open ordinary directory rule");
+        assert!(
+            !ordinary_dir_rule
+                .access
+                .effective
+                .contains(AccessFs::IoctlDev)
+        );
 
-    #[test]
-    fn test_is_device_directory_dev_pts() {
-        // /dev/pts is a directory under /dev
         if Path::new("/dev/pts").exists() {
-            assert!(is_device_directory(Path::new("/dev/pts")));
+            let device_dir_cap =
+                crate::capability::FsCapability::new_dir("/dev/pts", AccessMode::ReadWrite)
+                    .expect("device directory capability");
+            let device_dir_rule =
+                open_path_rule(&device_dir_cap, ABI::V5).expect("open device directory rule");
+            assert!(
+                device_dir_rule
+                    .access
+                    .effective
+                    .contains(AccessFs::IoctlDev)
+            );
         }
     }
 
+    /// `open_path_rule` opens `cap.resolved` with `O_PATH`, so the kernel
+    /// resolves the whole chain before Landlock sees a literal path.
     #[test]
-    fn test_is_device_directory_not_dev() {
-        // /tmp is a directory but not under /dev
-        assert!(!is_device_directory(Path::new("/tmp")));
+    fn test_open_path_rule_resolves_multi_hop_symlink_through_symlinked_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize");
+
+        let hosts = canonical_dir.join("hosts");
+        let mymac = hosts.join("mymac");
+        std::fs::create_dir_all(&mymac).expect("mkdir mymac");
+        let real_gitconfig = mymac.join("gitconfig");
+        std::fs::write(&real_gitconfig, "[user]\n").expect("write gitconfig");
+
+        let current = hosts.join("current");
+        std::os::unix::fs::symlink(&mymac, &current).expect("symlink dir");
+
+        let gitconfig_link = canonical_dir.join(".gitconfig");
+        std::os::unix::fs::symlink(current.join("gitconfig"), &gitconfig_link)
+            .expect("symlink leaf");
+
+        let cap = crate::capability::FsCapability::new_file(&gitconfig_link, AccessMode::Read)
+            .expect("gitconfig capability");
+
+        let rule = open_path_rule(&cap, ABI::V5).expect("open multi-hop symlink rule");
+        assert!(rule.access.effective.contains(AccessFs::ReadFile));
+    }
+
+    #[test]
+    fn test_open_path_rule_rejects_removed_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("removed.txt");
+        std::fs::write(&path, b"data").expect("create file");
+        let cap = crate::capability::FsCapability::new_file(&path, AccessMode::ReadWrite)
+            .expect("file capability");
+        std::fs::remove_file(&path).expect("remove file");
+
+        let Err(error) = open_path_rule(&cap, ABI::V5) else {
+            panic!("removed path must fail closed");
+        };
+        assert!(matches!(error, NonoError::SandboxInit(_)));
     }
 
     #[test]
@@ -4976,6 +5141,137 @@ mod tests {
     }
 
     #[test]
+    fn prepared_path_rules_mask_directory_rights_for_non_directories() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let regular = temp.path().join("regular.txt");
+        std::fs::write(&regular, b"data").expect("create regular file");
+        let fifo = temp.path().join("events.fifo");
+        mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).expect("create fifo");
+        let socket = temp.path().join("service.sock");
+        let _listener = UnixListener::bind(&socket).expect("bind unix socket");
+
+        let caps = CapabilitySet::new()
+            .allow_path(temp.path(), AccessMode::ReadWrite)
+            .expect("directory capability")
+            .allow_file(&regular, AccessMode::ReadWrite)
+            .expect("regular file capability")
+            .allow_file(&fifo, AccessMode::ReadWrite)
+            .expect("fifo capability")
+            .allow_file(&socket, AccessMode::ReadWrite)
+            .expect("socket node capability")
+            .allow_file("/dev/null", AccessMode::ReadWrite)
+            .expect("device capability");
+        let abi = DetectedAbi::new(ABI::V5);
+
+        let prepared =
+            prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::preinstalled_tcp_filter())
+                .expect("prepare policy");
+        assert_eq!(prepared.path_rules.len(), 5);
+
+        let directory_access = prepared.path_rules[0].allowed_access;
+        assert_ne!(
+            directory_access & BitFlags::from(AccessFs::ReadDir).bits(),
+            0
+        );
+        assert_ne!(
+            directory_access & BitFlags::from(AccessFs::MakeReg).bits(),
+            0
+        );
+
+        let valid_file_access = AccessFs::from_file(ABI::V5).bits();
+        for rule in &prepared.path_rules[1..] {
+            assert_eq!(rule.allowed_access & !valid_file_access, 0);
+        }
+
+        for rule in &prepared.path_rules[1..4] {
+            assert_eq!(
+                rule.allowed_access & BitFlags::from(AccessFs::IoctlDev).bits(),
+                0
+            );
+        }
+        assert_ne!(
+            prepared.path_rules[4].allowed_access & BitFlags::from(AccessFs::IoctlDev).bits(),
+            0
+        );
+    }
+
+    #[test]
+    fn prepared_v2_file_rule_matches_landlock_file_compatibility() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let regular = temp.path().join("regular.txt");
+        std::fs::write(&regular, b"data").expect("create regular file");
+        let caps = CapabilitySet::new()
+            .allow_file(&regular, AccessMode::ReadWrite)
+            .expect("regular file capability")
+            .allow_file("/dev/null", AccessMode::ReadWrite)
+            .expect("device capability");
+        let abi = DetectedAbi::new(ABI::V2);
+
+        let prepared =
+            prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::preinstalled_tcp_filter())
+                .expect("prepare policy");
+        let requested = access_to_landlock(AccessMode::ReadWrite, ABI::V2).effective;
+        let expected = (requested & AccessFs::from_file(ABI::V2)).bits();
+        assert_eq!(prepared.path_rules.len(), 2);
+        for rule in &prepared.path_rules {
+            assert_eq!(rule.allowed_access, expected);
+        }
+    }
+
+    #[test]
+    fn path_rule_type_changes_fail_closed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let file_path = temp.path().join("file-to-dir");
+        std::fs::write(&file_path, b"data").expect("create file");
+        let file_cap = crate::capability::FsCapability::new_file(&file_path, AccessMode::ReadWrite)
+            .expect("file capability");
+        std::fs::remove_file(&file_path).expect("remove file");
+        std::fs::create_dir(&file_path).expect("replace file with directory");
+        let Err(error) = open_path_rule(&file_cap, ABI::V2) else {
+            panic!("shared path rule builder must reject a replacement directory");
+        };
+        assert!(matches!(error, NonoError::ExpectedFile(_)));
+
+        let mut file_caps = CapabilitySet::new();
+        file_caps.add_fs(file_cap);
+        let Err(error) = prepare_seccomp_with_abi(
+            &file_caps,
+            &DetectedAbi::new(ABI::V2),
+            SeccompOpts::preinstalled_tcp_filter(),
+        ) else {
+            panic!("file capability must reject a replacement directory");
+        };
+        assert!(matches!(error, NonoError::ExpectedFile(_)));
+
+        let dir_path = temp.path().join("dir-to-file");
+        std::fs::create_dir(&dir_path).expect("create directory");
+        let dir_cap = crate::capability::FsCapability::new_dir(&dir_path, AccessMode::ReadWrite)
+            .expect("directory capability");
+        std::fs::remove_dir(&dir_path).expect("remove directory");
+        std::fs::write(&dir_path, b"data").expect("replace directory with file");
+        let Err(error) = open_path_rule(&dir_cap, ABI::V2) else {
+            panic!("shared path rule builder must reject a replacement file");
+        };
+        assert!(matches!(error, NonoError::ExpectedDirectory(_)));
+
+        let mut dir_caps = CapabilitySet::new();
+        dir_caps.add_fs(dir_cap);
+        let Err(error) = prepare_seccomp_with_abi(
+            &dir_caps,
+            &DetectedAbi::new(ABI::V2),
+            SeccompOpts::preinstalled_tcp_filter(),
+        ) else {
+            panic!("directory capability must reject a replacement file");
+        };
+        assert!(matches!(error, NonoError::ExpectedDirectory(_)));
+    }
+
+    #[test]
     fn prepared_landlock_raw_structs_match_uapi_layout() {
         assert_eq!(std::mem::size_of::<RawLandlockRulesetAttr>(), 24);
         assert_eq!(std::mem::size_of::<RawLandlockPathBeneathAttr>(), 12);
@@ -4988,6 +5284,56 @@ mod tests {
         assert_eq!(proxy.filter.len(), 37);
         let unix = prepare_seccomp_af_unix_filter();
         assert_eq!(unix.filter.len(), 14);
+    }
+
+    #[test]
+    fn combined_notifications_preserve_network_filter_decisions() {
+        for original in [
+            prepare_seccomp_proxy_filter(false),
+            prepare_seccomp_proxy_filter(true),
+            prepare_seccomp_af_unix_filter(),
+        ] {
+            let network = original.filter.as_slice().to_vec();
+            let combined = original.with_openat_notifications();
+            for syscall in [SYS_OPENAT, SYS_OPENAT2] {
+                assert_eq!(
+                    evaluate_static_bpf(combined.filter.as_slice(), syscall, [0; 6]),
+                    SECCOMP_RET_USER_NOTIF
+                );
+            }
+            for syscall in [
+                SYS_SOCKET,
+                SYS_SOCKETPAIR,
+                SYS_CONNECT,
+                SYS_BIND,
+                SYS_SENDTO,
+                SYS_SENDMSG,
+                SYS_SENDMMSG,
+                libc::SYS_read as i32,
+                libc::SYS_write as i32,
+                libc::SYS_execve as i32,
+                SYS_IO_URING_SETUP,
+            ] {
+                for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
+                    for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_RAW] {
+                        let args = [family as u64, kind as u64, 0, 0, 0, 0];
+                        assert_eq!(
+                            evaluate_static_bpf(combined.filter.as_slice(), syscall, args),
+                            evaluate_static_bpf(&network, syscall, args)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                evaluate_static_bpf_with_arch(
+                    combined.filter.as_slice(),
+                    NATIVE_AUDIT_ARCH ^ 1,
+                    SYS_OPENAT as u32,
+                    [0; 6]
+                ),
+                SECCOMP_RET_ERRNO | libc::EPERM as u32
+            );
+        }
     }
 
     #[test]

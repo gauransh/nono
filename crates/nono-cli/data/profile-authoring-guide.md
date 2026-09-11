@@ -56,10 +56,11 @@ Inherit from another profile by name:
 
 - Inheritance chain max depth: 10.
 - The CLI `--extends <PROFILE>` flag composes a selected `--profile` for one
-  invocation. It is repeatable and prepends its bases to the profile JSON's
-  `extends` list, preserving left-to-right merge order while keeping the
-  selected profile as the final override layer. Inherited grants can widen
-  sandbox permissions.
+  invocation on profile-consuming commands such as `nono run`, `nono wrap`,
+  `nono why`, and `nono proxy`. It is repeatable and prepends its bases to the
+  profile JSON's `extends` list, preserving left-to-right merge order while
+  keeping the selected profile as the final override layer. Inherited grants
+  can widen sandbox permissions.
 - Scalar fields: child overrides base.
 - Array fields (`groups.include`, `groups.exclude`, `commands.allow`, `commands.deny`, `filesystem.*`, `allow_domain`, `deny_domain`, `open_port`, `open_port_range`, `listen_port`, `listen_port_range`, `no_proxy`, `rollback.*`, `upstream_bypass`): child values are appended to base values and deduplicated. To remove inherited entries, use `groups.exclude` for groups; there is no mechanism to remove inherited filesystem paths. For `allow_domain` entries with endpoint rules, rules for the same domain are merged (appended) rather than replaced. `deny_domain` entries are additive — child profiles can only add more denies, never remove inherited ones.
 - Map fields (`env_credentials`, `hooks`, `custom_credentials`): child entries are merged into base; child keys override matching base keys.
@@ -121,6 +122,8 @@ Controls startup-time command gating. These checks run only at launch time and a
 tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable through the outer sandbox capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
 Command sandbox path lists (`fs_read`, `fs_write`, `fs_read_file`, `fs_write_file`) may use dynamic provider tokens. `@git:config-files` expands to trusted global/system Git config files, Git file settings (attributes, excludes, commit templates), and the declared target of every `include.path` and `includeIf.*.path` directive — including conditional includes that do not currently fire. `@git:hooks-path` expands to trusted global/system `core.hooksPath` directories. `@git:common-dir` expands to the git common directory (`.git` in a regular repo, or the absolute path to the main repo's `.git` in a worktree). `@git:worktree` expands to the main worktree root (empty in a regular repo). `@git:toplevel` expands to the current checkout root. `@git:toplevel-parent` expands to the parent of the current checkout root. These tokens are opt-in per profile and ignore repo-local/worktree Git config so a checkout cannot grant itself extra host filesystem access.
+
+`unix_socket_bind` (command sandbox only) grants `connect(2)`/`bind(2)` on named pathname AF_UNIX sockets, with the same implied filesystem coupling as the agent-level field of the same name. It also accepts the `@git:fsmonitor-socket` dynamic token, which expands to `fsmonitor--daemon.ipc` under the current worktree's private git-dir — resolved by a pure filesystem walk (no `git` process spawn), so an attacker-controlled working directory cannot influence resolution through `.git/config`.
 
 ```json
 {
@@ -358,17 +361,28 @@ Here `read` only ever matches `.ts`/`.tsx` files, so it can never overlap `.env`
 | `block`                 | boolean                           | `false`  | Block all network access. |
 | `allow_http2`           | boolean                           | `false`  | Allow HTTP/2 to upstream servers via ALPN negotiation. Default is HTTP/1.1 with keep-alive. Equivalent to `--allow-http2`. |
 | `network_profile`       | string or null                    | inherit  | Name from `network-policy.json` for proxy filtering. Set to `null` to clear inherited value. |
-| `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Aliases: `proxy_allow`, `allow_proxy`. |
-| `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports wildcard subdomains (`*.ads.example.com`). Equivalent to `--deny-domain`. |
-| `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. Alias: `proxy_credentials`. |
-| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Aliases: `port_allow`, `allow_port`. Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
+| `allow_domain`          | array of string or object         | `[]`     | Additional domains to allow through the proxy. Entries can be plain strings (CONNECT tunnel) or objects with endpoint rules (TLS-intercepted L7 filtering). Supports wildcard subdomains (`*.googleapis.com`) and a whole-label wildcard in a non-leading position (`jenkins.*.ci.example.com`, matching exactly one label there). |
+| `deny_domain`           | array of string                   | `[]`     | Domains to block through the proxy regardless of the allowlist. Evaluated before `allow_domain`. Supports the same wildcard grammar as `allow_domain` (`*.ads.example.com`, `jenkins.*.ci.example.com`). Equivalent to `--deny-domain`. |
+| `credentials`           | array of string                   | `[]`     | Credential services to enable via reverse proxy. |
+| `open_port`             | array of integer                  | `[]`     | Localhost TCP IPC (connect + bind). Port **0**: macOS only (`localhost:*` outbound); Linux: explicit ports. |
 | `open_port_range`       | array of `[start, end]`           | `[]`     | Inclusive port ranges for bidirectional localhost TCP (connect + bind). Multiple ranges are supported. Example: `[[3000, 3010], [8000, 8100]]`. Each port becomes an individual rule; overlapping ranges are merged automatically. **macOS**: hard limit of 16,384 unique ports across all ranges (2¹⁴) due to `sandbox_init` rule limits. **Linux**: no limit beyond the 16-bit port space (1–65535). |
 | `listen_port`           | array of integer                  | `[]`     | TCP ports the sandboxed child may listen on (bind only). |
 | `listen_port_range`     | array of `[start, end]`           | `[]`     | Inclusive port ranges for TCP listen (bind only). Multiple ranges are supported. Example: `[[8000, 8100], [9000, 9010]]`. Overlapping ranges are merged automatically. Same platform limits as `open_port_range`. |
 | `no_proxy`              | array of string                   | `[]`     | Additional client-side `NO_PROXY` / `no_proxy` entries in proxy mode. This does not grant network access; direct connections still require matching sandbox permissions. Entries must be host patterns only (safe single-label local alias, canonical IP literal, `*.` wildcard suffix, or leading-dot suffix); bare multi-label domains, protected metadata suffix tokens, URLs, credentials, ports, paths, comma-separated lists, and `*` are rejected. |
 | `custom_credentials`    | map of string to credential def   | `{}`     | Custom credential route definitions (see below). Defines the route only — the proxy does not activate unless the service name also appears in `credentials`. |
-| `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). Alias: `external_proxy`. |
-| `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. Alias: `external_proxy_bypass`. |
+| `upstream_proxy`        | string                            | `null`   | Enterprise proxy address (`host:port`). |
+| `upstream_bypass`       | array of string                   | `[]`     | Hosts to bypass the upstream proxy. Supports `*.` wildcard suffixes. |
+
+#### Hostname wildcard patterns
+
+`allow_domain`, `deny_domain`, and `custom_credentials.<name>.upstream` all share one hostname matcher, so a host that reaches the proxy is authorized and routed by the same rule:
+
+| Pattern | Matches |
+|---------|---------|
+| `*.example.com` | One or more labels under `example.com` — `api.example.com` and `a.b.example.com` both match, but not `example.com` itself. |
+| `jenkins.*.ci.example.com` | Exactly one label in the `*` position — `jenkins.prod.ci.example.com` matches; `jenkins.ci.example.com` (zero labels) and `jenkins.a.b.ci.example.com` (two labels) do not. |
+
+A `*` occupying only part of a label (`jenkins-*.example.com`) is not a wildcard and can never match, since a real hostname label never contains `*`.
 
 #### allow_domain with endpoint restrictions
 
@@ -636,7 +650,7 @@ generated trust bundle.
           "host": "https://platform.claude.com",
           "path": "/v1/oauth/token",
           "response_fields": [
-            { "path": "access_token", "kind": "opaque" },
+            { "path": "access_token", "kind": "opaque", "format": "sk-ant-oat01-{}" },
             { "path": "refresh_token", "kind": "opaque" },
             { "path": "id_token", "kind": "jwt" }
           ],
@@ -681,7 +695,7 @@ generated trust bundle.
 | `type`               | string          | yes      | Currently `oauth_capture`. |
 | `token_endpoints`    | array           | yes      | HTTPS OAuth token origins and exact paths whose JSON responses are captured and rewritten to phantom tokens. Configure every token-bearing path the client may use. |
 | `api_hosts`          | array           | yes      | HTTPS API URL origins where this provider's phantom tokens may be resolved on egress. |
-| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. |
+| `response_fields`    | array           | yes      | Token response fields to rewrite. Each entry declares a `path` and a visible phantom `kind` of `opaque` or `jwt`; use `jwt` only for locally parsed fields, not bearer tokens resent upstream. An optional `format` (e.g. `"sk-ant-oat01-{}"`, `kind: opaque` only) shapes the visible phantom — `{}` is a random body — so a client that classifies a credential by its literal prefix recognises it; the template is stripped on egress. |
 | `request_body`       | string          | no       | Token request body format for refresh/exchange rewriting: `auto`, `json`, or `form`. |
 | `credential_store`   | object          | no       | Optional session/logout detection, such as a keychain JSON record or file JSON record with fields expected to contain phantoms. |
 | `helpers`            | object          | no       | Optional status, login, and logout commands for humans or CLI workflows. Commands are arrays and are not run through a shell. |
@@ -703,7 +717,7 @@ is not the primary capture policy.
 | `base_url_env_var`   | string          | no       | Environment variable that points SDKs or CLIs at the mediated proxy base URL. |
 | `endpoint_policy`    | object          | no       | Method/path policy for provider API egress. |
 
-### env_credentials (alias: secrets)
+### env_credentials
 
 Maps keystore account names to environment variable names. Secrets are loaded from the system keystore (macOS Keychain / Linux Secret Service) under the service name "nono".
 
@@ -729,20 +743,24 @@ Controls which environment variables are passed to the sandboxed process. When `
 ```json
 {
   "environment": {
-    "allow_vars": ["PATH", "HOME", "TERM", "AWS_*"],
-    "deny_vars": ["GH_TOKEN"],
+    "allow_vars": ["*"],
+    "deny_vars": ["*TOKEN*", "*KEY*", "*SECRET*"],
+    "case_insensitive_vars": true,
     "set_vars": { "RUST_LOG": "debug", "XDG_CONFIG_HOME": "$HOME/.config" }
   }
 }
 ```
 
-| Field         | Type            | Default | Description |
-|---------------|-----------------|---------|-------------|
-| `allow_vars`  | array of string | absent  | Allow-list of environment variable names. Supports exact names (`"PATH"`) and prefix patterns ending with `*` (`"AWS_*"` matches `AWS_REGION`, `AWS_SECRET_ACCESS_KEY`, etc.). The `*` wildcard is only valid as a trailing suffix. When omitted (or when the `environment` section is absent entirely), all variables pass through. When explicitly set to `[]`, no inherited variables are passed (only nono-injected credentials). When non-empty, only matching variables pass. Nono-injected credentials always bypass this list. |
-| `deny_vars`   | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same pattern syntax as `allow_vars` (exact names and trailing `*`). Denied vars are stripped even if they also match `allow_vars`. |
-| `set_vars`    | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
+| Field                   | Type            | Default | Description |
+|-------------------------|-----------------|---------|-------------|
+| `allow_vars`            | array of string | absent  | Allow-list of environment variable names. Supports exact names (`"PATH"`) and glob patterns where `*` may appear anywhere in the name — leading, trailing, or infix (`"AWS_*"`, `"*_TOKEN"`, `"*SECRET*"`, `"AWS_*_TOKEN"`). A bare `"*"` matches everything. When omitted (or when the `environment` section is absent entirely), all variables pass through. When explicitly set to `[]`, no inherited variables are passed (only nono-injected credentials). When non-empty, only matching variables pass. Nono-injected credentials always bypass this list. |
+| `deny_vars`             | array of string | `[]`    | Deny-list of environment variable names stripped from the child. Same glob syntax as `allow_vars`. Denied vars are stripped even if they also match `allow_vars`. |
+| `case_insensitive_vars` | boolean         | `false` | When `true`, `allow_vars`/`deny_vars` patterns are matched case-insensitively, so `"*token*"` also matches `JENKINS_TOKEN`, `jenkins_token`, and `Jenkins_Token`. |
+| `set_vars`              | object (string→string) | `{}` | Static environment variables injected after allow/deny filtering and before credential injection (injected credentials win on conflict). Values support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`, `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`); keys are not expanded. `PATH` and any `NONO_*` key are reserved and rejected at load time. Unlike inherited host vars, keys here are NOT subject to the dangerous-variable blocklist (`LD_PRELOAD`, `NODE_OPTIONS`, …) — setting one is an explicit operator decision. |
 
-Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `set_vars` merges as a map, with the child's value winning on key conflict.
+Matching is always anchored to the full variable name — a pattern never matches a substring implicitly unless it uses `*` to say so.
+
+Inheritance: child `allow_vars` and `deny_vars` are appended to base values and deduplicated; `case_insensitive_vars` is sticky (once any profile in the chain sets it `true`, a child cannot revert it to `false`); `set_vars` merges as a map, with the child's value winning on key conflict.
 
 ### export_env (caller-declared environment pass-through)
 
@@ -750,7 +768,7 @@ Inheritance: child `allow_vars` and `deny_vars` are appended to base values and 
 
 This is a **caller-declared** control: the field lives on the command doing the invoking (or on the session, for the top-level case), not on the command being invoked. When a command is intercepted, nono attributes it to its resolved caller, then copies the matching variables from that intercepted command's **immediate-parent environment** into the child. The caller's list is only the filter; the values always come from the live parent environment.
 
-- **Patterns:** exact names (`"TOOL_CONFIG"`), trailing-`*` prefixes (`"AWS_*"`), or a bare `"*"` (all). Mid-string wildcards are rejected at load time.
+- **Patterns:** exact names (`"TOOL_CONFIG"`) or a glob with a single `*` anywhere in the name (`"AWS_*"`, `"*_TOKEN"`, `"AWS_*_TOKEN"`), or a bare `"*"` (all). A pattern with more than one `*` (e.g. `"A**B"`) is rejected at load time.
 - **`PATH` and any `NONO_*` key are always excluded** — nono manages those — even under `"*"`. A pattern that explicitly targets them (exact `PATH`, or the `NONO_` prefix) is rejected at load time.
 - Values are taken verbatim and are **not** run through the credential broker. Use `export_env` for tooling variables, not credentials — those flow through `use_credentials`/`allow_vars`.
 - Applied on both the macOS and Linux tool-sandbox paths, before PATH/chaining/`set_vars`/credential injection, so nono-injected variables still win. Merges by dedup-append across the inheritance chain.
@@ -813,7 +831,7 @@ Map of application name to hook configuration:
 | `matcher` | string | Regex for tool name matching. |
 | `script`  | string | Script filename from embedded hooks. |
 
-### rollback (alias: undo)
+### rollback
 
 | Field              | Type            | Description |
 |--------------------|-----------------|-------------|
@@ -949,9 +967,8 @@ to grant, but also do not want offered in the save-profile prompt every run:
 ```
 
 The sandbox still denies these paths. `filesystem.suppress_save_prompt` only
-filters the save-profile suggestion. `filesystem.ignore` is accepted as an
-alias, but new profiles should use the explicit suppress name so it is not
-mistaken for an access grant.
+filters the save-profile suggestion; the explicit suppress name makes clear
+it is not an access grant.
 
 ### Denying specific project files
 
@@ -1249,26 +1266,3 @@ Supported predicate forms include `linux`, `macos`, `linux:fedora`, `linux:rhel-
 - `network.block: true` blocks all network access. It cannot be combined with proxy settings.
 - `custom_credentials` upstream URLs must use HTTPS. HTTP is only accepted for loopback addresses (localhost, 127.0.0.1, ::1).
 
-## 10. Migration from previous schema
-
-Issue [#594](https://github.com/nolabs-ai/nono/issues/594) restructured the profile JSON schema. The old `policy.*` namespace has been dissolved into `filesystem`, `groups`, and `commands`; `security.groups` and `security.allowed_commands` have moved to top-level `groups.include` and `commands.allow`.
-
-Legacy keys still deserialize — profiles using the old names continue to load and emit a single deprecation warning — but they are scheduled for removal in **v1.0.0**. New profiles and edits should use the canonical keys below.
-
-| OLD                          | NEW                             |
-|------------------------------|---------------------------------|
-| `security.groups`            | `groups.include`                |
-| `security.allowed_commands`  | `commands.allow`                |
-| `policy.add_allow_read`      | `filesystem.read`               |
-| `policy.add_allow_write`     | `filesystem.write`              |
-| `policy.add_allow_readwrite` | `filesystem.allow`              |
-| `policy.add_deny_access`     | `filesystem.deny`               |
-| `policy.add_deny_commands`   | `commands.deny`                 |
-| `policy.override_deny`       | `filesystem.bypass_protection`  |
-| `policy.exclude_groups`      | `groups.exclude`                |
-| `--override-deny` (CLI)      | `--bypass-protection` (CLI)     |
-
-Notes:
-- The old `policy` key is no longer recognized as a top-level section. Its former fields now live directly under `filesystem`, `groups`, or `commands` as shown above.
-- The CLI flag renamed from `--override-deny` to `--bypass-protection` for the same reason the JSON key was renamed: to make the "does not grant access" semantics explicit. The old flag remains as a deprecated alias until v1.0.0.
-- When mechanically migrating a profile, move each `policy.*` entry up one level and rename per the table. Array values are preserved unchanged.
