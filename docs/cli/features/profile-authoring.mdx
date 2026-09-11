@@ -457,7 +457,10 @@ explicit so it is not mistaken for allowing the denied path.
 
 The post-run save prompt offers the same behavior interactively: choose
 `suppress` to save all listed denied-path suggestions here instead of adding
-them as `read`, `read_file`, `allow`, or `allow_file` grants.
+them as `read`, `read_file`, `allow`, or `allow_file` grants. The interactive
+selector ignores input for its first second and discards queued keypresses
+before enabling its controls, preventing input intended for the command that
+just exited from immediately confirming the default grants.
 
 ### Suppressing Expected macOS System-Service Diagnostics
 

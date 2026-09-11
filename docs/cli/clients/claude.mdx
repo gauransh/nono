@@ -352,10 +352,13 @@ The first time you run `nono run --profile nolabs-ai/claude -- claude`, nono pro
      Provenance   Sigstore cryptographic supply chain (verified on pull)
      Installs     sandbox profile + Claude Code plugin
 
-  Continue? [Y/n]
+  Continue? [y/N]
 ```
 
-Press `Y` (or just Enter). nono pulls the pack, verifies its Sigstore provenance, and prints a summary that ties the release artifacts back to the source repository.
+After the one-second input guard enables the prompt, press `Y`. Pressing Enter
+uses the safe default and skips installation. nono pulls the pack, verifies its
+Sigstore provenance, and prints a summary that ties the release artifacts back
+to the source repository.
 
 ### What "Pull" Actually Does
 
