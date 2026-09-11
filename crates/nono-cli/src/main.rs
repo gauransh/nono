@@ -77,6 +77,7 @@ mod startup_runtime;
 mod state_paths;
 mod supervised_runtime;
 mod terminal_approval;
+mod terminal_prompt;
 mod theme;
 mod timeouts;
 #[path = "tool-sandbox/mod.rs"]
