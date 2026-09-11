@@ -9,6 +9,7 @@ use nono::{AccessMode, CapabilitySet, NonoError, Result, UrlDenialReason, UrlDen
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SaveAction {
@@ -133,6 +134,7 @@ enum DenialItem {
 }
 
 const DENIAL_SELECTOR_MAX_VISIBLE_ITEMS: usize = 15;
+const DENIAL_SELECTOR_INPUT_DELAY: Duration = Duration::from_secs(1);
 
 fn denial_selector_visible_range(
     item_count: usize,
@@ -1193,6 +1195,14 @@ impl RawTtyGuard {
         Ok(key)
     }
 
+    /// Wait for the selector's input guard, then discard any type-ahead that
+    /// arrived before the operator had time to read the prompt.
+    fn arm_input_after(&self, delay: Duration) -> Result<()> {
+        std::thread::sleep(delay);
+        nix::sys::termios::tcflush(&self.tty, nix::sys::termios::FlushArg::TCIFLUSH)
+            .map_err(|e| NonoError::LearnError(format!("tcflush: {e}")))
+    }
+
     fn set_vmin_vtime(&self, vmin: u8, vtime: u8) -> Result<()> {
         use nix::sys::termios::SpecialCharacterIndices;
         let mut t = nix::sys::termios::tcgetattr(&self.tty)
@@ -1234,6 +1244,7 @@ fn render_denial_selector(
     cursor: usize,
     line_count: &mut usize,
     first_render: bool,
+    input_armed: bool,
 ) -> Result<()> {
     if !first_render && *line_count > 0 {
         write!(tty, "\x1b[{}A", line_count)
@@ -1273,11 +1284,18 @@ fn render_denial_selector(
             theme::fg(" [nono] Review denied paths", t.brand).bold()
         );
     }
-    tty_ln!(
-        "  {}",
-        "↑/↓ move  ·  Space cycle  ·  a grant-all  ·  d deny-all  ·  Enter confirm  ·  Esc cancel"
-            .dimmed()
-    );
+    if input_armed {
+        tty_ln!(
+            "  {}",
+            "↑/↓ move  ·  Space cycle  ·  a grant-all  ·  d deny-all  ·  Enter confirm  ·  Esc cancel"
+                .dimmed()
+        );
+    } else {
+        tty_ln!(
+            "  {}",
+            "Input enables in 1 second · early keys ignored".dimmed()
+        );
+    }
     tty_ln!("");
 
     for (offset, item) in items[start..end].iter().enumerate() {
@@ -1420,12 +1438,13 @@ fn interactive_denial_selector(patch: &profile::Profile) -> Result<Option<Vec<De
 
     let mut cursor: usize = 0;
     let mut line_count: usize = 0;
-    let mut first_render = true;
     let mut cancelled = false;
 
+    render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, true, false)?;
+    raw.arm_input_after(DENIAL_SELECTOR_INPUT_DELAY)?;
+
     loop {
-        render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, first_render)?;
-        first_render = false;
+        render_denial_selector(&mut raw.tty, &items, cursor, &mut line_count, false, true)?;
 
         match raw.read_key()? {
             Key::Up => {
@@ -3097,5 +3116,29 @@ mod tests {
         assert_eq!(decode(b"\n"), Key::Enter);
         assert_eq!(decode(b" "), Key::Space);
         assert_eq!(decode(b"a"), Key::Char('a'));
+    }
+
+    #[test]
+    fn input_guard_discards_queued_keys_before_arming() {
+        use nix::pty::{OpenptyResult, openpty};
+
+        let OpenptyResult { master, slave } = openpty(None, None).expect("openpty");
+        let saved = nix::sys::termios::tcgetattr(&slave).expect("tcgetattr");
+        let mut raw_termios = saved.clone();
+        configure_raw_termios(&mut raw_termios);
+        nix::sys::termios::tcsetattr(&slave, nix::sys::termios::SetArg::TCSANOW, &raw_termios)
+            .expect("tcsetattr");
+
+        nix::unistd::write(&master, b"\r").expect("queue early Enter");
+        let mut guard = RawTtyGuard {
+            tty: std::fs::File::from(slave),
+            saved,
+        };
+        guard
+            .arm_input_after(Duration::ZERO)
+            .expect("arm selector input");
+
+        nix::unistd::write(&master, b"d").expect("write key after arming");
+        assert_eq!(guard.read_key().expect("read key"), Key::Char('d'));
     }
 }
